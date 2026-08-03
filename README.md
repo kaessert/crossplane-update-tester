@@ -1,0 +1,426 @@
+# crossplane-update-tester
+
+A command-line tool that validates the `Update()` path of a Crossplane v2
+provider during end-to-end test runs.
+
+It drives everything through `kubectl` and annotations placed on the provider's
+own example manifests. It contains no knowledge of any particular provider,
+API group, or backend, so a single copy serves every provider that follows the
+annotation convention.
+
+Everything it asserts is derived from two sources:
+
+- the example manifest under test (`apiVersion`, `kind`, `metadata.name`,
+  `metadata.namespace`, and the annotations described below), and
+- the live cluster, read via `kubectl` — the managed resource's
+  `spec.forProvider`, `status.atProvider`, `metadata.generation`,
+  `status.conditions[].observedGeneration`, and the Kubernetes Events that
+  `crossplane-runtime`'s managed reconciler emits.
+
+## Requirements
+
+- Go 1.24 or newer. Consumers use the `tool` directive, which was added in
+  Go 1.24; the module's own `go` directive is `1.24.0`.
+- `kubectl` on `PATH` (or `KUBECTL` pointing at it), configured against the
+  cluster under test.
+- A cluster with the provider installed and its controller `Deployment` running
+  in `crossplane-system`.
+- Permission to list Events across all namespaces. Several checks read the
+  aggregated Event count for the resource; without it those checks report a
+  counting error rather than a verdict.
+
+## Commands
+
+```
+update-tester run <manifest.yaml> [--timeout 120] [--poll-interval 60s]
+update-tester converge <manifest.yaml> [--poll-interval 60s] [--ignore-fields a,b] [--timeout 120s]
+update-tester validate <manifest.yaml> --types-file <types.go>
+update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
+update-tester resolve-recover <manifest.yaml> [--timeout 120]
+update-tester hook <invocation-name> --root <provider-repo-root>
+update-tester version
+```
+
+Flags may appear before or after the manifest path. Go's `flag` package stops
+scanning at the first non-flag argument, which would otherwise cause
+`run manifest.yaml --timeout 600` to silently drop the flag; the tool reorders
+its arguments so that both orders behave identically.
+
+Every check-running command exits non-zero when its check fails, so it can be
+used directly as an E2E assertion.
+
+### `run` — per-field update tests
+
+For each entry in the manifest's `crossplane.io/update-test` annotation, `run`:
+
+1. **Rejects no-ops.** It reads the field's current value (from
+   `spec.forProvider`, falling back to `status.atProvider`) before patching. If
+   the value already equals the test value, the patch would change nothing, the
+   generation would not bump, and `Update()` would never be invoked — polling
+   afterwards would re-observe the value that was already there and report a
+   false pass. This is reported as `NO-OP`, a distinct failure, so the stale
+   test value gets fixed.
+2. **Records an Event baseline.** It sums the aggregated `count` of the
+   resource's `UpdatedExternalResource` and `CannotUpdateExternalResource`
+   Events. (`client-go` folds repeated identical Events into one object by
+   incrementing `.count`, so counting Event objects is not the same as counting
+   occurrences.)
+3. **Patches the field** with a JSON merge patch under `spec.forProvider`,
+   supporting dot-separated paths for nested fields.
+4. **Drives two reconciles.** The first is the reconcile in which `Update()`
+   runs, but its `Observe()` ran before `Update()`, so `status.atProvider` is
+   still stale when it completes. A second reconcile is forced purely to obtain
+   a fresh `Observe()`, so the result does not depend on the provider's
+   background poll tick. The second is triggered by patching a private metadata
+   annotation rather than by a status-only write: generated controllers
+   typically watch with `resource.DesiredStateChanged()`, which reacts to
+   annotation, label, or generation changes and filters status-only writes out
+   entirely.
+5. **Polls `status.atProvider`** for the expected value until `--timeout`.
+6. **Requires evidence that `Update()` ran.** It re-counts the update Events. A
+   field whose observed value matches the target but whose Event count never
+   grew is reported as `NOT-EVIDENCED`, not `PASS`.
+7. **Diffs for side effects.** The top-level keys of `status.atProvider` are
+   compared before and after, excluding the field under test; anything else
+   that moved is printed alongside the result.
+
+Point 6 is the reason this tool exists rather than a `kubectl patch` followed by
+a value assertion. A value match alone cannot distinguish "the controller
+updated the external resource" from "the value already matched, or something
+else set it". The Event delta is a wall-clock-independent signal that the
+reconciler's `Update()` path actually executed.
+
+Two secondary behaviours follow from that design:
+
+- **Event-burst resets.** `client-go`'s `EventBroadcaster` spam filter allows a
+  burst of roughly 25 identical Events per object per controller process and
+  then silently drops further ones. A resource with more mutable fields than
+  that would produce false `NOT-EVIDENCED` results even though every `Update()`
+  succeeded. Before the burst can be exhausted, `run` restarts the provider's
+  controller `Deployment` — a new process starts with a fresh burst and emits a
+  new Event object — and waits for the rollout to become ready.
+- **Untrusted evidence.** If that restart fails, the burst state is unknown:
+  a `PASS` could be masking a dropped Event and a `NOT-EVIDENCED` could be a
+  false failure. Every field tested after a failed reset is reported as
+  `UNTRUSTED` and counted as a failure, so a run can never print a clean
+  "0 not-evidenced" summary on evidence it cannot vouch for.
+
+A passing, evidenced field that took at least **half the provider's poll
+interval** to converge is annotated `slow-observe`. It is still a pass — the
+Event evidence is positive — but a result on that scale is worth a look at the
+controller logs.
+
+`run --poll-interval` (default `60s`) is what sets that bar, and it does
+**nothing else**. `run` does not wait on the poll interval, does not poll on
+it, and does not derive any timeout from it: how long a field test waits for a
+value to appear is `--timeout`, and nothing about that changes when you pass
+`--poll-interval`. The flag exists because "slow" is only meaningful relative
+to the provider's own cadence — a provider polling every 10s and one polling
+every 300s disagree by a factor of 30 about what a slow convergence is, and a
+fixed 30-second bar would annotate nearly every pass of the first while never
+annotating a genuinely poll-scale pass of the second. Passing a smaller value
+makes the tool *report* more slow-observe annotations; it does not make the
+tool *wait* less, and passing a larger one does not give a field more time to
+converge.
+
+The controller `Deployment` is found by reading the `pkg.crossplane.io/revision`
+label off the controller Pod. If more than one provider package is installed,
+the lookup is ambiguous and the run stops rather than restarting the wrong
+controller; set `UPDATE_TESTER_PROVIDER_DEPLOYMENT` to disambiguate.
+
+### `converge` — steady-state assertion
+
+`converge` asserts that the resource settles instead of reconciling forever:
+
+1. Poll until `metadata.generation` equals the `observedGeneration` carried by
+   `status.conditions` (bounded by `--timeout`).
+2. Snapshot `status.atProvider`, the generation, and the update-Event count.
+3. Wait `--poll-interval * 1.5`, which guarantees at least one full reconcile
+   cycle.
+4. Assert that `status.atProvider` is unchanged (minus `--ignore-fields`), that
+   the generation is unchanged, and that **zero** new update Events were
+   recorded.
+
+A resource stuck in a perpetual update loop reports `Ready` on every cycle, so
+an assertion on `Ready` — the assertion an E2E harness makes by default — passes
+happily while the provider writes to the backend forever. The non-zero update
+Event count over a fixed window is what makes the loop visible.
+
+Use `--ignore-fields` for genuinely dynamic observed fields (server timestamps,
+rolling counters). If a resource cannot converge for a structural reason, put a
+`converge-skip:` line in its annotation with the reason; the check then reports
+`CONVERGE-SKIP` and exits zero.
+
+### `validate` — offline coverage check
+
+`validate` needs no cluster. It scans a generated `types.go` for the
+`<Kind>Parameters` struct (skipping any other `*Parameters` structs in the
+file) and reports, per field, whether the manifest's annotation covers it:
+
+- `tested` / `skipped` — the field appears in the annotation.
+- `immutable` — the field carries a `self == oldSelf` validation marker, so it
+  has no update semantics.
+- `reference-plumbing` — the field is a generated `*Ref` / `*Selector`
+  companion whose base value field is present in the same struct.
+- `MISSING` — none of the above; the command exits non-zero.
+
+This is what stops an annotation from quietly falling behind the API type as
+fields are added.
+
+### `check-external-name-prefix` — identity guard (opt-in)
+
+Requires `crossplane.io/expect-external-name-prefix` on the manifest; without
+it the command errors rather than silently passing. It asserts that the live
+resource's `crossplane.io/external-name` annotation starts with the declared
+prefix.
+
+This is for resources whose backend models more than one object type behind a
+single Kubernetes kind. An identity search issued against the wrong object type
+finds nothing, the reconciler creates a second object, and the resource still
+reports `Ready` — invisible to a plain `Ready` assertion, but visible in the
+external-name prefix.
+
+### `resolve-recover` — ref-less identity recovery (opt-in)
+
+Gated on the same annotation. A standing create/update/delete lifecycle always
+carries a non-empty `crossplane.io/external-name`, so it never exercises the
+code path that resolves identity by searching the backend.
+`resolve-recover` forces it: it pauses reconciliation with
+`crossplane.io/paused`, strips the external-name annotation, unpauses, and waits
+for the recovery reconcile.
+
+It passes only if **both** signals hold:
+
+1. the recovered external-name still carries the declared prefix, and
+2. exactly one `CreatedExternalResource` Event exists for the resource across
+   its whole lifecycle.
+
+Signal 1 alone is not enough: a wrong-type search that finds nothing and falls
+through to a duplicate `Create()` still derives the object type from the desired
+spec, so the duplicate's external-name is correctly prefixed too. The second
+`CreatedExternalResource` Event is what distinguishes "found the existing
+object" from "created a second one".
+
+### `hook` — the post-assert entry point
+
+`hook` derives the manifest path from the name it was invoked under and then
+runs the full post-assert sequence for it: `converge`, then — only when the
+manifest carries `crossplane.io/expect-external-name-prefix` —
+`check-external-name-prefix` and `resolve-recover`, then `run`, then `converge`
+again. The final convergence check matters: the field updates just proved values
+round-trip, which is not the same as proving the controller stopped reconciling.
+
+Derivation rules, relative to `--root`:
+
+| Invocation name | Manifest |
+|---|---|
+| `post-assert-<resource>.sh` | `examples/<resource>/<resource>.yaml` |
+| `post-assert-<resource>-namespaced.sh` | `examples/<resource>/<resource>-namespaced.yaml` |
+| `post-assert-<resource>-ns.sh` | `examples/<resource>/<resource>-namespaced.yaml` |
+
+Two rules are resolved against the filesystem rather than by string
+manipulation:
+
+- `-ns` is shorthand for `-namespaced`, but it is also a legitimate ending for
+  a resource name (a DNS NS record resource is naturally `record-ns`). The
+  literal reading wins whenever `examples/<slug>/` exists as a directory.
+- A resource directory may hold several example pairs for the same kind — an
+  alternate variant such as `examples/network/network-v6.yaml` beside
+  `examples/network/network.yaml`. When the primary derivation names no
+  existing file, the last hyphenated segment of the slug is stripped and the
+  same leaf filename is looked for in that shorter directory. The fallback runs
+  only when the primary path is missing, so it can never reinterpret a symlink
+  that already resolves.
+
+Setting `MANIFEST` overrides derivation entirely, which is useful when debugging
+a manifest that does not follow the convention.
+
+## Manifest annotations
+
+### `crossplane.io/update-test`
+
+A YAML block scalar holding a list of per-field entries, optionally preceded by
+a single top-level `converge-skip:` line.
+
+| Key | Meaning |
+|---|---|
+| `field` | Required. Field name under `spec.forProvider`; dot-separated for nested fields. |
+| `value` | The value to patch in. Required unless `skip` is set. |
+| `expect` | Optional. The value expected in `status.atProvider` when the backend normalises what it stores. Defaults to `value`. |
+| `skip` | Optional. A reason for not testing this field. The entry is reported as `SKIPPED` and still counts as coverage for `validate`. |
+
+`converge-skip: <reason>` is not valid YAML as a sibling of top-level sequence
+items, so the line is extracted before the rest of the block is parsed as a
+sequence. It must be unindented.
+
+Worked example:
+
+```yaml
+apiVersion: network.example.crossplane.io/v1alpha1
+kind: Network
+metadata:
+  name: example-network-v6
+  annotations:
+    uptest.upbound.io/post-assert-hook: ../../test/hooks/post-assert-network-v6.sh
+    # Opt in to the two identity checks. Only meaningful for resources whose
+    # backend models several object types behind one kind.
+    crossplane.io/expect-external-name-prefix: "ipv6network/"
+    crossplane.io/update-test: |
+      - field: comment
+        value: "Updated by update-tester (IPv6)"
+      - field: extAttrs
+        skip: "optional map field, low update-test value"
+      - field: parentCidr
+        skip: "create-time-only allocation input, mutually exclusive with the static CIDR this example uses"
+spec:
+  forProvider:
+    networkView: default
+    network: 2001:db8:1::/64
+    comment: Managed by Crossplane (IPv6)
+  providerConfigRef:
+    name: default
+```
+
+Because per-field tests apply as cumulative patches, a single field the backend
+rejects can leave the resource in a state where later fields in the same run
+also fail. Fields that a minimal example cannot legally set — allocation inputs,
+feature flags whose companion list is empty — belong in `skip` with the reason
+stated.
+
+The annotation is looked up across every document of a multi-document manifest,
+so an example that ships a companion `Secret` or `ProviderConfig` alongside the
+managed resource is handled correctly; the annotated document is the one tested.
+
+### `crossplane.io/expect-external-name-prefix`
+
+Optional and opt-in. Its presence enables `check-external-name-prefix` and
+`resolve-recover`; its value is the required prefix of the resource's
+`crossplane.io/external-name` annotation. Manifests that omit it skip both
+checks.
+
+## Consuming it from a provider repository
+
+Do **not** vendor the source. Add a stub module with no Go files of its own:
+
+```
+# <provider>/tools/update-tester/go.mod
+module github.com/<org>/<provider>/tools/update-tester
+
+go 1.24.0
+
+tool github.com/kaessert/crossplane-update-tester
+```
+
+Create it with:
+
+```console
+$ mkdir -p tools/update-tester && cd tools/update-tester
+$ go mod init github.com/<org>/<provider>/tools/update-tester
+$ go get -tool github.com/kaessert/crossplane-update-tester@v0.1.0
+```
+
+`go get -tool` adds the `tool` directive and pins the exact version in the stub
+module's own `go.mod` and `go.sum`. Commit both.
+
+Then invoke it from the provider root:
+
+```console
+$ go -C tools/update-tester tool crossplane-update-tester run /abs/path/to/examples/network/network.yaml
+```
+
+### Why a stub module instead of a `tool` directive in the root `go.mod`
+
+A `tool` directive adds the tool's requirements to the module graph of whatever
+module declares it. Putting it in the provider's root `go.mod` would make this
+tool's dependencies part of the provider's dependency graph — visible to
+`go mod tidy`, to `go list -m all`, to vulnerability scanners reporting on the
+shipped provider, and to anything resolving a shared dependency's version.
+An isolated module under `tools/update-tester/` keeps that graph the provider's
+own. The tool is still built from source, still version-pinned, and still
+reproducible — just accounted for separately.
+
+### Sharp edge: `go -C` changes the working directory
+
+`go -C tools/update-tester` runs the Go command, and therefore the tool process,
+with `tools/update-tester` as the working directory. **Any manifest path passed
+across that boundary must be absolute.** A relative path that is correct from
+the provider root resolves against `tools/update-tester/` inside the tool and
+fails — or, worse, finds a different file. The same applies to `--types-file`
+and `--root`.
+
+### The hook script
+
+`test/hooks/run-update-tester.sh` becomes a wrapper that `exec`s the `hook`
+subcommand:
+
+```bash
+#!/usr/bin/env bash
+# Every test/hooks/post-assert-<resource>.sh is a symlink to this script; the
+# invocation name ($0) selects the manifest. ROOT is absolute because `go -C`
+# runs the tool with tools/update-tester as its working directory.
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+exec go -C "$ROOT/tools/update-tester" tool crossplane-update-tester \
+  hook "$(basename "$0")" --root "$ROOT"
+```
+
+`$0` is the symlink name, not its target — bash does not resolve symlinks
+before `basename` — which is what lets one script serve every resource:
+
+```console
+$ ln -s run-update-tester.sh test/hooks/post-assert-network.sh
+$ ln -s run-update-tester.sh test/hooks/post-assert-network-v6.sh
+$ ln -s run-update-tester.sh test/hooks/post-assert-network-namespaced.sh
+```
+
+Each example manifest then points its
+`uptest.upbound.io/post-assert-hook` annotation at its own symlink.
+
+## Environment
+
+| Variable | Used by | Effect |
+|---|---|---|
+| `KUBECTL` | all cluster commands | Path to the `kubectl` binary. Defaults to `kubectl` from `PATH`. |
+| `MANIFEST` | `hook` | Absolute path to a manifest, overriding derivation from the invocation name. Intended for debugging. |
+| `UPDATE_TESTER_TIMEOUT` | `hook` | Default timeout for the checks the hook runs, where no flag is given. |
+| `UPDATE_TESTER_POLL_INTERVAL` | `hook` | Provider poll interval. Passed to both convergence checks, which wait `interval * 1.5`, and to `run`, which uses it only to calibrate the `slow-observe` annotation (half the interval). One variable, so both checks are measured against the same cadence. |
+| `UPDATE_TESTER_PROVIDER_DEPLOYMENT` | `run` | Name of the provider controller `Deployment` to restart for event-burst resets. Required when more than one provider package is installed, since the Pod-label lookup is then ambiguous. |
+
+## Versioning and compatibility
+
+Releases are tagged semver. Consumers pin an exact version in their stub
+module's `go.mod` and `go.sum`, so an E2E run resolves the same source on every
+machine and a new release cannot change a provider's test behaviour until that
+provider updates its pin:
+
+```console
+$ cd tools/update-tester
+$ go get -tool github.com/kaessert/crossplane-update-tester@v0.2.0
+```
+
+The compatibility surface is the CLI: subcommand names, flags, the two manifest
+annotations, and exit codes. Breaking changes to any of them take a major
+version. `update-tester version` prints the version in use, which is worth
+including in E2E logs when a result needs explaining after the fact.
+
+## Contributing
+
+- `go test ./...` must pass. The packages are unit-testable without a cluster:
+  `kubectl` invocations go through an injectable exec function, and the
+  filesystem-dependent derivation rules are tested against real temporary
+  trees.
+- **Keep it dependency-light.** The only non-stdlib dependency is
+  `gopkg.in/yaml.v3`, and it should stay that way. This tool is built from
+  source inside every E2E run of every consuming provider; each added
+  dependency is downloaded, compiled, and audited by all of them. A new
+  dependency needs a reason that outweighs that.
+- No provider-specific, backend-specific, or API-specific logic. Everything the
+  tool needs about a resource comes from the manifest annotations and the
+  cluster. If a check cannot be expressed that way, it belongs in the provider,
+  not here.
+- Run `gofmt`, `go vet ./...` and `golangci-lint run ./...` before opening a
+  pull request; CI runs all three, plus `go test ./... -count=1 -race`.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).

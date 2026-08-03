@@ -1,0 +1,80 @@
+version: "2"
+
+linters:
+  # The default set is errcheck, govet, ineffassign, staticcheck and unused.
+  # They are listed explicitly below so this file states the full set rather
+  # than deferring to whatever the installed golangci-lint version defaults to.
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - misspell
+    - revive
+    - staticcheck
+    - unused
+
+  settings:
+    errcheck:
+      # Assertions are checked where they matter; blanket type-assertion
+      # checking produces mostly noise in a tool that decodes free-form JSON.
+      check-type-assertions: false
+      check-blank: false
+    # misspell has no settings block on purpose: no locale is pinned. The prose
+    # in this repo mixes UK and US spellings ("normalised" beside "recognized"),
+    # and pinning a locale turns every variant into a lint failure — busywork,
+    # not a defect. Unpinned, misspell reports only genuine typos.
+    revive:
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: exported
+        - name: increment-decrement
+        - name: indent-error-flow
+        - name: package-comments
+        - name: range
+        - name: receiver-naming
+        - name: superfluous-else
+        - name: time-naming
+        - name: unexported-return
+        - name: unreachable-code
+        - name: var-declaration
+
+  exclusions:
+    generated: lax
+    rules:
+      # Test helpers routinely ignore errors from setup calls and declare
+      # unexported fixture types without doc comments; neither is a defect
+      # worth a lint failure.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - revive
+    paths:
+      - third_party$
+      - builtin$
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    gofmt:
+      simplify: true
+    goimports:
+      local-prefixes:
+        - github.com/kaessert/crossplane-update-tester
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$

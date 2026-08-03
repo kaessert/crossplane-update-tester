@@ -1,0 +1,26 @@
+# The counterpart to network-v6.yaml: a namespaced managed resource that does
+# NOT carry crossplane.io/expect-external-name-prefix. hack/smoke-test.sh uses
+# it to prove the annotation gate — the hook must run the 3-step sequence
+# (converge → run → converge) for this manifest and skip both identity checks.
+#
+# Being namespaced also exercises the runner's namespace handling: every
+# kubectl call for this resource carries "-n <namespace>", which the
+# cluster-scoped network-v6 example never produces.
+apiVersion: widget.example.crossplane.io/v1alpha1
+kind: Widget
+metadata:
+  name: example-widget
+  namespace: crossplane-e2e
+  annotations:
+    uptest.upbound.io/post-assert-hook: ../../test/hooks/post-assert-widget.sh
+    crossplane.io/update-test: |
+      - field: description
+        value: "Updated by update-tester"
+      - field: tier
+        skip: "immutable after create"
+spec:
+  forProvider:
+    description: Managed by Crossplane
+    tier: standard
+  providerConfigRef:
+    name: default

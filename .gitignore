@@ -1,0 +1,20 @@
+# Build output
+/crossplane-update-tester
+/update-tester
+/_output
+/dist
+
+# Test / coverage artifacts
+cover.out
+coverage.out
+*.test
+
+# Editors and OS
+.vscode
+.idea
+*.swp
+.DS_Store
+
+# Local environment
+.env
+.env.*

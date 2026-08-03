@@ -1,0 +1,37 @@
+# A provider-neutral stand-in for a real Crossplane example manifest, used by
+# hack/smoke-test.sh. It is shaped after a resource whose backend models more
+# than one object type behind a single Kubernetes kind (an IPv4 and an IPv6
+# network, say), because that is the shape that opts in to the two
+# identity-guard checks and therefore exercises the hook's full 5-step
+# sequence: converge → check-external-name-prefix → resolve-recover → run →
+# converge.
+#
+# Its slug also exercises the hook's sibling-variant fallback: the symlink
+# post-assert-network-v6.sh derives examples/network-v6/network-v6.yaml
+# first, finds nothing, strips the last hyphenated segment, and lands here.
+apiVersion: network.example.crossplane.io/v1alpha1
+kind: Network
+metadata:
+  name: example-network-v6
+  annotations:
+    uptest.upbound.io/post-assert-hook: ../../test/hooks/post-assert-network-v6.sh
+    # Opting in to check-external-name-prefix and resolve-recover.
+    crossplane.io/expect-external-name-prefix: "ipv6network/"
+    crossplane.io/update-test: |
+      - field: comment
+        value: "Updated by update-tester (IPv6)"
+      - field: routingHint
+        value: "medium"
+        expect: "MEDIUM"
+      - field: extAttrs
+        skip: "optional map field, low update-test value"
+      - field: parentCidr
+        skip: "create-time-only allocation input, mutually exclusive with the static CIDR this example uses"
+spec:
+  forProvider:
+    networkView: default
+    network: 2001:db8:1::/64
+    comment: Managed by Crossplane (IPv6)
+    routingHint: low
+  providerConfigRef:
+    name: default

@@ -25,6 +25,13 @@ const (
 	// testKindExample/testNameExample lives in. The cluster-scoped variant
 	// uses the empty string.
 	testNamespaceExample = "default"
+	// testNamespaceOther is a SECOND non-empty namespace, distinct from
+	// testNamespaceExample, for tests that must prove namespace equality is
+	// checked exactly rather than merely by "is it empty or not" — two
+	// namespaced resources of the same Kind+Name in different namespaces
+	// share neither an empty-vs-non-empty split nor an apiVersion group
+	// difference, so only exact namespace comparison tells them apart.
+	testNamespaceOther = "other"
 	// testAPIVersionClusterScoped and testAPIVersionNamespaced are the two
 	// apiVersion strings a dual-scope provider's unified example manifests
 	// carry for the SAME Kind+Name — differing only in API group, per the
@@ -251,27 +258,48 @@ func TestSumEventOccurrencesByReasonGroupMismatchStillExcludes(t *testing.T) {
 // puts two variants of the same Kind+Name in one list varies the apiVersion
 // GROUP alongside the namespace, so the group check alone is sufficient to
 // pass those and the namespace check is never the thing actually under
-// test. Here both events share Kind, Name AND apiVersion group, and differ
-// ONLY in involvedObject.namespace — one cluster-scoped (""), one
-// namespaced — so a query must be attributed to its own namespace on the
-// namespace check alone.
+// test. Here all three events share Kind, Name AND apiVersion group, and
+// differ ONLY in involvedObject.namespace — one cluster-scoped (""), and
+// TWO namespaced, in two DIFFERENT non-empty namespaces — so a query must be
+// attributed to its own namespace on the namespace check alone.
+//
+// The two namespaced events additionally close the gap a cluster-scoped vs.
+// namespaced pair leaves open: "" vs. a non-empty namespace also differs in
+// namespacedness, so a matcher that only compared namespacedness (empty vs.
+// non-empty) rather than exact namespace equality would still pass that
+// pair. Two DIFFERENT non-empty namespaces share no such shortcut — only
+// exact equality tells them apart.
 func TestSumEventOccurrencesByReasonNamespaceAloneDiscriminatesSameGroup(t *testing.T) {
 	list := eventList{Items: []eventItem{
 		newTestEventItemScoped(eventReasonUpdated, 6, testKindExample, testNameExample, "", testAPIVersionNamespaced),
 		newTestEventItemScoped(eventReasonUpdated, 2, testKindExample, testNameExample, testNamespaceExample, testAPIVersionNamespaced),
+		newTestEventItemScoped(eventReasonUpdated, 9, testKindExample, testNameExample, testNamespaceOther, testAPIVersionNamespaced),
 	}}
 
 	t.Run("ClusterScopedQuerySeesOnlyItsOwnEvents", func(t *testing.T) {
 		got := sumEventOccurrencesByReason(list, testKindExample, testNameExample, "", testAPIVersionNamespaced, eventReasonUpdated)
 		if got != 6 {
-			t.Errorf("cluster-scoped count = %d, want 6 (must not include the namespaced item's 2 — same group, so only namespace tells them apart)", got)
+			t.Errorf("cluster-scoped count = %d, want 6 (must not include the namespaced items' 2 or 9 — same group, so only namespace tells them apart)", got)
 		}
 	})
 
 	t.Run("NamespacedQuerySeesOnlyItsOwnEvents", func(t *testing.T) {
 		got := sumEventOccurrencesByReason(list, testKindExample, testNameExample, testNamespaceExample, testAPIVersionNamespaced, eventReasonUpdated)
 		if got != 2 {
-			t.Errorf("namespaced count = %d, want 2 (must not include the cluster-scoped item's 6 — same group, so only namespace tells them apart)", got)
+			t.Errorf("namespaced count = %d, want 2 (must not include the cluster-scoped item's 6 or the other namespace's 9 — same group, so only namespace tells them apart)", got)
+		}
+	})
+
+	t.Run("SecondNamespacedQuerySeesOnlyItsOwnEvents", func(t *testing.T) {
+		// The direct proof this test exists for: two NAMESPACED resources
+		// of the same Kind+Name+group in different namespaces must not
+		// cross-count each other. Neither is empty, so a matcher that only
+		// compared namespacedness (empty vs. non-empty) rather than exact
+		// namespace equality would wrongly sum this with the other
+		// namespace's 2 as well as its own 9.
+		got := sumEventOccurrencesByReason(list, testKindExample, testNameExample, testNamespaceOther, testAPIVersionNamespaced, eventReasonUpdated)
+		if got != 9 {
+			t.Errorf("namespaced count = %d, want 9 (must not include the cluster-scoped item's 6 or the other namespace's 2)", got)
 		}
 	})
 }

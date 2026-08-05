@@ -41,7 +41,7 @@
 // Usage:
 //
 //	update-tester run <manifest.yaml> [--timeout 120] [--poll-interval 60s]
-//	update-tester converge <manifest.yaml> [--poll-interval 60s] [--ignore-fields a,b] [--timeout 120s]
+//	update-tester converge <manifest.yaml> [--poll-interval 60s] [--ignore-fields a,b] [--timeout 120s] [--readiness-timeout 120s]
 //	update-tester validate <manifest.yaml> --types-file <types.go>
 //	update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
 //	update-tester resolve-recover <manifest.yaml> [--timeout 120]
@@ -129,7 +129,7 @@ func printUsage() {
 
 Usage:
   update-tester run <manifest.yaml> [--timeout 120] [--poll-interval 60s]
-  update-tester converge <manifest.yaml> [--poll-interval 60s] [--ignore-fields a,b] [--timeout 120s]
+  update-tester converge <manifest.yaml> [--poll-interval 60s] [--ignore-fields a,b] [--timeout 120s] [--readiness-timeout 120s]
   update-tester validate <manifest.yaml> --types-file <types.go>
   update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
   update-tester resolve-recover <manifest.yaml> [--timeout 120]
@@ -364,10 +364,11 @@ func cmdValidate(args []string) error {
 
 // convergeOptions holds the parsed command line of the `converge` subcommand.
 type convergeOptions struct {
-	manifestPath string
-	pollInterval time.Duration
-	ignoreFields []string
-	timeout      time.Duration
+	manifestPath     string
+	pollInterval     time.Duration
+	ignoreFields     []string
+	timeout          time.Duration
+	readinessTimeout time.Duration
 }
 
 func parseConvergeArgs(args []string) (convergeOptions, error) {
@@ -375,12 +376,14 @@ func parseConvergeArgs(args []string) (convergeOptions, error) {
 	pollInterval := fs.Duration("poll-interval", 60*time.Second, "Provider poll interval; determines wait duration")
 	ignoreFields := fs.String("ignore-fields", "", "Comma-separated atProvider fields excluded from snapshot diff")
 	timeout := fs.Duration("timeout", 120*time.Second, "Max time for the pre-check to settle")
+	readinessTimeout := fs.Duration("readiness-timeout", 120*time.Second,
+		"Max time to wait for the Ready condition before the baseline snapshot; on timeout the check proceeds anyway")
 	if err := fs.Parse(cli.ReorderArgs(fs, args)); err != nil {
 		return convergeOptions{}, err
 	}
 	if fs.NArg() < 1 {
 		return convergeOptions{}, errors.New(
-			"usage: update-tester converge <manifest.yaml> [--poll-interval 60s] [--ignore-fields a,b] [--timeout 120s]")
+			"usage: update-tester converge <manifest.yaml> [--poll-interval 60s] [--ignore-fields a,b] [--timeout 120s] [--readiness-timeout 120s]")
 	}
 
 	var ignore []string
@@ -388,10 +391,11 @@ func parseConvergeArgs(args []string) (convergeOptions, error) {
 		ignore = strings.Split(*ignoreFields, ",")
 	}
 	return convergeOptions{
-		manifestPath: fs.Arg(0),
-		pollInterval: *pollInterval,
-		ignoreFields: ignore,
-		timeout:      *timeout,
+		manifestPath:     fs.Arg(0),
+		pollInterval:     *pollInterval,
+		ignoreFields:     ignore,
+		timeout:          *timeout,
+		readinessTimeout: *readinessTimeout,
 	}, nil
 }
 
@@ -408,9 +412,10 @@ func cmdConverge(args []string) error {
 
 	r := runner.NewRunner(opts.manifestPath, int(opts.timeout.Seconds()))
 	result, err := r.RunConverge(m, runner.ConvergeOptions{
-		PollInterval: opts.pollInterval,
-		IgnoreFields: opts.ignoreFields,
-		Timeout:      opts.timeout,
+		PollInterval:     opts.pollInterval,
+		IgnoreFields:     opts.ignoreFields,
+		Timeout:          opts.timeout,
+		ReadinessTimeout: opts.readinessTimeout,
 	})
 	if err != nil {
 		return err
@@ -431,19 +436,23 @@ func cmdConverge(args []string) error {
 	return nil
 }
 
-// printConvergeResult prints the outcome of a convergence check.
+// printConvergeResult prints the outcome of a convergence check. Diagnostics
+// are printed whenever present, whether or not the check passed — a
+// readiness pre-check note is informational rather than a failure reason,
+// but an operator reading a passing result should still see it.
 func printConvergeResult(w io.Writer, m *manifest.Manifest, r *runner.ConvergeResult) {
 	printfTo(w, "Converge check: %s/%s\n", m.Kind, m.Name)
 	switch {
 	case r.Skipped:
 		printfTo(w, "  ⊘ CONVERGE-SKIP: %s\n", r.SkipMsg)
+		return
 	case r.Passed:
 		printfTo(w, "  ✓ converge: %s\n", r.Message)
 	default:
 		printfTo(w, "  ✗ converge: %s\n", r.Message)
-		for _, d := range r.Diagnostics {
-			printfTo(w, "    - %s\n", d)
-		}
+	}
+	for _, d := range r.Diagnostics {
+		printfTo(w, "    - %s\n", d)
 	}
 }
 

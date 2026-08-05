@@ -1,9 +1,12 @@
 package runner
 
 import (
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/kaessert/crossplane-update-tester/internal/differ"
+	"github.com/kaessert/crossplane-update-tester/internal/manifest"
 )
 
 // Kinds and names used across this package's tests. They stand in for any
@@ -148,7 +151,7 @@ func TestBuildConvergeResultReportsAggregatedUpdateDelta(t *testing.T) {
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			result := buildConvergeResult(nil, 1, 1, tc.beforeEvents, tc.afterEvents)
+			result := buildConvergeResult(nil, 1, 1, tc.beforeEvents, tc.afterEvents, true, nil)
 			if result.Passed != tc.wantPassed {
 				t.Errorf("Passed = %v, want %v (diagnostics: %v)", result.Passed, tc.wantPassed, result.Diagnostics)
 			}
@@ -163,11 +166,207 @@ func TestBuildConvergeResultReportsAggregatedUpdateDelta(t *testing.T) {
 func TestBuildConvergeResultFailsOnAtProviderDrift(t *testing.T) {
 	diff := []differ.FieldChange{{Field: "someCounter", OldValue: "1", NewValue: "2"}}
 
-	result := buildConvergeResult(diff, 1, 1, 0, 0)
+	result := buildConvergeResult(diff, 1, 1, 0, 0, true, nil)
 	if result.Passed {
 		t.Fatalf("expected Passed=false when atProvider drifted, got %+v", result)
 	}
 	if len(result.Diagnostics) == 0 {
 		t.Error("expected a diagnostic naming the drifted field")
 	}
+}
+
+// TestBuildConvergeResultReadinessFlapFailsIndependently confirms a final
+// Ready!=True reading is its own failure reason, distinct from the
+// atProvider diff: a resource with a perfectly stable atProvider snapshot
+// (zero diff, zero new events, unchanged generation) still fails the check
+// if it is not Ready at the final snapshot.
+func TestBuildConvergeResultReadinessFlapFailsIndependently(t *testing.T) {
+	result := buildConvergeResult(nil, 1, 1, 0, 0, false, nil)
+	if result.Passed {
+		t.Fatalf("expected Passed=false on a readiness flap with no atProvider drift, got %+v", result)
+	}
+	if len(result.Diagnostics) != 1 {
+		t.Fatalf("expected exactly one diagnostic (the readiness flap), got %v", result.Diagnostics)
+	}
+	if strings.Contains(result.Diagnostics[0], "atProvider changed") {
+		t.Errorf("readiness flap diagnostic must not be folded into the atProvider diff wording: %q", result.Diagnostics[0])
+	}
+}
+
+// TestBuildConvergeResultReadinessTimeoutNoteNeverReplacesFieldDiagnostic is
+// the direct proof for the AC that matters most here: a baseline
+// readiness-pre-check note must be ADDED to the diagnostics, never
+// SUBSTITUTED for the field-level atProvider diagnostic a genuine
+// reconciliation loop would otherwise produce.
+func TestBuildConvergeResultReadinessTimeoutNoteNeverReplacesFieldDiagnostic(t *testing.T) {
+	diff := []differ.FieldChange{{Field: "someCounter", OldValue: "1", NewValue: "2"}}
+	notes := []string{"readiness pre-check: Ready condition did not reach True within 1s before the baseline snapshot; proceeding with field-level diagnostics"}
+
+	result := buildConvergeResult(diff, 1, 1, 0, 0, true, notes)
+	if result.Passed {
+		t.Fatalf("expected Passed=false: the atProvider diff is a real reconciliation-loop signal, got %+v", result)
+	}
+	if len(result.Diagnostics) != 2 {
+		t.Fatalf("expected both the readiness note AND the field-level diagnostic, got %v", result.Diagnostics)
+	}
+	if !strings.Contains(result.Diagnostics[0], "readiness pre-check") {
+		t.Errorf("Diagnostics[0] = %q, want the readiness note first", result.Diagnostics[0])
+	}
+	if !strings.Contains(result.Diagnostics[1], "atProvider changed") {
+		t.Errorf("Diagnostics[1] = %q, want the atProvider diff diagnostic — it must never be dropped", result.Diagnostics[1])
+	}
+}
+
+// TestBuildConvergeResultReadinessTimeoutNoteSurvivesAPass confirms the note
+// is surfaced even when the run otherwise passes cleanly — an operator
+// reading a passing result should still see that the baseline was taken
+// before Ready was confirmed True.
+func TestBuildConvergeResultReadinessTimeoutNoteSurvivesAPass(t *testing.T) {
+	notes := []string{"readiness pre-check: Ready condition did not reach True within 1s before the baseline snapshot; proceeding with field-level diagnostics"}
+
+	result := buildConvergeResult(nil, 1, 1, 0, 0, true, notes)
+	if !result.Passed {
+		t.Fatalf("expected Passed=true: nothing actually drifted, got %+v", result)
+	}
+	if len(result.Diagnostics) != 1 || !strings.Contains(result.Diagnostics[0], "readiness pre-check") {
+		t.Errorf("expected the readiness note to survive on a passing result, got %v", result.Diagnostics)
+	}
+}
+
+// TestWaitReady covers the three mandatory readiness-gate paths named in
+// this change's acceptance criteria: Ready immediately (the gate is a
+// no-op), Ready after a dip (the resource settles mid-poll), and Ready
+// never reached (the gate times out and reports ready=false with a nil
+// error, so RunConverge can proceed rather than fail outright).
+func TestWaitReady(t *testing.T) {
+	t.Run("ReadyImmediately", func(t *testing.T) {
+		f := &fakeCluster{generation: 1, readyAfterCalls: 1}
+		r := newFakeRunner(f)
+		var slept int
+		r.sleepFunc = func(time.Duration) { slept++ }
+
+		ready, err := r.waitReady(time.Second)
+		if err != nil {
+			t.Fatalf("waitReady() error = %v", err)
+		}
+		if !ready {
+			t.Fatal("waitReady() = false, want true — Ready on the very first read")
+		}
+		if slept != 0 {
+			t.Errorf("waitReady() slept %d time(s), want 0 — the gate must be a no-op when already Ready", slept)
+		}
+		if f.getObjectCalls != 1 {
+			t.Errorf("getObjectCalls = %d, want exactly 1", f.getObjectCalls)
+		}
+	})
+
+	t.Run("ReadyAfterADip", func(t *testing.T) {
+		f := &fakeCluster{generation: 1, readyAfterCalls: 3}
+		r := newFakeRunner(f)
+		r.sleepFunc = func(time.Duration) {}
+
+		ready, err := r.waitReady(time.Second)
+		if err != nil {
+			t.Fatalf("waitReady() error = %v", err)
+		}
+		if !ready {
+			t.Fatal("waitReady() = false, want true — the resource settles before the timeout")
+		}
+		if f.getObjectCalls != 3 {
+			t.Errorf("getObjectCalls = %d, want 3 (two NotReady reads, then True)", f.getObjectCalls)
+		}
+	})
+
+	t.Run("NeverReady", func(t *testing.T) {
+		f := &fakeCluster{generation: 1, neverReady: true}
+		r := newFakeRunner(f)
+		r.sleepFunc = func(time.Duration) {}
+
+		ready, err := r.waitReady(20 * time.Millisecond)
+		if err != nil {
+			t.Fatalf("waitReady() error = %v, want nil — a timeout is not itself a failure", err)
+		}
+		if ready {
+			t.Fatal("waitReady() = true, want false — the Ready condition never reports True")
+		}
+		if f.getObjectCalls == 0 {
+			t.Error("expected at least one poll before the timeout was recognised")
+		}
+	})
+}
+
+// TestRunConvergeReadinessGate exercises the readiness gate through
+// RunConverge itself, end to end against the fake cluster — proving the
+// gate is actually WIRED into RunConverge's baseline and final snapshots,
+// not merely correct in isolation.
+func TestRunConvergeReadinessGate(t *testing.T) {
+	m := &manifest.Manifest{Kind: testKindExample, Name: testNameExample}
+
+	t.Run("ReadyImmediatelyIsANoOp", func(t *testing.T) {
+		f := &fakeCluster{
+			generation:      1,
+			readyAfterCalls: 1,
+			atProvider:      map[string]interface{}{"zone": "a"},
+		}
+		r := newFakeRunner(f)
+		r.sleepFunc = func(time.Duration) {}
+
+		result, err := r.RunConverge(m, ConvergeOptions{
+			PollInterval:     time.Millisecond,
+			ReadinessTimeout: time.Second,
+			Timeout:          time.Second,
+		})
+		if err != nil {
+			t.Fatalf("RunConverge() error = %v", err)
+		}
+		if !result.Passed {
+			t.Fatalf("expected Passed=true, got %+v", result)
+		}
+		for _, d := range result.Diagnostics {
+			if strings.Contains(d, "readiness pre-check") {
+				t.Errorf("did not expect a readiness-timeout note when Ready from the start: %v", result.Diagnostics)
+			}
+		}
+	})
+
+	t.Run("TimeoutProceedsAndNotesButDoesNotReplaceFailure", func(t *testing.T) {
+		f := &fakeCluster{
+			generation: 1,
+			neverReady: true,
+			atProvider: map[string]interface{}{"zone": "a"},
+		}
+		r := newFakeRunner(f)
+		r.sleepFunc = func(time.Duration) {}
+
+		result, err := r.RunConverge(m, ConvergeOptions{
+			PollInterval:     time.Millisecond,
+			ReadinessTimeout: 5 * time.Millisecond,
+			Timeout:          time.Second,
+		})
+		if err != nil {
+			t.Fatalf("RunConverge() error = %v, want nil — a readiness timeout must not abort the run", err)
+		}
+		// neverReady means Ready is also False at the final snapshot, so
+		// this is a genuine readiness flap on top of the baseline timeout
+		// note — RunConverge must surface BOTH, proving the timeout note
+		// never displaces a real diagnostic.
+		if result.Passed {
+			t.Fatalf("expected Passed=false: Ready was never True, including at the final snapshot, got %+v", result)
+		}
+		var sawTimeoutNote, sawFlap bool
+		for _, d := range result.Diagnostics {
+			if strings.Contains(d, "readiness pre-check") {
+				sawTimeoutNote = true
+			}
+			if strings.Contains(d, "readiness flap") {
+				sawFlap = true
+			}
+		}
+		if !sawTimeoutNote {
+			t.Errorf("expected a readiness pre-check timeout note, got %v", result.Diagnostics)
+		}
+		if !sawFlap {
+			t.Errorf("expected a readiness flap diagnostic for the final snapshot, got %v", result.Diagnostics)
+		}
+	})
 }

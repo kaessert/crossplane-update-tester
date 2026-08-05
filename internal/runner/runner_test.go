@@ -136,6 +136,56 @@ type fakeCluster struct {
 	// assert the forced second reconcile fired without conflating it with
 	// the field patch itself.
 	nudgeCalls int
+
+	// getObjectCalls counts how many times handleGet has served the
+	// resource-under-test object itself (get <resource> -o json — not the
+	// events/pods/name lookups). readyAfterCalls compares against this to
+	// simulate a Ready condition that only appears after some number of
+	// polls, the way a real resource dips through NotReady before settling.
+	getObjectCalls int
+	// readyAfterCalls, when non-zero, makes handleGet embed a status.conditions
+	// entry of type Ready: status "False" on every read before
+	// getObjectCalls reaches this value, and "True" from that read onward.
+	// Zero (the default) means no Ready condition is embedded at all,
+	// matching a resource that has not been reconciled yet — every test in
+	// this file that never sets this field is unaffected, since
+	// extractObservedGeneration and isReadyTrue both already treat an absent
+	// conditions list as "not yet", not as an error.
+	readyAfterCalls int
+	// neverReady, when true, makes handleGet embed a Ready condition whose
+	// status is permanently "False" — used to exercise waitReady's timeout
+	// path and RunConverge's degrade-and-proceed behaviour. Takes priority
+	// over readyAfterCalls.
+	neverReady bool
+}
+
+// readyCondition reports the status.conditions entry handleGet should embed
+// for the CURRENT read (incrementing getObjectCalls first, so the very
+// first read is call 1, not call 0), and whether one should be embedded at
+// all. observedGeneration is always the live generation once ANY condition
+// is reported — mirroring a real controller, which sets it on every
+// condition it (re)computes regardless of that condition's status — so
+// readiness and generation-settling are independent knobs in these tests:
+// setting readyAfterCalls or neverReady does not, by itself, make
+// waitGenerationSettled loop.
+func (f *fakeCluster) readyCondition() (cond map[string]interface{}, ok bool) {
+	f.getObjectCalls++
+	status := "False"
+	switch {
+	case f.neverReady:
+		// status stays "False"
+	case f.readyAfterCalls > 0:
+		if f.getObjectCalls >= f.readyAfterCalls {
+			status = "True"
+		}
+	default:
+		return nil, false
+	}
+	return map[string]interface{}{
+		"type":               "Ready",
+		"status":             status,
+		"observedGeneration": f.generation,
+	}, true
 }
 
 // exec implements the Runner.execFunc signature, dispatching on the kubectl
@@ -179,10 +229,14 @@ func (f *fakeCluster) handleGet(args []string) (string, error) {
 			externalNameAnnotation: f.externalName,
 		}
 	}
+	status := map[string]interface{}{jsonKeyAtProvider: f.atProvider}
+	if cond, ok := f.readyCondition(); ok {
+		status["conditions"] = []interface{}{cond}
+	}
 	obj := map[string]interface{}{
 		"metadata":    metadata,
 		"spec":        map[string]interface{}{"forProvider": f.forProvider},
-		jsonKeyStatus: map[string]interface{}{jsonKeyAtProvider: f.atProvider},
+		jsonKeyStatus: status,
 	}
 	b, err := json.Marshal(obj)
 	if err != nil {

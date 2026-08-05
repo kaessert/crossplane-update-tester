@@ -47,6 +47,25 @@ type Runner struct {
 	// burst (see eventBurstCeiling). Tests inject a fake here; production
 	// code leaves it nil and resetEventBurst shells out to kubectl for real.
 	restartFunc func() error
+
+	// sleepFunc, when set, overrides the wait between iterations of a
+	// bounded poll loop (waitReady, waitGenerationSettled). Tests inject a
+	// no-op or near-instant stand-in so every poll iteration's logic — not
+	// just its first pass — runs without spending real wall-clock time;
+	// production code leaves it nil and sleep() calls time.Sleep for real.
+	sleepFunc func(time.Duration)
+}
+
+// sleep waits d, calling sleepFunc instead of time.Sleep when a test has
+// overridden it. Every bounded poll loop in this package waits through this
+// method rather than calling time.Sleep directly, so one override makes all
+// of them fast under test.
+func (r *Runner) sleep(d time.Duration) {
+	if r.sleepFunc != nil {
+		r.sleepFunc(d)
+		return
+	}
+	time.Sleep(d)
 }
 
 // NewRunner creates a Runner for the given manifest file.

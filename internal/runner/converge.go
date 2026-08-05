@@ -43,6 +43,13 @@ type ConvergeOptions struct {
 	// Timeout bounds the pre-check that waits for generation to settle to
 	// observedGeneration.
 	Timeout time.Duration
+	// ReadinessTimeout bounds the pre-check that waits for the resource's
+	// Ready condition to reach "True" before the baseline snapshot is taken.
+	// Defaults to the same 120s as Timeout when zero. On timeout the check
+	// proceeds to snapshot and diff exactly as it would without this gate —
+	// it only narrows the window in which a live, still-settling readiness
+	// fact can be captured as the baseline and later misread as drift.
+	ReadinessTimeout time.Duration
 }
 
 // ConvergeResult holds the outcome of a convergence check.
@@ -61,9 +68,16 @@ type ConvergeResult struct {
 // Algorithm:
 //  1. Resolve the resource from the manifest.
 //  2. PRE-CHECK: poll until metadata.generation == status.conditions[].observedGeneration.
-//  3. RECORD: snapshot atProvider, generation, and update-event count.
-//  4. WAIT: pollInterval * 1.5.
-//  5. ASSERT: atProvider unchanged, zero new update events, generation unchanged.
+//  3. READINESS GATE: poll until the Ready condition is "True", bounded by
+//     ReadinessTimeout. A resource still coming up mirrors live readiness
+//     facts into atProvider; snapshotting before it settles reads those as
+//     drift. On timeout this proceeds anyway (see ConvergeOptions.ReadinessTimeout)
+//     rather than replacing a field-level diagnostic with a bare timeout.
+//  4. RECORD: snapshot atProvider, generation, and update-event count.
+//  5. WAIT: pollInterval * 1.5.
+//  6. ASSERT: atProvider unchanged, zero new update events, generation
+//     unchanged, and Ready is still "True" (a readiness flap is reported as
+//     its own diagnostic, not folded into the atProvider diff).
 func (r *Runner) RunConverge(m *manifest.Manifest, opts ConvergeOptions) (*ConvergeResult, error) {
 	if m.ConvergeSkip != "" {
 		return &ConvergeResult{Skipped: true, SkipMsg: m.ConvergeSkip}, nil
@@ -92,6 +106,24 @@ func (r *Runner) RunConverge(m *manifest.Manifest, opts ConvergeOptions) (*Conve
 		}, nil
 	}
 
+	readinessTimeout := opts.ReadinessTimeout
+	if readinessTimeout <= 0 {
+		readinessTimeout = 120 * time.Second
+	}
+
+	var notes []string
+	baselineReady, err := r.waitReady(readinessTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("readiness pre-check: %w", err)
+	}
+	if !baselineReady {
+		// Proceed anyway: the field-level diagnostic below is never
+		// discarded in favour of this note, only supplemented by it.
+		notes = append(notes, fmt.Sprintf(
+			"readiness pre-check: Ready condition did not reach True within %s before the baseline snapshot; proceeding with field-level diagnostics",
+			readinessTimeout))
+	}
+
 	before, beforeEvents, err := r.recordConvergeBaseline(m)
 	if err != nil {
 		return nil, err
@@ -104,7 +136,7 @@ func (r *Runner) RunConverge(m *manifest.Manifest, opts ConvergeOptions) (*Conve
 	waitDur := time.Duration(float64(pollInterval) * 1.5)
 	time.Sleep(waitDur)
 
-	after, afterEvents, afterGen, err := r.recordConvergeOutcome(m)
+	after, afterEvents, afterGen, afterReady, err := r.recordConvergeOutcome(m)
 	if err != nil {
 		return nil, err
 	}
@@ -114,7 +146,7 @@ func (r *Runner) RunConverge(m *manifest.Manifest, opts ConvergeOptions) (*Conve
 		return nil, fmt.Errorf("diff: %w", err)
 	}
 
-	return buildConvergeResult(diff, gen, afterGen, beforeEvents, afterEvents), nil
+	return buildConvergeResult(diff, gen, afterGen, beforeEvents, afterEvents, afterReady, notes), nil
 }
 
 // recordConvergeBaseline snapshots atProvider and the update-event count
@@ -131,27 +163,38 @@ func (r *Runner) recordConvergeBaseline(m *manifest.Manifest) (snapshot []byte, 
 	return snapshot, events, nil
 }
 
-// recordConvergeOutcome snapshots atProvider, the update-event count, and the
-// generation after the convergence wait completes.
-func (r *Runner) recordConvergeOutcome(m *manifest.Manifest) (snapshot []byte, events int, gen int64, err error) {
+// recordConvergeOutcome snapshots atProvider, the update-event count, the
+// generation, and the Ready condition after the convergence wait completes.
+// Generation and readiness are both read from a single decoded object so
+// the two facts describe the exact same read of the resource.
+func (r *Runner) recordConvergeOutcome(m *manifest.Manifest) (snapshot []byte, events int, gen int64, ready bool, err error) {
 	snapshot, err = r.Snapshot()
 	if err != nil {
-		return nil, 0, 0, fmt.Errorf("post-wait snapshot: %w", err)
+		return nil, 0, 0, false, fmt.Errorf("post-wait snapshot: %w", err)
 	}
 	events, err = r.countUpdateEvents(m.Kind, m.Name)
 	if err != nil {
-		return nil, 0, 0, fmt.Errorf("counting events: %w", err)
+		return nil, 0, 0, false, fmt.Errorf("counting events: %w", err)
 	}
-	gen, err = r.GetGeneration()
+	obj, err := r.GetObject()
 	if err != nil {
-		return nil, 0, 0, fmt.Errorf("reading generation: %w", err)
+		return nil, 0, 0, false, fmt.Errorf("reading resource: %w", err)
 	}
-	return snapshot, events, gen, nil
+	gen, err = extractGeneration(obj)
+	if err != nil {
+		return nil, 0, 0, false, fmt.Errorf("reading generation: %w", err)
+	}
+	ready = isReadyTrue(obj)
+	return snapshot, events, gen, ready, nil
 }
 
-// buildConvergeResult evaluates the pre/post snapshots, event counts, and
-// generations, and assembles the final ConvergeResult.
-func buildConvergeResult(diff []differ.FieldChange, gen, afterGen int64, beforeEvents, afterEvents int) *ConvergeResult {
+// buildConvergeResult evaluates the pre/post snapshots, event counts,
+// generations, and final readiness, and assembles the final ConvergeResult.
+// notes are informational diagnostics (e.g. the baseline readiness-timeout
+// note) that are always surfaced, whether or not they change the verdict —
+// they must never be lost behind a field-level diagnostic, and must never
+// silently replace one either.
+func buildConvergeResult(diff []differ.FieldChange, gen, afterGen int64, beforeEvents, afterEvents int, afterReady bool, notes []string) *ConvergeResult {
 	var problems []string
 	passed := true
 
@@ -168,13 +211,25 @@ func buildConvergeResult(diff []differ.FieldChange, gen, afterGen int64, beforeE
 		passed = false
 		problems = append(problems, fmt.Sprintf("generation changed: %d → %d", gen, afterGen))
 	}
+	if !afterReady {
+		// Its own named diagnostic, deliberately kept out of the atProvider
+		// diff list above: a readiness flap is a distinct failure mode from
+		// a field drifting, even though both are reported through the same
+		// Diagnostics slice.
+		passed = false
+		problems = append(problems, "readiness flap: Ready condition was not True at the final snapshot")
+	}
+
+	diagnostics := append(append([]string{}, notes...), problems...)
 
 	result := &ConvergeResult{Passed: passed}
 	if passed {
 		result.Message = fmt.Sprintf("resource stable (1 cycle observed, %d updates)", afterEvents-beforeEvents)
 	} else {
 		result.Message = "RECONCILIATION LOOP DETECTED"
-		result.Diagnostics = problems
+	}
+	if len(diagnostics) > 0 {
+		result.Diagnostics = diagnostics
 	}
 	return result
 }
@@ -206,7 +261,32 @@ func (r *Runner) waitGenerationSettled(timeout time.Duration) (settled bool, gen
 		if time.Now().After(deadline) {
 			return false, gen, obsGen, nil
 		}
-		time.Sleep(2 * time.Second)
+		r.sleep(2 * time.Second)
+	}
+}
+
+// waitReady polls the resource until its status.conditions carries a Ready
+// condition with status "True", or timeout elapses. It mirrors
+// waitGenerationSettled's bounded-poll shape exactly — same deadline
+// pattern, same 2s cadence — rather than inventing a second waiting idiom.
+// Unlike waitGenerationSettled, a timeout here is not itself a failure: the
+// caller (RunConverge) decides what to do with ready=false, since the whole
+// point of this gate is to never let a readiness timeout replace a
+// field-level converge diagnostic.
+func (r *Runner) waitReady(timeout time.Duration) (ready bool, err error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		obj, gerr := r.GetObject()
+		if gerr != nil {
+			return false, gerr
+		}
+		if isReadyTrue(obj) {
+			return true, nil
+		}
+		if time.Now().After(deadline) {
+			return false, nil
+		}
+		r.sleep(2 * time.Second)
 	}
 }
 
@@ -334,6 +414,34 @@ func extractGeneration(obj map[string]interface{}) (int64, error) {
 		return 0, fmt.Errorf("metadata.generation not found")
 	}
 	return toInt64(genRaw)
+}
+
+// isReadyTrue reports whether a decoded resource object's status.conditions
+// carries a condition of type "Ready" whose status is "True". A missing
+// status, missing conditions, or a Ready condition with any other status
+// (or no Ready condition at all) all report false — a resource that has not
+// been reconciled yet is simply not ready, not an error.
+func isReadyTrue(obj map[string]interface{}) bool {
+	status, ok := obj[jsonKeyStatus].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	condsRaw, ok := status["conditions"].([]interface{})
+	if !ok {
+		return false
+	}
+	for _, cRaw := range condsRaw {
+		c, ok := cRaw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if t, _ := c["type"].(string); t != "Ready" {
+			continue
+		}
+		s, _ := c["status"].(string)
+		return s == "True"
+	}
+	return false
 }
 
 // extractObservedGeneration reads the minimum observedGeneration across all

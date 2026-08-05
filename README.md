@@ -33,7 +33,7 @@ Everything it asserts is derived from two sources:
 
 ```
 update-tester run <manifest.yaml> [--timeout 120] [--poll-interval 60s]
-update-tester converge <manifest.yaml> [--poll-interval 60s] [--ignore-fields a,b] [--timeout 120s]
+update-tester converge <manifest.yaml> [--poll-interval 60s] [--ignore-fields a,b] [--timeout 120s] [--readiness-timeout 120s]
 update-tester validate <manifest.yaml> --types-file <types.go>
 update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
 update-tester resolve-recover <manifest.yaml> [--timeout 120]
@@ -134,12 +134,21 @@ controller; set `UPDATE_TESTER_PROVIDER_DEPLOYMENT` to disambiguate.
 
 1. Poll until `metadata.generation` equals the `observedGeneration` carried by
    `status.conditions` (bounded by `--timeout`).
-2. Snapshot `status.atProvider`, the generation, and the update-Event count.
-3. Wait `--poll-interval * 1.5`, which guarantees at least one full reconcile
+2. Poll until the `Ready` condition reports `True` (bounded by
+   `--readiness-timeout`, defaulting to the same 120s as `--timeout`). A
+   resource that is still coming up mirrors live readiness facts into
+   `status.atProvider`, and snapshotting before it settles would read those
+   as drift. On timeout this step proceeds anyway rather than failing
+   outright — it only narrows the window in which that can happen — and adds
+   a diagnostic line noting the timeout without dropping anything else the
+   check finds.
+3. Snapshot `status.atProvider`, the generation, and the update-Event count.
+4. Wait `--poll-interval * 1.5`, which guarantees at least one full reconcile
    cycle.
-4. Assert that `status.atProvider` is unchanged (minus `--ignore-fields`), that
-   the generation is unchanged, and that **zero** new update Events were
-   recorded.
+5. Assert that `status.atProvider` is unchanged (minus `--ignore-fields`),
+   that the generation is unchanged, that **zero** new update Events were
+   recorded, and that `Ready` is still `True`. A `Ready` flap at this point is
+   reported as its own diagnostic, separate from the `atProvider` diff.
 
 A resource stuck in a perpetual update loop reports `Ready` on every cycle, so
 an assertion on `Ready` — the assertion an E2E harness makes by default — passes

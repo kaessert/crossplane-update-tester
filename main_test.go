@@ -473,13 +473,31 @@ func TestFlagAfterPositionalTakesEffect(t *testing.T) {
 				t.Fatalf("parseConvergeArgs(%q): %v", args, err)
 			}
 			want := convergeOptions{
-				manifestPath: path,
-				pollInterval: 90 * time.Second,
-				ignoreFields: []string{"a", "b"},
-				timeout:      300 * time.Second,
+				manifestPath:     path,
+				pollInterval:     90 * time.Second,
+				ignoreFields:     []string{"a", "b"},
+				timeout:          300 * time.Second,
+				readinessTimeout: 120 * time.Second,
 			}
 			if !reflect.DeepEqual(got, want) {
 				t.Errorf("parseConvergeArgs(%q) = %+v, want %+v", args, got, want)
+			}
+		}
+
+		// --readiness-timeout reorders like every other flag, and defaults
+		// to the same 120s as --timeout so a caller that never mentions it
+		// gets exactly today's behaviour.
+		for _, args := range [][]string{
+			{"--readiness-timeout", "45s", path},
+			{path, "--readiness-timeout", "45s"},
+			{path, "--readiness-timeout=45s"},
+		} {
+			got, err := parseConvergeArgs(args)
+			if err != nil {
+				t.Fatalf("parseConvergeArgs(%q): %v", args, err)
+			}
+			if got.manifestPath != path || got.readinessTimeout != 45*time.Second {
+				t.Errorf("parseConvergeArgs(%q) = %+v, want manifest %q and readiness timeout 45s", args, got, path)
 			}
 		}
 	})

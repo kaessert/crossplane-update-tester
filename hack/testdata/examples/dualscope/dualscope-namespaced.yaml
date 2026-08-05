@@ -1,9 +1,10 @@
 # The namespaced counterpart to dualscope-cluster.yaml: same Kind, same
-# metadata.name, differing only in namespace and apiVersion group. Its own
-# update-test field is deliberately never exercised by
-# hack/smoke-test.sh — the point of this fixture is to confirm that events
-# recorded for the CLUSTER-SCOPED sibling never count toward this one's
-# converge check.
+# metadata.name, differing only in namespace and apiVersion group.
+# hack/smoke-test.sh exercises this fixture in both directions: first as
+# the quiet sibling, confirming events recorded for the CLUSTER-SCOPED
+# sibling never count toward this one's converge check; then its own
+# update-test field IS exercised via `run`, and the cluster-scoped sibling
+# is re-checked to confirm isolation holds the other way too.
 apiVersion: dualscope.m.example.crossplane.io/v1alpha1
 kind: DualScope
 metadata:

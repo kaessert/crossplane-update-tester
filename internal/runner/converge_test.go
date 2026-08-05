@@ -245,6 +245,37 @@ func TestSumEventOccurrencesByReasonGroupMismatchStillExcludes(t *testing.T) {
 	}
 }
 
+// TestSumEventOccurrencesByReasonNamespaceAloneDiscriminatesSameGroup proves
+// the namespace check is independently load-bearing, not merely redundant
+// with the apiVersion-group check. Every other fixture in this file that
+// puts two variants of the same Kind+Name in one list varies the apiVersion
+// GROUP alongside the namespace, so the group check alone is sufficient to
+// pass those and the namespace check is never the thing actually under
+// test. Here both events share Kind, Name AND apiVersion group, and differ
+// ONLY in involvedObject.namespace — one cluster-scoped (""), one
+// namespaced — so a query must be attributed to its own namespace on the
+// namespace check alone.
+func TestSumEventOccurrencesByReasonNamespaceAloneDiscriminatesSameGroup(t *testing.T) {
+	list := eventList{Items: []eventItem{
+		newTestEventItemScoped(eventReasonUpdated, 6, testKindExample, testNameExample, "", testAPIVersionNamespaced),
+		newTestEventItemScoped(eventReasonUpdated, 2, testKindExample, testNameExample, testNamespaceExample, testAPIVersionNamespaced),
+	}}
+
+	t.Run("ClusterScopedQuerySeesOnlyItsOwnEvents", func(t *testing.T) {
+		got := sumEventOccurrencesByReason(list, testKindExample, testNameExample, "", testAPIVersionNamespaced, eventReasonUpdated)
+		if got != 6 {
+			t.Errorf("cluster-scoped count = %d, want 6 (must not include the namespaced item's 2 — same group, so only namespace tells them apart)", got)
+		}
+	})
+
+	t.Run("NamespacedQuerySeesOnlyItsOwnEvents", func(t *testing.T) {
+		got := sumEventOccurrencesByReason(list, testKindExample, testNameExample, testNamespaceExample, testAPIVersionNamespaced, eventReasonUpdated)
+		if got != 2 {
+			t.Errorf("namespaced count = %d, want 2 (must not include the cluster-scoped item's 6 — same group, so only namespace tells them apart)", got)
+		}
+	})
+}
+
 // TestApiGroup covers the group-extraction helper directly: the split point,
 // a core-group (no slash) value, and the empty string.
 func TestApiGroup(t *testing.T) {

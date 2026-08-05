@@ -36,16 +36,40 @@ func TestPrintResultsCounters(t *testing.T) {
 		contains []string
 	}{
 		{
-			name:     "PassIsCountedOnce",
-			results:  []runner.TestResult{{Field: "comment", Passed: true, Expected: "a", Actual: "a", Duration: 2 * time.Second}},
+			// The pre-patch value (Before) differs from the post-patch target
+			// (Expected/Actual): the printed line must show that real
+			// transition, not Expected → Actual, which would print the same
+			// value "a" on both sides of the arrow and read as a no-op that
+			// never happened.
+			name: "PassIsCountedOnce",
+			results: []runner.TestResult{{
+				Field: "comment", Passed: true, Before: "b", BeforeKnown: true,
+				Expected: "a", Actual: "a", Duration: 2 * time.Second,
+			}},
 			want:     counts{passed: 1},
-			contains: []string{`  ✓ comment: "a" → "a" (2s)`, "Differential: all non-target fields stable ✓"},
+			contains: []string{`  ✓ comment: "b" → "a" (2s)`, "Differential: all non-target fields stable ✓"},
 		},
 		{
-			name:     "SlowPassIsAnnotatedButStillPasses",
-			results:  []runner.TestResult{{Field: "comment", Passed: true, SlowObserve: true, Expected: "a", Actual: "a", Duration: 45 * time.Second}},
+			name: "SlowPassIsAnnotatedButStillPasses",
+			results: []runner.TestResult{{
+				Field: "comment", Passed: true, SlowObserve: true, Before: "b", BeforeKnown: true,
+				Expected: "a", Actual: "a", Duration: 45 * time.Second,
+			}},
 			want:     counts{passed: 1},
-			contains: []string{`  ✓ comment: "a" → "a" (45s, slow-observe)`},
+			contains: []string{`  ✓ comment: "b" → "a" (45s, slow-observe)`},
+		},
+		{
+			// The pre-patch read failed (BeforeKnown false), e.g. the field
+			// was absent from both spec.forProvider and status.atProvider
+			// before the first write. The line must fall back to explicit
+			// expected/observed labels rather than printing a bare arrow with
+			// an unknown left side.
+			name: "PassWithoutKnownBeforeFallsBackToLabels",
+			results: []runner.TestResult{{
+				Field: "comment", Passed: true, Expected: "a", Actual: "a", Duration: 2 * time.Second,
+			}},
+			want:     counts{passed: 1},
+			contains: []string{`  ✓ comment: expected "a", observed "a" (2s)`},
 		},
 		{
 			name:     "SkipIsNeitherPassedNorFailed",
@@ -80,7 +104,7 @@ func TestPrintResultsCounters(t *testing.T) {
 		{
 			name: "SideEffectsAreReportedAndSuppressTheStableLine",
 			results: []runner.TestResult{{
-				Field: "comment", Passed: true, Expected: "a", Actual: "a", Duration: time.Second,
+				Field: "comment", Passed: true, Before: "old", BeforeKnown: true, Expected: "a", Actual: "a", Duration: time.Second,
 				SideFx: []differ.FieldChange{{Field: "ttl", OldValue: "30", NewValue: "60"}},
 			}},
 			want:     counts{passed: 1},
@@ -89,7 +113,7 @@ func TestPrintResultsCounters(t *testing.T) {
 		{
 			name: "MixedRunCountsEveryModeSeparately",
 			results: []runner.TestResult{
-				{Field: "a", Passed: true, Expected: "1", Actual: "1"},
+				{Field: "a", Passed: true, Before: "0", BeforeKnown: true, Expected: "1", Actual: "1"},
 				{Field: "b", Skipped: true, SkipMsg: "immutable"},
 				{Field: "c", NoOp: true, Error: errors.New("no-op")},
 				{Field: "d", NotEvidenced: true, Error: errors.New("no event")},
@@ -126,7 +150,7 @@ func TestUntrustedResultFailsTheRun(t *testing.T) {
 		name   string
 		result runner.TestResult
 	}{
-		{name: "UntrustedWhilePassing", result: runner.TestResult{Field: "comment", EvidenceUntrusted: true, Passed: true, Expected: "a", Actual: "a"}},
+		{name: "UntrustedWhilePassing", result: runner.TestResult{Field: "comment", EvidenceUntrusted: true, Passed: true, Before: "b", BeforeKnown: true, Expected: "a", Actual: "a"}},
 		{name: "UntrustedWhileNotEvidenced", result: runner.TestResult{Field: "comment", EvidenceUntrusted: true, NotEvidenced: true}},
 		{name: "UntrustedAlone", result: runner.TestResult{Field: "comment", EvidenceUntrusted: true}},
 	}
@@ -151,6 +175,73 @@ func TestUntrustedResultFailsTheRun(t *testing.T) {
 				t.Errorf("output missing the untrusted marker\noutput:\n%s", out)
 			}
 		})
+	}
+}
+
+// TestPassTransition pins passTransition's two shapes directly: a known
+// pre-patch value produces a plain arrow, and an unknown one falls back to
+// explicit labels rather than printing an arrow with a blank or misleading
+// left side.
+func TestPassTransition(t *testing.T) {
+	tests := []struct {
+		name   string
+		result runner.TestResult
+		want   string
+	}{
+		{
+			name:   "KnownBeforeProducesAnArrow",
+			result: runner.TestResult{Before: "transaction", BeforeKnown: true, Expected: "session", Actual: "session"},
+			want:   `"transaction" → "session"`,
+		},
+		{
+			name: "UnknownBeforeFallsBackToLabels",
+			// BeforeKnown left false — the pre-patch read failed, so Before
+			// must not be trusted even if it happens to be non-empty.
+			result: runner.TestResult{Before: "stale-leftover", Expected: "session", Actual: "session"},
+			want:   `expected "session", observed "session"`,
+		},
+		{
+			name:   "KnownEmptyBeforeIsDistinctFromUnknown",
+			result: runner.TestResult{Before: "", BeforeKnown: true, Expected: "x", Actual: "x"},
+			want:   `"" → "x"`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := passTransition(tc.result); got != tc.want {
+				t.Errorf("passTransition(%+v) = %q, want %q", tc.result, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPassLineIsNotReadableAsANoOp is the regression test for the defect
+// this display fix addresses: a genuine transaction→session update used to
+// print as `mode: "session" → "session"` — Expected paired with Actual, both
+// the post-update target — which reads exactly like the no-op the update
+// test exists to catch, even though the transition genuinely happened. The
+// PASS line must show the value that actually changed on the left.
+func TestPassLineIsNotReadableAsANoOp(t *testing.T) {
+	result := runner.TestResult{
+		Field: "mode", Passed: true, SlowObserve: true,
+		Before: "transaction", BeforeKnown: true,
+		Expected: "session", Actual: "session",
+		Duration: 12 * time.Second,
+	}
+
+	out, got := run([]runner.TestResult{result})
+
+	if got.passed != 1 {
+		t.Fatalf("counts = %+v, want 1 passed", got)
+	}
+	const wantLine = `  ✓ mode: "transaction" → "session" (12s, slow-observe)`
+	if !strings.Contains(out, wantLine) {
+		t.Errorf("output missing %q\noutput:\n%s", wantLine, out)
+	}
+	const noOpShape = `"session" → "session"`
+	if strings.Contains(out, noOpShape) {
+		t.Errorf("output contains %q — a real transition must never print the same value on both sides of the arrow\noutput:\n%s", noOpShape, out)
 	}
 }
 

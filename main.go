@@ -275,12 +275,12 @@ func printResults(w io.Writer, results []runner.TestResult) (passed, failed, noo
 			printfTo(w, "  ✗ %s: ERROR (%v) (%s)\n", r.Field, r.Error, fmtDuration(r.Duration))
 			failed++
 		case r.Passed && r.SlowObserve:
-			printfTo(w, "  ✓ %s: %q → %q (%s, slow-observe)\n",
-				r.Field, r.Expected, r.Actual, fmtDuration(r.Duration))
+			printfTo(w, "  ✓ %s: %s (%s, slow-observe)\n",
+				r.Field, passTransition(r), fmtDuration(r.Duration))
 			passed++
 		case r.Passed:
-			printfTo(w, "  ✓ %s: %q → %q (%s)\n",
-				r.Field, r.Expected, r.Actual, fmtDuration(r.Duration))
+			printfTo(w, "  ✓ %s: %s (%s)\n",
+				r.Field, passTransition(r), fmtDuration(r.Duration))
 			passed++
 		default:
 			printfTo(w, "  ✗ %s: expected %q, got %q (%s)\n",
@@ -299,6 +299,24 @@ func printResults(w io.Writer, results []runner.TestResult) (passed, failed, noo
 		printfTo(w, "\n")
 	}
 	return passed, failed, noop, notEvidenced, untrusted
+}
+
+// passTransition formats the value pairing shown on a PASS line. It prefers
+// the pre-patch value captured immediately before the patch (r.Before), so
+// the line reads as a genuine before → after transition. Expected and Actual
+// are both the post-update target on a PASS, so pairing them instead — as
+// this used to do — prints the same value on both sides of the arrow and
+// reads as the no-op the update-test exists to catch, even though the no-op
+// guard already ran and the field genuinely changed. r.Before is only
+// unset when the pre-patch read itself failed, in which case the pairing
+// falls back to explicit expected/observed labels instead of a bare arrow,
+// so the line is never printed in a shape that COULD be misread as a
+// before → after transition when it is not one.
+func passTransition(r runner.TestResult) string {
+	if r.BeforeKnown {
+		return fmt.Sprintf("%q → %q", r.Before, r.Actual)
+	}
+	return fmt.Sprintf("expected %q, observed %q", r.Expected, r.Actual)
 }
 
 // printSideEffects prints the fields that changed unexpectedly alongside a

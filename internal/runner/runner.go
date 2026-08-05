@@ -547,13 +547,26 @@ type TestResult struct {
 	// NoOp marks a test whose pre-patch value already equalled the target
 	// value: the patch below could not have exercised the Update() path, so
 	// this is reported as a distinct failure rather than a false PASS.
-	NoOp     bool
-	Passed   bool
-	Expected string
-	Actual   string
-	Duration time.Duration
-	Error    error
-	SideFx   []differ.FieldChange
+	NoOp   bool
+	Passed bool
+	// Before is the field's value as read immediately before the patch was
+	// applied (the same read the no-op check uses), valid only when
+	// BeforeKnown is true — that read can fail (e.g. the field is absent
+	// from both spec.forProvider and status.atProvider before the first
+	// write), and an empty string is also a legitimate field value, so a
+	// separate flag is needed to tell "read failed" from "read an empty
+	// value" apart. Display code uses Before, not Expected, as the left
+	// side of a PASS line: Expected and Actual are both the post-update
+	// target, so printing "expected → actual" on a successful transition
+	// shows the same value on both sides and reads as a no-op that never
+	// happened. Before → Actual is what actually changed.
+	Before      string
+	BeforeKnown bool
+	Expected    string
+	Actual      string
+	Duration    time.Duration
+	Error       error
+	SideFx      []differ.FieldChange
 	// UpdateEvidenced records whether the aggregated count of
 	// UpdatedExternalResource/CannotUpdateExternalResource events for this
 	// resource increased between the pre-patch baseline and the post-patch
@@ -885,7 +898,12 @@ func (r *Runner) runFieldTest(t manifest.UpdateTest, snapshot []byte, kind, name
 	// controller with no Update() implementation at all. Report this as a
 	// failure instead, distinct from both PASS and SKIP, so the stale test
 	// value gets fixed.
-	if before, err := r.readCurrentValue(t.Field); err == nil && jsonEqual(t.Value, before) {
+	before, beforeErr := r.readCurrentValue(t.Field)
+	if beforeErr == nil {
+		result.Before = before
+		result.BeforeKnown = true
+	}
+	if beforeErr == nil && jsonEqual(t.Value, before) {
 		result.NoOp = true
 		result.Expected = expected
 		result.Actual = before

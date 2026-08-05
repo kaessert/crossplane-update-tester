@@ -718,6 +718,9 @@ func TestRunFieldTestNoOpDetection(t *testing.T) {
 	if !strings.Contains(result.Error.Error(), wantSubstr) {
 		t.Errorf("error = %q, want substring %q", result.Error.Error(), wantSubstr)
 	}
+	if !result.BeforeKnown || result.Before != "10" {
+		t.Errorf("Before = %q, BeforeKnown = %v, want \"10\", true — the no-op check already read the pre-patch value", result.Before, result.BeforeKnown)
+	}
 	if f.patchCalls != 0 {
 		t.Errorf("expected 0 patch calls for a no-op field, got %d", f.patchCalls)
 	}
@@ -761,6 +764,13 @@ func TestRunFieldTestExecutesWhenValueDiffers(t *testing.T) {
 	}
 	if !result.Passed {
 		t.Fatalf("expected the update test to pass, got %+v", result)
+	}
+	// The pre-patch value (5) must survive on the result distinct from the
+	// post-patch target (10, on both Expected and Actual once the test
+	// passes) — it is what lets a PASS line show the transition that
+	// actually happened instead of the target value paired with itself.
+	if !result.BeforeKnown || result.Before != "5" {
+		t.Errorf("Before = %q, BeforeKnown = %v, want \"5\", true", result.Before, result.BeforeKnown)
 	}
 	if !result.UpdateEvidenced {
 		t.Errorf("expected UpdateEvidenced=true when the controller emits an update event, got %+v", result)

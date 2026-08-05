@@ -193,6 +193,75 @@ func TestBuildConvergeResultReadinessFlapFailsIndependently(t *testing.T) {
 	}
 }
 
+// TestBuildConvergeResultHeadline pins the headline message to the failure
+// reason rather than assuming every failure is a reconciliation loop: only
+// an atProvider diff or a new update event is real evidence the controller
+// wrote something repeatedly. A readiness flap and/or an unsettled
+// generation, on their own, are failures but not loops.
+func TestBuildConvergeResultHeadline(t *testing.T) {
+	driftDiff := []differ.FieldChange{{Field: "someCounter", OldValue: "1", NewValue: "2"}}
+
+	cases := map[string]struct {
+		diff                      []differ.FieldChange
+		gen, afterGen             int64
+		beforeEvents, afterEvents int
+		afterReady                bool
+		wantMessage               string
+	}{
+		"ReadinessFlapOnlyIsNotALoop": {
+			diff: nil, gen: 1, afterGen: 1,
+			beforeEvents: 0, afterEvents: 0,
+			afterReady:  false,
+			wantMessage: "RESOURCE NOT IN STEADY STATE",
+		},
+		"GenerationChangeOnlyIsNotALoop": {
+			diff: nil, gen: 1, afterGen: 2,
+			beforeEvents: 0, afterEvents: 0,
+			afterReady:  true,
+			wantMessage: "RESOURCE NOT IN STEADY STATE",
+		},
+		"ReadinessFlapAndGenerationChangeTogetherStillNotALoop": {
+			diff: nil, gen: 1, afterGen: 2,
+			beforeEvents: 0, afterEvents: 0,
+			afterReady:  false,
+			wantMessage: "RESOURCE NOT IN STEADY STATE",
+		},
+		"AtProviderDriftIsALoop": {
+			diff: driftDiff, gen: 1, afterGen: 1,
+			beforeEvents: 0, afterEvents: 0,
+			afterReady:  true,
+			wantMessage: "RECONCILIATION LOOP DETECTED",
+		},
+		"UpdateEventDeltaIsALoop": {
+			diff: nil, gen: 1, afterGen: 1,
+			beforeEvents: 1, afterEvents: 3,
+			afterReady:  true,
+			wantMessage: "RECONCILIATION LOOP DETECTED",
+		},
+		"DriftAlongsideReadinessFlapStillReportsLoopVerbatim": {
+			diff: driftDiff, gen: 1, afterGen: 1,
+			beforeEvents: 0, afterEvents: 0,
+			afterReady:  false,
+			wantMessage: "RECONCILIATION LOOP DETECTED",
+		},
+		"NothingWrongPasses": {
+			diff: nil, gen: 1, afterGen: 1,
+			beforeEvents: 0, afterEvents: 0,
+			afterReady:  true,
+			wantMessage: "resource stable (1 cycle observed, 0 updates)",
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			result := buildConvergeResult(tc.diff, tc.gen, tc.afterGen, tc.beforeEvents, tc.afterEvents, tc.afterReady, nil)
+			if result.Message != tc.wantMessage {
+				t.Errorf("Message = %q, want %q (diagnostics: %v)", result.Message, tc.wantMessage, result.Diagnostics)
+			}
+		})
+	}
+}
+
 // TestBuildConvergeResultReadinessTimeoutNoteNeverReplacesFieldDiagnostic is
 // the direct proof for the AC that matters most here: a baseline
 // readiness-pre-check note must be ADDED to the diagnostics, never
@@ -368,5 +437,42 @@ func TestRunConvergeReadinessGate(t *testing.T) {
 		if !sawFlap {
 			t.Errorf("expected a readiness flap diagnostic for the final snapshot, got %v", result.Diagnostics)
 		}
+		if result.Message != "RESOURCE NOT IN STEADY STATE" {
+			t.Errorf("Message = %q, want %q — nothing here is evidence of a reconciliation loop, only that Ready never went True", result.Message, "RESOURCE NOT IN STEADY STATE")
+		}
 	})
+}
+
+// TestRunConvergeGenerationNeverSettlesReportsSteadyStateNotLoop pins the
+// headline for the pre-check timeout path (waitGenerationSettled never
+// observing metadata.generation reach observedGeneration): this has always
+// been reported as "RECONCILIATION LOOP DETECTED", but a generation that
+// simply never settles is not evidence a reconciler is looping — nothing
+// has been observed to repeat.
+func TestRunConvergeGenerationNeverSettlesReportsSteadyStateNotLoop(t *testing.T) {
+	m := &manifest.Manifest{Kind: testKindExample, Name: testNameExample}
+	// No readyAfterCalls and neverReady left false means fakeCluster never
+	// embeds a status.conditions entry at all, so extractObservedGeneration
+	// never finds one to compare against — waitGenerationSettled spins
+	// until its own timeout without ever settling.
+	f := &fakeCluster{generation: 1}
+	r := newFakeRunner(f)
+	r.sleepFunc = func(time.Duration) {}
+
+	result, err := r.RunConverge(m, ConvergeOptions{
+		PollInterval: time.Millisecond,
+		Timeout:      20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("RunConverge() error = %v, want nil", err)
+	}
+	if result.Passed {
+		t.Fatalf("expected Passed=false: generation never settled, got %+v", result)
+	}
+	if result.Message != "RESOURCE NOT IN STEADY STATE" {
+		t.Errorf("Message = %q, want %q", result.Message, "RESOURCE NOT IN STEADY STATE")
+	}
+	if len(result.Diagnostics) != 1 || !strings.Contains(result.Diagnostics[0], "pre-check: generation") {
+		t.Errorf("expected exactly one pre-check diagnostic naming the unsettled generation, got %v", result.Diagnostics)
+	}
 }

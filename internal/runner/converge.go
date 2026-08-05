@@ -97,9 +97,13 @@ func (r *Runner) RunConverge(m *manifest.Manifest, opts ConvergeOptions) (*Conve
 		return nil, fmt.Errorf("pre-check: %w", err)
 	}
 	if !settled {
+		// Not a reconciliation loop: nothing has been observed to change
+		// repeatedly, the resource has simply never reached a settled
+		// generation within the timeout. See buildConvergeResult for the
+		// equivalent distinction on the post-wait path.
 		return &ConvergeResult{
 			Passed:  false,
-			Message: "RECONCILIATION LOOP DETECTED",
+			Message: "RESOURCE NOT IN STEADY STATE",
 			Diagnostics: []string{
 				fmt.Sprintf("pre-check: generation (%d) did not settle to observedGeneration (%d) within %s", gen, obsGen, timeout),
 			},
@@ -197,13 +201,22 @@ func (r *Runner) recordConvergeOutcome(m *manifest.Manifest) (snapshot []byte, e
 func buildConvergeResult(diff []differ.FieldChange, gen, afterGen int64, beforeEvents, afterEvents int, afterReady bool, notes []string) *ConvergeResult {
 	var problems []string
 	passed := true
+	// loopSignal is true only for the two failure modes that are actually
+	// evidence of the controller repeatedly writing something: the
+	// atProvider snapshot moved, or a new update event fired. A readiness
+	// flap or a bare generation change are signs the resource has not
+	// settled, not signs of a loop, so they must never earn the headline
+	// on their own.
+	loopSignal := false
 
 	if len(diff) > 0 {
 		passed = false
+		loopSignal = true
 		problems = append(problems, fmt.Sprintf("atProvider changed: %s", differ.FormatChanges(diff)))
 	}
 	if afterEvents > beforeEvents {
 		passed = false
+		loopSignal = true
 		problems = append(problems, fmt.Sprintf("%d new update event(s) observed (%s/%s)",
 			afterEvents-beforeEvents, eventReasonUpdated, eventReasonCannotUpdate))
 	}
@@ -223,10 +236,19 @@ func buildConvergeResult(diff []differ.FieldChange, gen, afterGen int64, beforeE
 	diagnostics := append(append([]string{}, notes...), problems...)
 
 	result := &ConvergeResult{Passed: passed}
-	if passed {
+	switch {
+	case passed:
 		result.Message = fmt.Sprintf("resource stable (1 cycle observed, %d updates)", afterEvents-beforeEvents)
-	} else {
+	case loopSignal:
+		// A genuine atProvider drift or update-event delta: this is what
+		// operators and past tickets search for, so the string stays
+		// verbatim regardless of what else also failed alongside it.
 		result.Message = "RECONCILIATION LOOP DETECTED"
+	default:
+		// The only problems are a readiness flap and/or an unsettled
+		// generation — real, but not a loop: nothing was observed
+		// repeating.
+		result.Message = "RESOURCE NOT IN STEADY STATE"
 	}
 	if len(diagnostics) > 0 {
 		result.Diagnostics = diagnostics

@@ -376,7 +376,9 @@ type eventList struct {
 // sumEventOccurrencesByReason tell apart a cluster-scoped resource and a
 // namespaced resource that share the same Kind and Name — the unified
 // example-manifest convention every dual-scope provider follows. Namespace
-// is empty for a cluster-scoped involvedObject.
+// is empty for a cluster-scoped involvedObject. APIVersion may legitimately
+// be empty: not every event source populates it, and sumEventOccurrencesByReason
+// treats that as "group unknown", not "group empty" — see its comment.
 type eventItem struct {
 	Reason         string `json:"reason"`
 	Count          int32  `json:"count"`
@@ -396,31 +398,63 @@ func sumEventOccurrences(list eventList, kind, name, namespace, apiVersion strin
 	return sumEventOccurrencesByReason(list, kind, name, namespace, apiVersion, eventReasonUpdated, eventReasonCannotUpdate)
 }
 
+// apiGroup returns the group portion of an apiVersion string
+// ("group/version" → "group"). A core-group value with no slash (e.g. "v1")
+// has no group and returns "".
+func apiGroup(apiVersion string) string {
+	if i := strings.IndexByte(apiVersion, '/'); i >= 0 {
+		return apiVersion[:i]
+	}
+	return ""
+}
+
 // sumEventOccurrencesByReason sums the aggregated .count field of every
 // event Item matching the given involvedObject kind/name/namespace/
 // apiVersion and any of the given reasons, treating a zero .count as a
 // single (non-aggregated) occurrence.
 //
-// Matching namespace and apiVersion, in addition to kind and name, is what
-// keeps a cluster-scoped resource and a namespaced resource of the same
-// Kind+Name from being counted together: the unified example-manifest
-// convention every dual-scope provider follows names both variants
-// identically, differing only in involvedObject.namespace and
-// involvedObject.apiVersion. A cluster-scoped resource's namespace argument
-// must be the empty string, which matches only events whose involvedObject
-// itself carries an empty namespace — never "any namespace".
+// Matching namespace, in addition to kind and name, is what keeps a
+// cluster-scoped resource and a namespaced resource of the same Kind+Name
+// from being counted together: the unified example-manifest convention
+// every dual-scope provider follows names both variants identically,
+// differing only in involvedObject.namespace and involvedObject.apiVersion's
+// GROUP. A cluster-scoped resource's namespace argument must be the empty
+// string, which matches only events whose involvedObject itself carries an
+// empty namespace — never "any namespace".
+//
+// apiVersion is compared by GROUP only, not the full string, and only when
+// the event actually carries one:
+//
+//   - Comparing groups rather than the full apiVersion tolerates a version
+//     skew between the manifest and the served object (a CRD version bump, a
+//     conversion webhook) without silently zeroing the count for a resource
+//     that is otherwise the right one. It is also exactly the discriminator
+//     a dual-scope provider's two variants actually differ on — e.g.
+//     "widget.crossplane.io" vs "widget.m.crossplane.io" — never the version.
+//   - An event whose involvedObject carries an EMPTY apiVersion is treated as
+//     "group unknown", not "group empty", and is never excluded on that
+//     basis: not every event source populates the field, and excluding it
+//     would silently zero a genuinely looping resource's count on any such
+//     source. Namespace has already narrowed the match to one scope by this
+//     point, so letting an unknown group through cannot reintroduce a
+//     cross-scope false match — it only ever widens a match that is already
+//     namespace-correct.
 func sumEventOccurrencesByReason(list eventList, kind, name, namespace, apiVersion string, reasons ...string) int {
 	want := make(map[string]bool, len(reasons))
 	for _, reason := range reasons {
 		want[reason] = true
 	}
+	wantGroup := apiGroup(apiVersion)
 
 	var total int32
 	for _, it := range list.Items {
 		if it.InvolvedObject.Kind != kind || it.InvolvedObject.Name != name {
 			continue
 		}
-		if it.InvolvedObject.Namespace != namespace || it.InvolvedObject.APIVersion != apiVersion {
+		if it.InvolvedObject.Namespace != namespace {
+			continue
+		}
+		if raw := it.InvolvedObject.APIVersion; raw != "" && apiGroup(raw) != wantGroup {
 			continue
 		}
 		if !want[it.Reason] {

@@ -459,6 +459,113 @@ for expected in \
   fi
 done
 
+# ─── 6b. dual-scope event attribution, end to end ───────────────────────────
+#
+# dualscope-cluster.yaml and dualscope-namespaced.yaml share the SAME Kind
+# and the SAME metadata.name — the unified example-manifest convention every
+# dual-scope provider follows — differing only in scope and apiVersion
+# group. This is the direct proof, through the real fake + runner (not just
+# a unit-level fixture), that an update to one is never attributed to the
+# other.
+
+section "6b. dual-scope event attribution (same Kind+Name, different scope) end-to-end"
+
+DUALSCOPE_STATE="$TMP/state-dualscope"
+mkdir -p "$DUALSCOPE_STATE"
+CLUSTER_DUALSCOPE_MANIFEST="$TREE/examples/dualscope/dualscope-cluster.yaml"
+NAMESPACED_DUALSCOPE_MANIFEST="$TREE/examples/dualscope/dualscope-namespaced.yaml"
+
+DUALSCOPE_RUN_OUT="$TMP/dualscope-cluster-run.out"
+set +e
+(cd "$ELSEWHERE" && SMOKE_STATE="$DUALSCOPE_STATE" go -C "$STUB" tool crossplane-update-tester \
+  run "$CLUSTER_DUALSCOPE_MANIFEST" --timeout 5) >"$DUALSCOPE_RUN_OUT" 2>&1
+DUALSCOPE_RUN_RC=$?
+set -e
+
+if [ "$DUALSCOPE_RUN_RC" -eq 0 ]; then
+  ok "cluster-scoped dualscope: run exited 0 (comment field updated, events recorded)"
+else
+  bad "cluster-scoped dualscope: run exited $DUALSCOPE_RUN_RC, expected 0"
+  dump "run output" "$DUALSCOPE_RUN_OUT"
+fi
+
+if grep -q 'PASS: 1/1 tested' "$DUALSCOPE_RUN_OUT"; then
+  ok "cluster-scoped dualscope: the mutable field PASSed (an UpdatedExternalResource event was recorded)"
+else
+  bad "cluster-scoped dualscope: expected 'PASS: 1/1 tested' in the run output"
+  dump "run output" "$DUALSCOPE_RUN_OUT"
+fi
+
+DUALSCOPE_CONVERGE_OUT="$TMP/dualscope-namespaced-converge.out"
+set +e
+(cd "$ELSEWHERE" && SMOKE_STATE="$DUALSCOPE_STATE" go -C "$STUB" tool crossplane-update-tester \
+  converge "$NAMESPACED_DUALSCOPE_MANIFEST" --poll-interval 1s --timeout 5s --readiness-timeout 5s) \
+  >"$DUALSCOPE_CONVERGE_OUT" 2>&1
+DUALSCOPE_CONVERGE_RC=$?
+set -e
+
+if [ "$DUALSCOPE_CONVERGE_RC" -eq 0 ]; then
+  ok "namespaced dualscope sibling: converge PASSED despite the cluster-scoped sibling's recorded event"
+else
+  bad "namespaced dualscope sibling: converge FAILED — the cluster-scoped sibling's event bled across scope"
+  dump "converge output" "$DUALSCOPE_CONVERGE_OUT"
+fi
+
+if grep -q '0 updates' "$DUALSCOPE_CONVERGE_OUT"; then
+  ok "namespaced dualscope sibling: converge reported 0 updates (event isolation confirmed)"
+else
+  bad "namespaced dualscope sibling: expected a converge message reporting 0 updates"
+  dump "converge output" "$DUALSCOPE_CONVERGE_OUT"
+fi
+
+# Reverse direction: now make the NAMESPACED sibling the one that genuinely
+# updates, and confirm the CLUSTER-SCOPED sibling — which by now also has an
+# events entry of its own, from the run above — still reports 0 updates.
+# Isolation must hold in both directions, not just the one this scenario
+# happened to exercise first.
+DUALSCOPE_NS_RUN_OUT="$TMP/dualscope-namespaced-run.out"
+set +e
+(cd "$ELSEWHERE" && SMOKE_STATE="$DUALSCOPE_STATE" go -C "$STUB" tool crossplane-update-tester \
+  run "$NAMESPACED_DUALSCOPE_MANIFEST" --timeout 5) >"$DUALSCOPE_NS_RUN_OUT" 2>&1
+DUALSCOPE_NS_RUN_RC=$?
+set -e
+
+if [ "$DUALSCOPE_NS_RUN_RC" -eq 0 ] && grep -q 'PASS: 1/1 tested' "$DUALSCOPE_NS_RUN_OUT"; then
+  ok "namespaced dualscope sibling: run also PASSed (it now has its own recorded event too)"
+else
+  bad "namespaced dualscope sibling: run did not PASS as expected"
+  dump "run output" "$DUALSCOPE_NS_RUN_OUT"
+fi
+
+DUALSCOPE_CLUSTER_CONVERGE_OUT="$TMP/dualscope-cluster-converge.out"
+set +e
+(cd "$ELSEWHERE" && SMOKE_STATE="$DUALSCOPE_STATE" go -C "$STUB" tool crossplane-update-tester \
+  converge "$CLUSTER_DUALSCOPE_MANIFEST" --poll-interval 1s --timeout 5s --readiness-timeout 5s) \
+  >"$DUALSCOPE_CLUSTER_CONVERGE_OUT" 2>&1
+DUALSCOPE_CLUSTER_CONVERGE_RC=$?
+set -e
+
+if [ "$DUALSCOPE_CLUSTER_CONVERGE_RC" -eq 0 ]; then
+  ok "cluster-scoped dualscope sibling: converge PASSED despite the namespaced sibling's own recorded events"
+else
+  bad "cluster-scoped dualscope sibling: converge FAILED — the namespaced sibling's events bled across scope"
+  dump "converge output" "$DUALSCOPE_CLUSTER_CONVERGE_OUT"
+fi
+
+if grep -q '0 updates' "$DUALSCOPE_CLUSTER_CONVERGE_OUT"; then
+  ok "cluster-scoped dualscope sibling: converge reported 0 updates (isolation holds in both directions)"
+else
+  bad "cluster-scoped dualscope sibling: expected a converge message reporting 0 updates"
+  dump "converge output" "$DUALSCOPE_CLUSTER_CONVERGE_OUT"
+fi
+
+if grep -q 'FAKE-KUBECTL-ERROR' "$DUALSCOPE_STATE/kubectl.log"; then
+  bad "dual-scope scenario: the fake kubectl rejected an invocation"
+  grep -h 'FAKE-KUBECTL-ERROR' "$DUALSCOPE_STATE/kubectl.log" | sed 's/^/   | /' >&2
+else
+  ok "dual-scope scenario: every kubectl invocation was one the fake recognises"
+fi
+
 # ─── 7. a failing step must fail the hook and abort the rest ───────────────
 
 section "7a. failure injection: reconcile loop (drifting atProvider)"
@@ -517,6 +624,42 @@ if grep -qE '^patch networks.* --type=merge -p \{"spec"' "$TMP/state-stuck/kubec
 else
   bad "expected a spec patch in the transcript for the 'stuck' scenario"
   dump "kubectl transcript" "$TMP/state-stuck/kubectl.log"
+fi
+
+section "7c. failure injection: reconciliation loop via repeated update events (no atProvider drift)"
+
+run_hook post-assert-network-v6.sh loop loop
+
+if [ "$RC" -ne 0 ]; then
+  ok "hook exited $RC (non-zero) when update events kept growing with no atProvider drift"
+else
+  bad "hook exited 0 despite update events growing on every poll — a broken check would pass E2E silently"
+  dump "hook output" "$OUT"
+fi
+
+if grep -q 'RECONCILIATION LOOP DETECTED' "$OUT"; then
+  ok "reported: RECONCILIATION LOOP DETECTED"
+else
+  bad "expected 'RECONCILIATION LOOP DETECTED' in the output"
+  dump "hook output" "$OUT"
+fi
+
+# This is the direct proof that converge still COUNTS: the diagnostic must
+# name a NON-ZERO new-event delta, not just an atProvider diff. A change that
+# makes every delta 0 (this ticket's exact regression) would report no such
+# diagnostic and this check would catch it.
+if grep -qE '[1-9][0-9]* new update event\(s\) observed' "$OUT"; then
+  ok "diagnostic names a non-zero new-event count — converge is still COUNTING events, not just diffing atProvider"
+else
+  bad "expected a 'N new update event(s) observed' diagnostic naming a non-zero delta"
+  dump "hook output" "$OUT"
+fi
+
+loop_banners="$(banners "$OUT" | cut -f1 | tr '\n' ',')"
+if [ "$loop_banners" = "converge," ]; then
+  ok "aborted at step 1: the remaining 4 steps never ran"
+else
+  bad "expected the hook to stop after 'converge', got: $loop_banners"
 fi
 
 # ─── summary ───────────────────────────────────────────────────────────────

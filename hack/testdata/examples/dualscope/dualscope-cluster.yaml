@@ -1,0 +1,22 @@
+# The end-to-end proof for dual-scope event attribution (see
+# hack/smoke-test.sh section "dual-scope event attribution"): this manifest
+# and dualscope-namespaced.yaml share the SAME Kind and the SAME
+# metadata.name — the unified example-manifest convention every dual-scope
+# provider follows — and differ ONLY in scope (no namespace here) and
+# apiVersion GROUP ("dualscope.example.crossplane.io" here vs
+# "dualscope.m.example.crossplane.io" for the namespaced sibling). Running an
+# update against this one and then checking the sibling proves the two are
+# never attributed to each other's events.
+apiVersion: dualscope.example.crossplane.io/v1alpha1
+kind: DualScope
+metadata:
+  name: example-dualscope
+  annotations:
+    crossplane.io/update-test: |
+      - field: comment
+        value: "Updated by update-tester (cluster-scoped)"
+spec:
+  forProvider:
+    comment: Managed by Crossplane (cluster-scoped)
+  providerConfigRef:
+    name: default

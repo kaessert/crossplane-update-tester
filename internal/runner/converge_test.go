@@ -190,6 +190,83 @@ func TestSumEventOccurrencesByReasonScopesByNamespaceAndAPIVersion(t *testing.T)
 	})
 }
 
+// TestSumEventOccurrencesByReasonEmptyAPIVersionIsTreatedAsUnknownGroup is
+// the direct proof for the stated empty-apiVersion policy: an event whose
+// involvedObject carries no apiVersion at all (an event source that never
+// populates it — the exact defect this ticket traces to) must still be
+// counted, not silently dropped to zero. Namespace alone already scopes the
+// match to one resource here, so admitting an unknown group cannot bleed in
+// a sibling's events.
+func TestSumEventOccurrencesByReasonEmptyAPIVersionIsTreatedAsUnknownGroup(t *testing.T) {
+	list := eventList{Items: []eventItem{
+		// No InvolvedObject.APIVersion set at all — mirrors a fake or real
+		// event source that never populates the field.
+		newTestEventItem(eventReasonUpdated, 4, testKindExample, testNameExample),
+	}}
+
+	got := sumEventOccurrencesByReason(list, testKindExample, testNameExample, "", testAPIVersionClusterScoped, eventReasonUpdated)
+	if got != 4 {
+		t.Errorf("got %d, want 4 — an empty involvedObject.apiVersion must not zero out a genuinely matching event", got)
+	}
+}
+
+// TestSumEventOccurrencesByReasonToleratesVersionSkewWithinSameGroup proves
+// the matcher compares apiVersion by GROUP only: a served object reporting a
+// newer or older version than the manifest declares — the ordinary result of
+// a CRD version bump or a conversion webhook — must still be counted as long
+// as the group (and namespace) agree.
+func TestSumEventOccurrencesByReasonToleratesVersionSkewWithinSameGroup(t *testing.T) {
+	const (
+		manifestAPIVersion = "example.crossplane.io/v1alpha1"
+		servedAPIVersion   = "example.crossplane.io/v1beta1" // same group, different version
+	)
+	list := eventList{Items: []eventItem{
+		newTestEventItemScoped(eventReasonUpdated, 2, testKindExample, testNameExample, "", servedAPIVersion),
+	}}
+
+	got := sumEventOccurrencesByReason(list, testKindExample, testNameExample, "", manifestAPIVersion, eventReasonUpdated)
+	if got != 2 {
+		t.Errorf("got %d, want 2 — a version skew within the same group must not zero the count", got)
+	}
+}
+
+// TestSumEventOccurrencesByReasonGroupMismatchStillExcludes confirms the
+// group check still does real work: two DIFFERENT groups, same namespace
+// (a scenario the namespace check alone cannot catch), must not be summed
+// together.
+func TestSumEventOccurrencesByReasonGroupMismatchStillExcludes(t *testing.T) {
+	list := eventList{Items: []eventItem{
+		newTestEventItemScoped(eventReasonUpdated, 9, testKindExample, testNameExample, testNamespaceExample, testAPIVersionNamespaced),
+	}}
+
+	got := sumEventOccurrencesByReason(list, testKindExample, testNameExample, testNamespaceExample, testAPIVersionClusterScoped, eventReasonUpdated)
+	if got != 0 {
+		t.Errorf("got %d, want 0 — a genuinely different group, same namespace, must not match", got)
+	}
+}
+
+// TestApiGroup covers the group-extraction helper directly: the split point,
+// a core-group (no slash) value, and the empty string.
+func TestApiGroup(t *testing.T) {
+	cases := map[string]struct {
+		apiVersion string
+		want       string
+	}{
+		"GroupAndVersion":     {apiVersion: "example.crossplane.io/v1alpha1", want: "example.crossplane.io"},
+		"CoreGroupNoSlash":    {apiVersion: "v1", want: ""},
+		"Empty":               {apiVersion: "", want: ""},
+		"MultipleSlashesKeep": {apiVersion: "example.crossplane.io/v1alpha1/extra", want: "example.crossplane.io"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := apiGroup(tc.apiVersion)
+			if got != tc.want {
+				t.Errorf("apiGroup(%q) = %q, want %q", tc.apiVersion, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestBuildConvergeResultReportsAggregatedUpdateDelta ensures the pass/fail
 // decision reflects an update delta derived from aggregated event counts,
 // not raw Item counts. A looping resource whose events are aggregated into

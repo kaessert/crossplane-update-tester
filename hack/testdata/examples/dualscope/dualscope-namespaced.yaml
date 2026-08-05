@@ -1,0 +1,20 @@
+# The namespaced counterpart to dualscope-cluster.yaml: same Kind, same
+# metadata.name, differing only in namespace and apiVersion group. Its own
+# update-test field is deliberately never exercised by
+# hack/smoke-test.sh — the point of this fixture is to confirm that events
+# recorded for the CLUSTER-SCOPED sibling never count toward this one's
+# converge check.
+apiVersion: dualscope.m.example.crossplane.io/v1alpha1
+kind: DualScope
+metadata:
+  name: example-dualscope
+  namespace: crossplane-e2e
+  annotations:
+    crossplane.io/update-test: |
+      - field: comment
+        value: "Updated by update-tester (namespaced)"
+spec:
+  forProvider:
+    comment: Managed by Crossplane (namespaced)
+  providerConfigRef:
+    name: default

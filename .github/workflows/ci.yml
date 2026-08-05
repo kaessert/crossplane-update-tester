@@ -44,6 +44,9 @@ jobs:
       - name: go test
         run: go test ./... -count=1 -race
 
+      - name: smoke test
+        run: bash hack/smoke-test.sh
+
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v8
         with:

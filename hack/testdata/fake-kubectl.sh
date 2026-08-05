@@ -38,6 +38,13 @@
 #                                are emitted, but status.atProvider never
 #                                picks the new value up, i.e. the silent
 #                                update failure `run` exists to catch.
+#                            "loop" — every `get events` poll bumps
+#                                ev_update for every resource in state, with
+#                                no atProvider drift at all, i.e. a
+#                                reconciler that is genuinely stuck calling
+#                                Update() repeatedly — the event-count half
+#                                of what `converge` catches, independent of
+#                                the atProvider-diff half "drift" exercises.
 #   SMOKE_UPPERCASE_FIELDS   space-separated forProvider field names the
 #                            "backend" normalises to upper case when storing
 #                            them, so a manifest entry's `expect:` differing
@@ -70,11 +77,22 @@ json_escape() {
 
 # ─── resource state ────────────────────────────────────────────────────────
 #
-# One directory per resource under $STATE/res/<metadata.name>/, holding:
+# One directory per resource under $STATE/res/<res_key>/, holding:
 #   name apiVersion kind namespace type generation extname extname_prev
 #   paused ev_update ev_create drift
 #   spec/<field>   the value the last merge patch put in spec.forProvider
 #   at/<field>     the value the backend stores, i.e. status.atProvider
+#
+# res_key is keyed by NAMESPACE+NAME, not name alone: the unified
+# example-manifest convention every dual-scope provider follows gives the
+# cluster-scoped and namespaced variants of a Kind the exact same
+# metadata.name, differing only in namespace and apiVersion group. Keying by
+# name alone would collide the two into one state directory the moment a
+# fixture actually exercises that convention.
+res_key() {
+  local namespace=$1 name=$2
+  printf '%s__%s' "${namespace:-_cluster}" "$name"
+}
 
 # seed_from_manifest reads a manifest and materialises the resource state it
 # describes, if it does not exist yet. This is what makes the fake generic
@@ -94,7 +112,7 @@ seed_from_manifest() {
   [ -n "$kind" ] || die "manifest $f has no kind"
   [ -n "$name" ] || die "manifest $f has no metadata.name"
 
-  rd="$STATE/res/$name"
+  rd="$STATE/res/$(res_key "$namespace" "$name")"
   if [ -d "$rd" ]; then
     printf '%s' "$rd"
     return
@@ -139,10 +157,14 @@ seed_from_manifest() {
   printf '%s' "$rd"
 }
 
-# resource_dir maps a "<type>/<name>" identifier back to its state directory.
+# resource_dir maps a "<type>/<name>" identifier plus the namespace (empty
+# for cluster-scoped, as captured by strip_namespace) back to its state
+# directory. The namespace is REQUIRED, not inferred: two resources sharing
+# a name across scopes are two different state directories (see res_key).
 resource_dir() {
-  local rd="$STATE/res/${1##*/}"
-  [ -d "$rd" ] || die "no such resource: $1 (state dir $rd does not exist)"
+  local ident=$1 namespace=${2:-}
+  local rd="$STATE/res/$(res_key "$namespace" "${ident##*/}")"
+  [ -d "$rd" ] || die "no such resource: $ident (namespace='$namespace') (state dir $rd does not exist)"
   printf '%s' "$rd"
 }
 
@@ -214,12 +236,16 @@ render_object() {
 # ─── argv dispatch ─────────────────────────────────────────────────────────
 
 # strip_namespace removes a "-n <ns>" pair, which Runner.run() appends for a
-# namespaced resource. The remaining args are left in ARGS. It is applied only
-# to the resource-scoped commands: `get pods` and `rollout` carry a -n of
-# their own, which they are checked for.
+# namespaced resource. The remaining args are left in ARGS, and the
+# namespace value itself (empty if no "-n" was present) is left in NS — the
+# resource-scoped commands need it to key into $STATE/res (see res_key), not
+# just to strip it. It is applied only to the resource-scoped commands: `get
+# pods` and `rollout` carry a -n of their own, which they are checked for.
 ARGS=()
+NS=""
 strip_namespace() {
   ARGS=()
+  NS=""
   local skip=0 i=1
   local -a in=("$@")
   for ((i = 0; i < ${#in[@]}; i++)); do
@@ -228,6 +254,7 @@ strip_namespace() {
       continue
     fi
     if [ "${in[$i]}" = "-n" ]; then
+      NS="${in[$((i + 1))]:-}"
       skip=1
       continue
     fi
@@ -260,18 +287,36 @@ cmd_get() {
   if [ "${1:-}" = "events" ]; then
     [ "${2:-}" = "--all-namespaces" ] && [ "${3:-}" = "-o" ] && [ "${4:-}" = "json" ] ||
       die "unhandled 'get events' argv: $*"
-    local items=() dir name kind u c
+
+    # FAIL_MODE=loop simulates a controller that is genuinely stuck calling
+    # Update() repeatedly: every `get events` poll bumps ev_update for every
+    # resource currently in state, so two successive polls (the baseline and
+    # the outcome a converge check takes) see a growing count with no
+    # backend field ever changing — the exact signature a real reconcile
+    # loop produces, and the one converge exists to catch independently of
+    # any atProvider drift.
+    if [ "$FAIL_MODE" = "loop" ]; then
+      local ldir
+      for ldir in "$STATE"/res/*/; do
+        [ -d "$ldir" ] || continue
+        printf '%s' "$(($(cat "$ldir/ev_update") + 1))" >"$ldir/ev_update"
+      done
+    fi
+
+    local items=() dir name kind namespace apiVersion u c
     for dir in "$STATE"/res/*/; do
       [ -d "$dir" ] || continue
       name=$(cat "$dir/name")
       kind=$(cat "$dir/kind")
+      namespace=$(cat "$dir/namespace")
+      apiVersion=$(cat "$dir/apiVersion")
       u=$(cat "$dir/ev_update")
       c=$(cat "$dir/ev_create")
       if [ "$u" -gt 0 ]; then
-        items+=("{\"reason\":\"UpdatedExternalResource\",\"count\":$u,\"involvedObject\":{\"kind\":\"$kind\",\"name\":\"$name\"}}")
+        items+=("{\"reason\":\"UpdatedExternalResource\",\"count\":$u,\"involvedObject\":{\"kind\":\"$(json_escape "$kind")\",\"name\":\"$(json_escape "$name")\",\"namespace\":\"$(json_escape "$namespace")\",\"apiVersion\":\"$(json_escape "$apiVersion")\"}}")
       fi
       if [ "$c" -gt 0 ]; then
-        items+=("{\"reason\":\"CreatedExternalResource\",\"count\":$c,\"involvedObject\":{\"kind\":\"$kind\",\"name\":\"$name\"}}")
+        items+=("{\"reason\":\"CreatedExternalResource\",\"count\":$c,\"involvedObject\":{\"kind\":\"$(json_escape "$kind")\",\"name\":\"$(json_escape "$name")\",\"namespace\":\"$(json_escape "$namespace")\",\"apiVersion\":\"$(json_escape "$apiVersion")\"}}")
       fi
     done
     local joined=""
@@ -305,7 +350,7 @@ cmd_get() {
   # unhandled argv, not a shape to emulate.
   strip_namespace "$@"
   set -- "${ARGS[@]+"${ARGS[@]}"}"
-  rd=$(resource_dir "$1")
+  rd=$(resource_dir "$1" "$NS")
   [ "${2:-}" = "-o" ] || die "unhandled 'get' argv: $*"
   case "${3:-}" in
     json)
@@ -338,7 +383,7 @@ cmd_patch() {
   [ -n "$patch" ] || die "'patch' called without -p"
 
   local dir
-  dir=$(resource_dir "$rd")
+  dir=$(resource_dir "$rd" "$NS")
 
   # A status-subresource patch (clearing conditions) is a no-op here: this
   # fake's controller re-establishes Ready with the current observedGeneration
@@ -432,7 +477,7 @@ cmd_wait() {
     "--for=condition=Ready --timeout="*) ;;
     *) die "unhandled 'wait' argv: $rd $*" ;;
   esac
-  resource_dir "$rd" >/dev/null
+  resource_dir "$rd" "$NS" >/dev/null
   printf '%s condition met\n' "$rd"
 }
 

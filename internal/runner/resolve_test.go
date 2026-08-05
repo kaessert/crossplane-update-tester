@@ -181,7 +181,7 @@ func TestSumEventOccurrencesByReasonCreated(t *testing.T) {
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			got := sumEventOccurrencesByReason(tc.list, testKindExample, testNameExample, EventReasonCreated)
+			got := sumEventOccurrencesByReason(tc.list, testKindExample, testNameExample, "", "", EventReasonCreated)
 			if got != tc.want {
 				t.Errorf("%s: sumEventOccurrencesByReason() = %d, want %d", tc.reason, got, tc.want)
 			}

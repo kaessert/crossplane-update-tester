@@ -720,7 +720,7 @@ func (r *Runner) RunTests(m *manifest.Manifest) ([]TestResult, error) {
 		}
 
 		var result TestResult
-		result, snapshot = r.runFieldTest(t, snapshot, m.Kind, m.Name)
+		result, snapshot = r.runFieldTest(t, snapshot, m.Kind, m.Name, m.Namespace, m.APIVersion)
 		// A no-op test never reaches applyPatchAndReconcile, so it never
 		// consults the event-evidence check — the burst reset's success or
 		// failure is irrelevant to it.
@@ -871,11 +871,12 @@ func uniqueNonEmptyLines(out string) []string {
 // reconcile so status.atProvider reflects a fresh Observe rather than a
 // stale one, polls status.atProvider for the expected value, checks for
 // positive event evidence that Update() actually ran, and runs the
-// differential assertion against the prior snapshot. kind and name identify
-// the resource for the event-evidence lookup. It returns the test result and
-// the snapshot to use for the next test (unchanged from the input snapshot
-// if the test aborted early).
-func (r *Runner) runFieldTest(t manifest.UpdateTest, snapshot []byte, kind, name string) (TestResult, []byte) {
+// differential assertion against the prior snapshot. kind, name, namespace
+// and apiVersion identify the resource for the event-evidence lookup — see
+// countUpdateEvents for why all four matter, not just kind/name. It returns
+// the test result and the snapshot to use for the next test (unchanged from
+// the input snapshot if the test aborted early).
+func (r *Runner) runFieldTest(t manifest.UpdateTest, snapshot []byte, kind, name, namespace, apiVersion string) (TestResult, []byte) {
 	start := time.Now()
 	result := TestResult{Field: t.Field}
 
@@ -920,7 +921,7 @@ func (r *Runner) runFieldTest(t manifest.UpdateTest, snapshot []byte, kind, name
 	// it only disables the evidence check for this field. countUpdateEvents
 	// sums each Event's aggregated .Count field (with a zero-guard treating
 	// an absent/zero .Count as one occurrence) — not a raw Item count.
-	eventsBefore, eventsBeforeErr := r.countUpdateEvents(kind, name)
+	eventsBefore, eventsBeforeErr := r.countUpdateEvents(kind, name, namespace, apiVersion)
 
 	if err := r.applyPatchAndReconcile(t); err != nil {
 		result.Error = err
@@ -943,7 +944,7 @@ func (r *Runner) runFieldTest(t manifest.UpdateTest, snapshot []byte, kind, name
 	// false without downgrading the result — the evidence check could not
 	// run either way, which is different from having run and come back
 	// empty.
-	r.applyEvidenceCheck(&result, kind, name, t.Field, eventsBefore, eventsBeforeErr)
+	r.applyEvidenceCheck(&result, kind, name, namespace, apiVersion, t.Field, eventsBefore, eventsBeforeErr)
 
 	if result.Passed && result.Duration >= r.slowObserveThreshold() {
 		result.SlowObserve = true
@@ -1033,8 +1034,8 @@ func (r *Runner) nudgeAndReconcile() error {
 // PASS to NotEvidenced when the aggregated event count never grew (a value
 // match without an event is not proof Update() ran — see evidenceOutcome),
 // and records a counting error without overwriting one already present.
-func (r *Runner) applyEvidenceCheck(result *TestResult, kind, name, field string, eventsBefore int, eventsBeforeErr error) {
-	checked, evidenced, err := r.evidenceOutcome(kind, name, eventsBefore, eventsBeforeErr)
+func (r *Runner) applyEvidenceCheck(result *TestResult, kind, name, namespace, apiVersion, field string, eventsBefore int, eventsBeforeErr error) {
+	checked, evidenced, err := r.evidenceOutcome(kind, name, namespace, apiVersion, eventsBefore, eventsBeforeErr)
 	result.UpdateEvidenced = evidenced
 	if err != nil && result.Error == nil {
 		result.Error = err
@@ -1050,18 +1051,19 @@ func (r *Runner) applyEvidenceCheck(result *TestResult, kind, name, field string
 	}
 }
 
-// evidenceOutcome counts update-related events for (kind, name) and reports
-// whether the aggregated count grew relative to eventsBefore — proof that
-// Update() executed, independent of wall-clock convergence timing. checked
-// is false when the count could not be established (the pre-patch baseline
-// errored, or the post-patch recount errored); in that case evidenced is
-// meaningless and err explains what went wrong, but the caller should not
-// treat the absence of a count as absence of an update.
-func (r *Runner) evidenceOutcome(kind, name string, eventsBefore int, eventsBeforeErr error) (checked, evidenced bool, err error) {
+// evidenceOutcome counts update-related events for (kind, name, namespace,
+// apiVersion) and reports whether the aggregated count grew relative to
+// eventsBefore — proof that Update() executed, independent of wall-clock
+// convergence timing. checked is false when the count could not be
+// established (the pre-patch baseline errored, or the post-patch recount
+// errored); in that case evidenced is meaningless and err explains what
+// went wrong, but the caller should not treat the absence of a count as
+// absence of an update.
+func (r *Runner) evidenceOutcome(kind, name, namespace, apiVersion string, eventsBefore int, eventsBeforeErr error) (checked, evidenced bool, err error) {
 	if eventsBeforeErr != nil {
 		return false, false, fmt.Errorf("counting update events before patch: %w", eventsBeforeErr)
 	}
-	eventsAfter, afterErr := r.countUpdateEvents(kind, name)
+	eventsAfter, afterErr := r.countUpdateEvents(kind, name, namespace, apiVersion)
 	if afterErr != nil {
 		return false, false, fmt.Errorf("counting update events after patch: %w", afterErr)
 	}

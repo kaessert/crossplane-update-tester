@@ -160,7 +160,7 @@ func (r *Runner) recordConvergeBaseline(m *manifest.Manifest) (snapshot []byte, 
 	if err != nil {
 		return nil, 0, fmt.Errorf("recording snapshot: %w", err)
 	}
-	events, err = r.countUpdateEvents(m.Kind, m.Name)
+	events, err = r.countUpdateEvents(m.Kind, m.Name, m.Namespace, m.APIVersion)
 	if err != nil {
 		return nil, 0, fmt.Errorf("counting events: %w", err)
 	}
@@ -176,7 +176,7 @@ func (r *Runner) recordConvergeOutcome(m *manifest.Manifest) (snapshot []byte, e
 	if err != nil {
 		return nil, 0, 0, false, fmt.Errorf("post-wait snapshot: %w", err)
 	}
-	events, err = r.countUpdateEvents(m.Kind, m.Name)
+	events, err = r.countUpdateEvents(m.Kind, m.Name, m.Namespace, m.APIVersion)
 	if err != nil {
 		return nil, 0, 0, false, fmt.Errorf("counting events: %w", err)
 	}
@@ -313,36 +313,40 @@ func (r *Runner) waitReady(timeout time.Duration) (ready bool, err error) {
 }
 
 // countUpdateEvents counts occurrences of update-related events for the
-// given involvedObject kind/name, whose reason is UpdatedExternalResource
-// or CannotUpdateExternalResource. Queries across all namespaces because
-// cluster-scoped managed resources may have their events recorded outside
-// the resource's own namespace.
+// given involvedObject kind/name/namespace/apiVersion, whose reason is
+// UpdatedExternalResource or CannotUpdateExternalResource. The kubectl list
+// itself queries across all namespaces (see countEventsByReason); namespace
+// and apiVersion are what actually scope the count to one resource. Pass
+// namespace="" for a cluster-scoped resource — that matches only events
+// whose involvedObject itself carries no namespace, never "any namespace".
 //
 // client-go's event recorder aggregates repeated identical events onto a
 // single Item by incrementing that Item's .count field rather than
 // appending a new Item, so the number of matching Items is NOT the number
 // of occurrences. This function sums each matching Item's .count instead
 // of counting Items (see sumEventOccurrences).
-func (r *Runner) countUpdateEvents(kind, name string) (int, error) {
-	return r.countEventsByReason(kind, name, eventReasonUpdated, eventReasonCannotUpdate)
+func (r *Runner) countUpdateEvents(kind, name, namespace, apiVersion string) (int, error) {
+	return r.countEventsByReason(kind, name, namespace, apiVersion, eventReasonUpdated, eventReasonCannotUpdate)
 }
 
 // countCreateEvents counts occurrences of CreatedExternalResource events for
-// the given involvedObject kind/name, across the resource's ENTIRE
-// lifecycle (not a before/after delta like countUpdateEvents). Exactly one
-// occurrence is the expected outcome for a resource that has been created
-// once and recovered its identity via search (rather than a stored ref)
-// without duplicating — see RunResolveRecover.
-func (r *Runner) countCreateEvents(kind, name string) (int, error) {
-	return r.countEventsByReason(kind, name, EventReasonCreated)
+// the given involvedObject kind/name/namespace/apiVersion, across the
+// resource's ENTIRE lifecycle (not a before/after delta like
+// countUpdateEvents). Exactly one occurrence is the expected outcome for a
+// resource that has been created once and recovered its identity via search
+// (rather than a stored ref) without duplicating — see RunResolveRecover.
+func (r *Runner) countCreateEvents(kind, name, namespace, apiVersion string) (int, error) {
+	return r.countEventsByReason(kind, name, namespace, apiVersion, EventReasonCreated)
 }
 
 // countEventsByReason lists cluster events and sums the aggregated
 // occurrence count of every event matching the given involvedObject
-// kind/name and any of the given reasons. Queries across all namespaces
-// because cluster-scoped managed resources may have their events recorded
-// outside the resource's own namespace.
-func (r *Runner) countEventsByReason(kind, name string, reasons ...string) (int, error) {
+// kind/name/namespace/apiVersion and any of the given reasons. Queries
+// across all namespaces because cluster-scoped managed resources may have
+// their events recorded outside the resource's own namespace — the
+// namespace argument then filters the decoded list down to the one
+// involvedObject the caller means (see sumEventOccurrencesByReason).
+func (r *Runner) countEventsByReason(kind, name, namespace, apiVersion string, reasons ...string) (int, error) {
 	out, err := r.runRaw("get", "events", "--all-namespaces", "-o", "json")
 	if err != nil {
 		return 0, fmt.Errorf("listing events: %w", err)
@@ -353,7 +357,7 @@ func (r *Runner) countEventsByReason(kind, name string, reasons ...string) (int,
 		return 0, fmt.Errorf("parsing events JSON: %w", err)
 	}
 
-	return sumEventOccurrencesByReason(list, kind, name, reasons...), nil
+	return sumEventOccurrencesByReason(list, kind, name, namespace, apiVersion, reasons...), nil
 }
 
 // eventList mirrors the subset of a `kubectl get events -o json` response
@@ -367,27 +371,45 @@ type eventList struct {
 // events (client-go's event recorder increments it in place instead of
 // appending a new Item for a repeated identical event). A zero Count means
 // the event was recorded exactly once and is treated as 1 occurrence.
+//
+// Namespace and APIVersion, alongside Kind and Name, are what let
+// sumEventOccurrencesByReason tell apart a cluster-scoped resource and a
+// namespaced resource that share the same Kind and Name — the unified
+// example-manifest convention every dual-scope provider follows. Namespace
+// is empty for a cluster-scoped involvedObject.
 type eventItem struct {
 	Reason         string `json:"reason"`
 	Count          int32  `json:"count"`
 	InvolvedObject struct {
-		Kind string `json:"kind"`
-		Name string `json:"name"`
+		Kind       string `json:"kind"`
+		Name       string `json:"name"`
+		Namespace  string `json:"namespace"`
+		APIVersion string `json:"apiVersion"`
 	} `json:"involvedObject"`
 }
 
 // sumEventOccurrences sums the aggregated .count field of every event Item
-// matching the given involvedObject kind/name and an update-related reason,
-// treating a zero .count as a single (non-aggregated) occurrence.
-func sumEventOccurrences(list eventList, kind, name string) int {
-	return sumEventOccurrencesByReason(list, kind, name, eventReasonUpdated, eventReasonCannotUpdate)
+// matching the given involvedObject kind/name/namespace/apiVersion and an
+// update-related reason, treating a zero .count as a single (non-aggregated)
+// occurrence.
+func sumEventOccurrences(list eventList, kind, name, namespace, apiVersion string) int {
+	return sumEventOccurrencesByReason(list, kind, name, namespace, apiVersion, eventReasonUpdated, eventReasonCannotUpdate)
 }
 
 // sumEventOccurrencesByReason sums the aggregated .count field of every
-// event Item matching the given involvedObject kind/name and any of the
-// given reasons, treating a zero .count as a single (non-aggregated)
-// occurrence.
-func sumEventOccurrencesByReason(list eventList, kind, name string, reasons ...string) int {
+// event Item matching the given involvedObject kind/name/namespace/
+// apiVersion and any of the given reasons, treating a zero .count as a
+// single (non-aggregated) occurrence.
+//
+// Matching namespace and apiVersion, in addition to kind and name, is what
+// keeps a cluster-scoped resource and a namespaced resource of the same
+// Kind+Name from being counted together: the unified example-manifest
+// convention every dual-scope provider follows names both variants
+// identically, differing only in involvedObject.namespace and
+// involvedObject.apiVersion. A cluster-scoped resource's namespace argument
+// must be the empty string, which matches only events whose involvedObject
+// itself carries an empty namespace — never "any namespace".
+func sumEventOccurrencesByReason(list eventList, kind, name, namespace, apiVersion string, reasons ...string) int {
 	want := make(map[string]bool, len(reasons))
 	for _, reason := range reasons {
 		want[reason] = true
@@ -396,6 +418,9 @@ func sumEventOccurrencesByReason(list eventList, kind, name string, reasons ...s
 	var total int32
 	for _, it := range list.Items {
 		if it.InvolvedObject.Kind != kind || it.InvolvedObject.Name != name {
+			continue
+		}
+		if it.InvolvedObject.Namespace != namespace || it.InvolvedObject.APIVersion != apiVersion {
 			continue
 		}
 		if !want[it.Reason] {

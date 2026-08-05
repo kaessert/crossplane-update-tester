@@ -75,9 +75,37 @@ type fakeCluster struct {
 	// kind and name identify the resource for event-evidence lookups
 	// (kubectl get events ... involvedObject matching). Tests exercising
 	// countUpdateEvents/runFieldTest's evidence check set these to match
-	// the kind/name passed into runFieldTest.
-	kind string
-	name string
+	// the kind/name passed into runFieldTest. namespace and apiVersion do
+	// the same for the involvedObject fields that scope a dual-scope
+	// resource's events apart from its same-Kind-same-Name sibling; left
+	// empty (the default for every test that predates namespace/apiVersion
+	// scoping), they match a cluster-scoped resource.
+	kind       string
+	name       string
+	namespace  string
+	apiVersion string
+
+	// siblingKind/siblingName/siblingNamespace/siblingAPIVersion, when
+	// siblingKind is non-empty, make handleGetEvents also emit events for a
+	// SECOND involvedObject — standing in for the other scope of a
+	// dual-scope resource that shares this fake's Kind and Name but differs
+	// in namespace/apiVersion (the unified example-manifest convention
+	// every dual-scope provider follows). siblingEventBase is that sibling's
+	// aggregated .count on the very first handleGetEvents call;
+	// siblingEventGrowthPerCall adds that much MORE on every subsequent
+	// call, simulating a sibling resource that keeps emitting new update
+	// events across RunConverge's baseline/outcome reads — exactly the
+	// scenario that bled into the resource-under-test's delta before events
+	// were scoped by namespace/apiVersion.
+	siblingKind               string
+	siblingName               string
+	siblingNamespace          string
+	siblingAPIVersion         string
+	siblingEventBase          int32
+	siblingEventGrowthPerCall int32
+	// siblingEventCallCount counts handleGetEvents calls, so
+	// siblingEventGrowthPerCall can be applied per call.
+	siblingEventCallCount int
 
 	// resourceLines, when non-empty, overrides what
 	// `kubectl get -f <manifest> -o name` prints — one line per manifest
@@ -301,6 +329,7 @@ func (f *fakeCluster) handleGetPods(args []string) (string, error) {
 // so countUpdateEvents/sumEventOccurrences must sum across Items, not just
 // read the last one.
 func (f *fakeCluster) handleGetEvents() (string, error) {
+	f.siblingEventCallCount++
 	list := eventList{}
 	for i, count := range f.generations {
 		if count <= 0 {
@@ -313,6 +342,17 @@ func (f *fakeCluster) handleGetEvents() (string, error) {
 		item := eventItem{Reason: eventReasonUpdated, Count: reported}
 		item.InvolvedObject.Kind = f.kind
 		item.InvolvedObject.Name = f.name
+		item.InvolvedObject.Namespace = f.namespace
+		item.InvolvedObject.APIVersion = f.apiVersion
+		list.Items = append(list.Items, item)
+	}
+	if f.siblingKind != "" {
+		count := f.siblingEventBase + f.siblingEventGrowthPerCall*int32(f.siblingEventCallCount-1)
+		item := eventItem{Reason: eventReasonUpdated, Count: count}
+		item.InvolvedObject.Kind = f.siblingKind
+		item.InvolvedObject.Name = f.siblingName
+		item.InvolvedObject.Namespace = f.siblingNamespace
+		item.InvolvedObject.APIVersion = f.siblingAPIVersion
 		list.Items = append(list.Items, item)
 	}
 	b, err := json.Marshal(list)
@@ -671,7 +711,7 @@ func TestRunFieldTestSlowObserveTracksPollInterval(t *testing.T) {
 			}
 
 			test := manifest.UpdateTest{Field: testFieldNotifyDelay, Value: 10}
-			result, _ := r.runFieldTest(test, snapshot, testKindExample, testNameExample)
+			result, _ := r.runFieldTest(test, snapshot, testKindExample, testNameExample, "", "")
 
 			if !result.Passed {
 				t.Fatalf("%s: expected a PASS to annotate, got %+v", tc.reason, result)
@@ -703,7 +743,7 @@ func TestRunFieldTestNoOpDetection(t *testing.T) {
 	}
 
 	test := manifest.UpdateTest{Field: testFieldNotifyDelay, Value: 10}
-	result, newSnapshot := r.runFieldTest(test, snapshot, testKindExample, testNameExample)
+	result, newSnapshot := r.runFieldTest(test, snapshot, testKindExample, testNameExample, "", "")
 
 	if !result.NoOp {
 		t.Fatalf("expected NoOp=true, got %+v", result)
@@ -754,7 +794,7 @@ func TestRunFieldTestExecutesWhenValueDiffers(t *testing.T) {
 	}
 
 	test := manifest.UpdateTest{Field: testFieldNotifyDelay, Value: 10}
-	result, newSnapshot := r.runFieldTest(test, snapshot, testKindExample, testNameExample)
+	result, newSnapshot := r.runFieldTest(test, snapshot, testKindExample, testNameExample, "", "")
 
 	if result.NoOp {
 		t.Fatalf("expected NoOp=false when the pre-patch value differs, got %+v", result)
@@ -820,7 +860,7 @@ func TestRunFieldTestNotEvidencedWhenNoUpdateEvent(t *testing.T) {
 	}
 
 	test := manifest.UpdateTest{Field: testFieldNotifyDelay, Value: 10}
-	result, _ := r.runFieldTest(test, snapshot, testKindExample, testNameExample)
+	result, _ := r.runFieldTest(test, snapshot, testKindExample, testNameExample, "", "")
 
 	if result.Passed {
 		t.Fatalf("expected Passed=false when no update event was recorded, got %+v", result)
@@ -862,7 +902,7 @@ func TestRunFieldTestZeroCountEventStillEvidencesUpdate(t *testing.T) {
 	}
 
 	test := manifest.UpdateTest{Field: testFieldNotifyDelay, Value: 10}
-	result, _ := r.runFieldTest(test, snapshot, testKindExample, testNameExample)
+	result, _ := r.runFieldTest(test, snapshot, testKindExample, testNameExample, "", "")
 
 	if !result.UpdateEvidenced {
 		t.Fatalf("expected UpdateEvidenced=true for a zero-count first occurrence, got %+v", result)
@@ -893,7 +933,7 @@ func TestRunFieldTestNoOpUsesExpectOverride(t *testing.T) {
 	}
 
 	test := manifest.UpdateTest{Field: testFieldFeatureEnabled, Value: true, Expect: true}
-	result, _ := r.runFieldTest(test, snapshot, testKindExample, testNameExample)
+	result, _ := r.runFieldTest(test, snapshot, testKindExample, testNameExample, "", "")
 
 	if !result.NoOp {
 		t.Fatalf("expected NoOp=true, got %+v", result)

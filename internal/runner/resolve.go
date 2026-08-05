@@ -86,7 +86,7 @@ func (r *Runner) RunResolveRecover(m *manifest.Manifest) (*ResolveRecoverResult,
 		return nil, fmt.Errorf("reading external-name after recovery: %w", err)
 	}
 
-	createEvents, err := r.countCreateEvents(m.Kind, m.Name)
+	createEvents, err := r.countCreateEvents(m.Kind, m.Name, m.Namespace, m.APIVersion)
 	if err != nil {
 		return nil, fmt.Errorf("counting create events: %w", err)
 	}

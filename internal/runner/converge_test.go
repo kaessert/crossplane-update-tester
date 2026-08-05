@@ -20,15 +20,39 @@ const (
 	// testNameOtherInstance is a second instance of testKindExample — used
 	// to prove event matching is per-object, not per-kind.
 	testNameOtherInstance = "some-other-example-resource"
+
+	// testNamespaceExample is the namespace a NAMESPACED variant of
+	// testKindExample/testNameExample lives in. The cluster-scoped variant
+	// uses the empty string.
+	testNamespaceExample = "default"
+	// testAPIVersionClusterScoped and testAPIVersionNamespaced are the two
+	// apiVersion strings a dual-scope provider's unified example manifests
+	// carry for the SAME Kind+Name — differing only in API group, per the
+	// namespaced-group naming convention. They stand in for any provider's
+	// real groups; the matching logic under test is group-string-agnostic.
+	testAPIVersionClusterScoped = "example.crossplane.io/v1alpha1"
+	testAPIVersionNamespaced    = "example.m.crossplane.io/v1alpha1"
 )
 
-// newTestEventItem builds an eventItem for the given reason, aggregated
-// count, kind, and name — reducing repetition of the anonymous
-// InvolvedObject struct literal across test cases.
+// newTestEventItem builds a CLUSTER-SCOPED eventItem for the given reason,
+// aggregated count, kind, and name — reducing repetition of the anonymous
+// InvolvedObject struct literal across test cases. Namespace is left empty
+// and APIVersion is left unset, matching every existing test's fixtures
+// (none of which exercise namespace/apiVersion scoping).
 func newTestEventItem(reason string, count int32, kind, name string) eventItem {
 	e := eventItem{Reason: reason, Count: count}
 	e.InvolvedObject.Kind = kind
 	e.InvolvedObject.Name = name
+	return e
+}
+
+// newTestEventItemScoped builds an eventItem carrying an explicit namespace
+// and apiVersion, for tests that exercise dual-scope event attribution — a
+// cluster-scoped and a namespaced resource sharing the same Kind and Name.
+func newTestEventItemScoped(reason string, count int32, kind, name, namespace, apiVersion string) eventItem {
+	e := newTestEventItem(reason, count, kind, name)
+	e.InvolvedObject.Namespace = namespace
+	e.InvolvedObject.APIVersion = apiVersion
 	return e
 }
 
@@ -115,12 +139,55 @@ func TestSumEventOccurrences(t *testing.T) {
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			got := sumEventOccurrences(tc.list, tc.kind, tc.name)
+			got := sumEventOccurrences(tc.list, tc.kind, tc.name, "", "")
 			if got != tc.want {
 				t.Errorf("sumEventOccurrences() = %d, want %d", got, tc.want)
 			}
 		})
 	}
+}
+
+// TestSumEventOccurrencesByReasonScopesByNamespaceAndAPIVersion is the
+// direct proof for this change's acceptance criteria: a cluster-scoped and
+// a namespaced resource sharing the same Kind and Name — the unified
+// example-manifest convention every dual-scope provider follows — must each
+// see only their own events, never the other's. A cluster-scoped resource's
+// namespace argument ("") must match ONLY events whose involvedObject
+// itself carries an empty namespace, not events from any namespace.
+func TestSumEventOccurrencesByReasonScopesByNamespaceAndAPIVersion(t *testing.T) {
+	// One fixture list containing BOTH variants of the same Kind+Name: a
+	// cluster-scoped Item (empty namespace, cluster-scoped apiVersion) and
+	// a namespaced Item (non-empty namespace, namespaced apiVersion) — the
+	// exact scenario a unified dual-scope example manifest produces.
+	list := eventList{Items: []eventItem{
+		newTestEventItemScoped(eventReasonUpdated, 3, testKindExample, testNameExample, "", testAPIVersionClusterScoped),
+		newTestEventItemScoped(eventReasonUpdated, 5, testKindExample, testNameExample, testNamespaceExample, testAPIVersionNamespaced),
+	}}
+
+	t.Run("ClusterScopedSeesOnlyItsOwnEvents", func(t *testing.T) {
+		got := sumEventOccurrencesByReason(list, testKindExample, testNameExample, "", testAPIVersionClusterScoped, eventReasonUpdated)
+		if got != 3 {
+			t.Errorf("cluster-scoped count = %d, want 3 (must not include the namespaced variant's 5)", got)
+		}
+	})
+
+	t.Run("NamespacedSeesOnlyItsOwnEvents", func(t *testing.T) {
+		got := sumEventOccurrencesByReason(list, testKindExample, testNameExample, testNamespaceExample, testAPIVersionNamespaced, eventReasonUpdated)
+		if got != 5 {
+			t.Errorf("namespaced count = %d, want 5 (must not include the cluster-scoped variant's 3)", got)
+		}
+	})
+
+	t.Run("ClusterScopedNamespaceArgumentDoesNotMatchAnyNamespace", func(t *testing.T) {
+		// A regression-proof for the specific failure mode named in the
+		// AC: passing "" must mean "match empty namespace only", not "match
+		// every namespace" — asserted here by confirming the cluster-scoped
+		// query never picks up the namespaced Item's count.
+		got := sumEventOccurrencesByReason(list, testKindExample, testNameExample, "", testAPIVersionClusterScoped, eventReasonUpdated)
+		if got == 3+5 {
+			t.Fatal("cluster-scoped query summed both variants — \"\" is being treated as \"any namespace\"")
+		}
+	})
 }
 
 // TestBuildConvergeResultReportsAggregatedUpdateDelta ensures the pass/fail
@@ -474,5 +541,63 @@ func TestRunConvergeGenerationNeverSettlesReportsSteadyStateNotLoop(t *testing.T
 	}
 	if len(result.Diagnostics) != 1 || !strings.Contains(result.Diagnostics[0], "pre-check: generation") {
 		t.Errorf("expected exactly one pre-check diagnostic naming the unsettled generation, got %v", result.Diagnostics)
+	}
+}
+
+// TestRunConvergeIgnoresSiblingScopeEvents is the end-to-end proof that
+// RunConverge's update-event delta is scoped by namespace and apiVersion,
+// not just Kind+Name: a cluster-scoped resource and a namespaced resource
+// that share a Kind and Name — the unified example-manifest convention
+// every dual-scope provider follows — are tested here as siblings, with the
+// SIBLING actively emitting new update events across the baseline/outcome
+// snapshots while the resource under test emits none. Before events were
+// scoped by namespace/apiVersion, the sibling's growing count bled into
+// this delta and produced a false "RECONCILIATION LOOP DETECTED" for a
+// resource that never actually changed.
+func TestRunConvergeIgnoresSiblingScopeEvents(t *testing.T) {
+	// The resource under test is the NAMESPACED variant.
+	m := &manifest.Manifest{
+		Kind:       testKindExample,
+		Name:       testNameExample,
+		Namespace:  testNamespaceExample,
+		APIVersion: testAPIVersionNamespaced,
+	}
+	f := &fakeCluster{
+		generation:      1,
+		readyAfterCalls: 1,
+		atProvider:      map[string]interface{}{"zone": "a"},
+		kind:            testKindExample,
+		name:            testNameExample,
+		namespace:       testNamespaceExample,
+		apiVersion:      testAPIVersionNamespaced,
+		// The resource under test never emits an update event of its own.
+		generations: []int32{0},
+		// The CLUSTER-SCOPED sibling — same Kind+Name, empty namespace,
+		// the cluster-scoped apiVersion — starts at 1 occurrence and gains
+		// 5 more between the baseline and outcome reads, simulating an
+		// unrelated resource that is genuinely looping at the same time.
+		siblingKind:               testKindExample,
+		siblingName:               testNameExample,
+		siblingNamespace:          "",
+		siblingAPIVersion:         testAPIVersionClusterScoped,
+		siblingEventBase:          1,
+		siblingEventGrowthPerCall: 5,
+	}
+	r := newFakeRunner(f)
+	r.sleepFunc = func(time.Duration) {}
+
+	result, err := r.RunConverge(m, ConvergeOptions{
+		PollInterval:     time.Millisecond,
+		ReadinessTimeout: time.Second,
+		Timeout:          time.Second,
+	})
+	if err != nil {
+		t.Fatalf("RunConverge() error = %v", err)
+	}
+	if !result.Passed {
+		t.Fatalf("expected Passed=true: the sibling's growing event count must not be attributed to this resource, got %+v", result)
+	}
+	if result.Message != "resource stable (1 cycle observed, 0 updates)" {
+		t.Errorf("Message = %q, want the stable-resource message with 0 updates — the sibling's 5 new events must not be counted", result.Message)
 	}
 }

@@ -213,6 +213,7 @@ func TestParseHookEnv(t *testing.T) {
 		name         string
 		timeout      string
 		pollInterval string
+		ignoreFields string
 		want         hookEnv
 		wantErr      bool
 	}{
@@ -220,6 +221,12 @@ func TestParseHookEnv(t *testing.T) {
 		{name: "TimeoutSeconds", timeout: "600", want: hookEnv{timeout: 600}},
 		{name: "PollIntervalDuration", pollInterval: "90s", want: hookEnv{pollInterval: 90 * time.Second}},
 		{name: "Both", timeout: "600", pollInterval: "2m", want: hookEnv{timeout: 600, pollInterval: 2 * time.Minute}},
+		{name: "IgnoreFieldsSingle", ignoreFields: "latestBackup", want: hookEnv{ignoreFields: []string{"latestBackup"}}},
+		{name: "IgnoreFieldsMultiple", ignoreFields: "a,b", want: hookEnv{ignoreFields: []string{"a", "b"}}},
+		{
+			name: "AllThree", timeout: "600", pollInterval: "2m", ignoreFields: "latestBackup",
+			want: hookEnv{timeout: 600, pollInterval: 2 * time.Minute, ignoreFields: []string{"latestBackup"}},
+		},
 		{name: "TimeoutNotANumber", timeout: "600s", wantErr: true},
 		{name: "TimeoutNotPositive", timeout: "0", wantErr: true},
 		{name: "PollIntervalNotADuration", pollInterval: "90", wantErr: true},
@@ -228,18 +235,18 @@ func TestParseHookEnv(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := parseHookEnv(tc.timeout, tc.pollInterval)
+			got, err := parseHookEnv(tc.timeout, tc.pollInterval, tc.ignoreFields)
 			if tc.wantErr {
 				if err == nil {
-					t.Fatalf("parseHookEnv(%q, %q) = %+v, want error", tc.timeout, tc.pollInterval, got)
+					t.Fatalf("parseHookEnv(%q, %q, %q) = %+v, want error", tc.timeout, tc.pollInterval, tc.ignoreFields, got)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("parseHookEnv(%q, %q): %v", tc.timeout, tc.pollInterval, err)
+				t.Fatalf("parseHookEnv(%q, %q, %q): %v", tc.timeout, tc.pollInterval, tc.ignoreFields, err)
 			}
-			if got != tc.want {
-				t.Errorf("parseHookEnv(%q, %q) = %+v, want %+v", tc.timeout, tc.pollInterval, got, tc.want)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("parseHookEnv(%q, %q, %q) = %+v, want %+v", tc.timeout, tc.pollInterval, tc.ignoreFields, got, tc.want)
 			}
 		})
 	}
@@ -315,6 +322,42 @@ func TestHookStepArgs(t *testing.T) {
 			env:  hookEnv{pollInterval: 90 * time.Second},
 			want: []string{path},
 		},
+		{
+			name: "ConvergeTakesIgnoreFields",
+			step: hookStep{banner: "converge", command: "converge"},
+			env:  hookEnv{ignoreFields: []string{"latestBackup"}},
+			want: []string{"--ignore-fields", "latestBackup", path},
+		},
+		{
+			name: "ConvergeTakesMultipleIgnoreFieldsJoined",
+			step: hookStep{banner: "post-update converge", command: "converge"},
+			env:  hookEnv{ignoreFields: []string{"a", "b"}},
+			want: []string{"--ignore-fields", "a,b", path},
+		},
+		{
+			name: "IgnoreFieldsIsNotPassedToRun",
+			step: hookStep{banner: "run", command: "run"},
+			env:  hookEnv{ignoreFields: []string{"latestBackup"}},
+			want: []string{path},
+		},
+		{
+			name: "IgnoreFieldsIsNotPassedToResolveRecover",
+			step: hookStep{banner: "resolve-recover", command: "resolve-recover"},
+			env:  hookEnv{ignoreFields: []string{"latestBackup"}},
+			want: []string{path},
+		},
+		{
+			name: "IgnoreFieldsIsNotPassedToTheExternalNameCheck",
+			step: hookStep{banner: "check-external-name-prefix", command: "check-external-name-prefix"},
+			env:  hookEnv{ignoreFields: []string{"latestBackup"}},
+			want: []string{path},
+		},
+		{
+			name: "ConvergeTakesEveryOverrideTogether",
+			step: hookStep{banner: "converge", command: "converge"},
+			env:  hookEnv{timeout: 600, pollInterval: 90 * time.Second, ignoreFields: []string{"latestBackup"}},
+			want: []string{"--poll-interval", "1m30s", "--timeout", "10m0s", "--ignore-fields", "latestBackup", path},
+		},
 	}
 
 	for _, tc := range tests {
@@ -335,7 +378,12 @@ func TestHookStepArgs(t *testing.T) {
 // each step the sequence can produce.
 func TestHookStepArgsPollIntervalIsAcceptedByEveryStepGivenIt(t *testing.T) {
 	const path = "/repo/examples/example-resource/example-resource.yaml"
-	env := hookEnv{timeout: 600, pollInterval: 90 * time.Second}
+	// ignoreFields is included here too: hookStepArgs itself gates it to
+	// "converge" steps only (see the len(env.ignoreFields) > 0 && s.command
+	// == "converge" guard), so an env carrying it alongside timeout and
+	// pollInterval must still produce argv the real parser for every OTHER
+	// step accepts — proving the gate, not just asserting it by inspection.
+	env := hookEnv{timeout: 600, pollInterval: 90 * time.Second, ignoreFields: []string{"latestBackup"}}
 
 	parsers := map[string]func([]string) error{
 		"run":      func(a []string) error { _, err := parseRunArgs(a); return err },
@@ -354,6 +402,9 @@ func TestHookStepArgsPollIntervalIsAcceptedByEveryStepGivenIt(t *testing.T) {
 				t.Fatalf("no parser registered for step command %q", s.command)
 			}
 			args := hookStepArgs(s, path, env)
+			if s.command != "converge" && strings.Contains(strings.Join(args, " "), "--ignore-fields") {
+				t.Errorf("%s received --ignore-fields (%q), want it gated to converge only", s.command, args)
+			}
 			if err := parse(args); err != nil {
 				t.Errorf("%s rejects the argv the hook builds for it (%q): %v", s.command, args, err)
 			}

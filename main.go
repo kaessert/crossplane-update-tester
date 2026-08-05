@@ -585,6 +585,13 @@ const (
 	// the convergence checks (which wait on it) and the per-field run
 	// (which calibrates its slow-observe annotation with it).
 	envPollInterval = "UPDATE_TESTER_POLL_INTERVAL"
+	// envIgnoreFields is a comma-separated list of atProvider field names,
+	// forwarded only to the two `converge` steps — the only subcommand that
+	// accepts --ignore-fields at all. Excludes named fields from the
+	// snapshot diff for resources with a server-driven atProvider field
+	// (e.g. a one-time timestamp populated asynchronously by the backend)
+	// that is not itself evidence of drift.
+	envIgnoreFields = "UPDATE_TESTER_IGNORE_FIELDS"
 )
 
 // hookOptions holds the parsed command line of the `hook` subcommand.
@@ -661,12 +668,13 @@ func hookSteps(m *manifest.Manifest) []hookStep {
 type hookEnv struct {
 	timeout      int
 	pollInterval time.Duration
+	ignoreFields []string
 }
 
 // parseHookEnv interprets the raw environment values. An unparseable value
 // is an error rather than a silent fall-back to the default: a typo in a CI
 // variable would otherwise surface much later as a timeout nobody asked for.
-func parseHookEnv(timeout, pollInterval string) (hookEnv, error) {
+func parseHookEnv(timeout, pollInterval, ignoreFields string) (hookEnv, error) {
 	var env hookEnv
 	if timeout != "" {
 		n, err := strconv.Atoi(timeout)
@@ -682,6 +690,9 @@ func parseHookEnv(timeout, pollInterval string) (hookEnv, error) {
 		}
 		env.pollInterval = d
 	}
+	if ignoreFields != "" {
+		env.ignoreFields = strings.Split(ignoreFields, ",")
+	}
 	return env, nil
 }
 
@@ -694,6 +705,11 @@ func parseHookEnv(timeout, pollInterval string) (hookEnv, error) {
 // it — so one environment variable describes the provider once and both
 // checks are measured against the same cadence. The two identity checks do
 // not take the flag at all and would reject it.
+//
+// --ignore-fields is narrower still: only `converge` accepts it at all (it
+// excludes named atProvider fields from the snapshot diff), so it is passed
+// to neither `run` nor the two identity checks, matching stepTakesPollInterval's
+// own per-step gating.
 func hookStepArgs(s hookStep, manifestPath string, env hookEnv) []string {
 	var args []string
 	if env.pollInterval > 0 && stepTakesPollInterval(s.command) {
@@ -706,6 +722,9 @@ func hookStepArgs(s hookStep, manifestPath string, env hookEnv) []string {
 		} else {
 			args = append(args, "--timeout", strconv.Itoa(env.timeout))
 		}
+	}
+	if len(env.ignoreFields) > 0 && s.command == "converge" {
+		args = append(args, "--ignore-fields", strings.Join(env.ignoreFields, ","))
 	}
 	return append(args, manifestPath)
 }
@@ -752,7 +771,7 @@ func cmdHook(args []string) error {
 		return err
 	}
 
-	env, err := parseHookEnv(os.Getenv(envTimeout), os.Getenv(envPollInterval))
+	env, err := parseHookEnv(os.Getenv(envTimeout), os.Getenv(envPollInterval), os.Getenv(envIgnoreFields))
 	if err != nil {
 		return err
 	}

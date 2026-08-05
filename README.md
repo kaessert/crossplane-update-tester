@@ -384,6 +384,7 @@ Each example manifest then points its
 | `MANIFEST` | `hook` | Absolute path to a manifest, overriding derivation from the invocation name. Intended for debugging. |
 | `UPDATE_TESTER_TIMEOUT` | `hook` | Default timeout for the checks the hook runs, where no flag is given. |
 | `UPDATE_TESTER_POLL_INTERVAL` | `hook` | Provider poll interval. Passed to both convergence checks, which wait `interval * 1.5`, and to `run`, which uses it only to calibrate the `slow-observe` annotation (half the interval). One variable, so both checks are measured against the same cadence. |
+| `UPDATE_TESTER_IGNORE_FIELDS` | `hook` | Comma-separated `atProvider` field names excluded from the snapshot diff. Forwarded only to the two `converge` steps — `run`, `check-external-name-prefix` and `resolve-recover` do not define `--ignore-fields` and would reject it. For a resource with a field the backend populates asynchronously and independently of any controller write (e.g. a one-time timestamp set once the first automated action completes), that field's presence would otherwise fail every convergence check as if it were reconciliation drift. |
 | `UPDATE_TESTER_PROVIDER_DEPLOYMENT` | `run` | Name of the provider controller `Deployment` to restart for event-burst resets. Required when more than one provider package is installed, since the Pod-label lookup is then ambiguous. |
 
 ## Versioning and compatibility

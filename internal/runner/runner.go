@@ -997,19 +997,31 @@ func (r *Runner) applyPatchAndReconcile(t manifest.UpdateTest) error {
 	return r.nudgeAndReconcile()
 }
 
-// reconcileOnce clears status conditions and waits for Ready, so the caller
-// can block on the NEXT reconcile's outcome rather than the stale
-// conditions already present. Clearing conditions does not by itself
-// trigger that next reconcile: most generated controllers watch with
-// resource.DesiredStateChanged(), which reacts only to an annotation,
-// label, or generation (spec) change, so the status-only clear is filtered
-// out and never reaches the reconciler on its own. The caller's preceding
-// Patch() usually does trigger a reconcile through that same watch filter,
-// but there is no guarantee it wins the race against ClearConditions: when
-// the spec-patch reconcile has already landed by the time ClearConditions
-// runs, the clear wipes the Ready it just set and nothing is left to set it
-// again until the provider's background poll tick. NudgeReconcile closes
-// that gap the same way it does for nudgeAndReconcile.
+// reconcileOnce clears status conditions, THEN nudges the controller, THEN
+// waits for Ready — in that order, always — so the caller can block on the
+// NEXT reconcile's outcome rather than the stale conditions already
+// present.
+//
+// Clearing conditions does not by itself trigger that next reconcile: most
+// generated controllers watch with resource.DesiredStateChanged(), which
+// reacts only to an annotation, label, or generation (spec) change, so the
+// status-only clear is filtered out and never reaches the reconciler on its
+// own. A caller's preceding Patch() usually does trigger a reconcile
+// through that same watch filter, but there is no guarantee it wins the
+// race against ClearConditions: when the spec-patch reconcile has already
+// landed by the time ClearConditions runs, the clear wipes the Ready it
+// just set and nothing is left to set it again until the provider's
+// background poll tick. The explicit NudgeReconcile call closes that gap.
+//
+// Clearing BEFORE nudging matters independently of that gap: NudgeReconcile's
+// annotation patch can trigger a reconcile that completes (Observe + status
+// write) within milliseconds — often faster than this process can issue its
+// own next kubectl call. Clearing conditions after the nudge would then have
+// a real chance of wiping the fresh Ready condition the nudge just produced,
+// forcing WaitReady to fall back on the provider's background poll tick —
+// exactly the failure mode this whole sequence exists to avoid. Clearing
+// first guarantees the clear has already landed before anything can set a
+// new condition, so nothing after it can re-clear a fresh result.
 func (r *Runner) reconcileOnce() error {
 	if err := r.ClearConditions(); err != nil {
 		return err
@@ -1020,24 +1032,13 @@ func (r *Runner) reconcileOnce() error {
 	return r.WaitReady()
 }
 
-// nudgeAndReconcile clears status conditions BEFORE issuing the nudge, the
-// reverse order from reconcileOnce. NudgeReconcile's annotation patch can
-// trigger a reconcile that completes (Observe + status write) within
-// milliseconds — often faster than this process can issue its own next
-// kubectl call. Clearing conditions after the nudge would then have a real
-// chance of wiping the fresh Ready condition the nudge just produced,
-// forcing WaitReady to fall back on the provider's background poll tick —
-// exactly the failure mode this second reconcile exists to avoid. Clearing
-// first guarantees the clear has already landed before anything can set a
-// new condition, so nothing after it can re-clear a fresh result.
+// nudgeAndReconcile is reconcileOnce under the name applyPatchAndReconcile
+// uses for the second of its two forced reconciles (see that comment for why
+// two are needed). The two names exist to make each call site self-
+// documenting; the ordering rationale itself lives once, on reconcileOnce
+// above, so it cannot drift out of sync between the two callers again.
 func (r *Runner) nudgeAndReconcile() error {
-	if err := r.ClearConditions(); err != nil {
-		return err
-	}
-	if err := r.NudgeReconcile(); err != nil {
-		return err
-	}
-	return r.WaitReady()
+	return r.reconcileOnce()
 }
 
 // applyEvidenceCheck runs the event-based update-evidence check and updates

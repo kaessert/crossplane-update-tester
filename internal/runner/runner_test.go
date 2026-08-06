@@ -821,8 +821,15 @@ func TestRunFieldTestExecutesWhenValueDiffers(t *testing.T) {
 	if f.patchCalls != 1 {
 		t.Errorf("expected exactly 1 patch call, got %d", f.patchCalls)
 	}
-	if f.nudgeCalls != 1 {
-		t.Errorf("expected exactly 1 nudge call (forcing the second reconcile), got %d", f.nudgeCalls)
+	// 2 nudges, not 1: reconcileOnce nudges to force the reconcile it then
+	// waits on (the spec Patch above is not a reliable trigger — it can
+	// have already reconciled and been wiped by ClearConditions before
+	// reconcileOnce gets a chance to observe it), and nudgeAndReconcile
+	// nudges again to force the independent re-observe that refreshes
+	// atProvider. Both reconciles must be triggered, not just the forced
+	// re-observe.
+	if f.nudgeCalls != 2 {
+		t.Errorf("expected exactly 2 nudge calls (forcing both reconciles), got %d", f.nudgeCalls)
 	}
 	if f.waitCalls != 2 {
 		t.Errorf("expected exactly 2 wait calls (first reconcile + forced re-observe), got %d", f.waitCalls)
@@ -832,6 +839,37 @@ func TestRunFieldTestExecutesWhenValueDiffers(t *testing.T) {
 	}
 	if len(result.SideFx) != 0 {
 		t.Errorf("expected no side effects, got %v", result.SideFx)
+	}
+}
+
+// TestReconcileOnceNudgesBeforeWaiting is a regression test for the case
+// TestRunFieldTestExecutesWhenValueDiffers exercises indirectly: called on
+// its own, reconcileOnce must not rely on some OTHER trigger (a caller's
+// preceding spec patch, in production) having already queued a reconcile.
+// If it merely clears conditions and waits, WaitReady blocks until the
+// controller's next background poll tick, because a status-only patch is
+// filtered out by resource.DesiredStateChanged() and never reaches the
+// reconciler. Calling reconcileOnce with nothing else in flight isolates
+// that dependency: against the pre-fix body (ClearConditions, then
+// WaitReady with no nudge in between) this fails with nudgeCalls == 0.
+func TestReconcileOnceNudgesBeforeWaiting(t *testing.T) {
+	f := &fakeCluster{
+		forProvider: map[string]interface{}{testFieldNotifyDelay: float64(5)},
+		atProvider:  map[string]interface{}{testFieldNotifyDelay: float64(5)},
+		generation:  1,
+		kind:        testKindExample,
+		name:        testNameExample,
+	}
+	r := newFakeRunner(f)
+
+	if err := r.reconcileOnce(); err != nil {
+		t.Fatalf("reconcileOnce: %v", err)
+	}
+	if f.nudgeCalls != 1 {
+		t.Errorf("expected reconcileOnce to nudge once so WaitReady blocks on the reconcile it just forced, rather than falling back to the provider's background poll tick; got %d nudge calls", f.nudgeCalls)
+	}
+	if f.waitCalls != 1 {
+		t.Errorf("expected exactly 1 wait call, got %d", f.waitCalls)
 	}
 }
 

@@ -980,13 +980,13 @@ func (r *Runner) runFieldTest(t manifest.UpdateTest, snapshot []byte, kind, name
 // second is forced purely to obtain a fresh Observe of the now-updated
 // external resource, so atProvider does not depend on the provider's
 // background poll tick to refresh (which can be a full poll interval away).
-// The second reconcile is triggered by NudgeReconcile rather than a repeat
-// of ClearConditions: most generated controllers watch with
+// Both reconciles are triggered by NudgeReconcile rather than relying on
+// ClearConditions alone: most generated controllers watch with
 // resource.DesiredStateChanged(), which reacts only to an annotation,
 // label, or generation (spec) change, so a status-only patch on its own
-// would be filtered out and never reach the reconciler — leaving the
-// "second reconcile" waiting on the same background poll tick this is
-// meant to avoid.
+// would be filtered out and never reach the reconciler — leaving either
+// reconcile waiting on the same background poll tick this is meant to
+// avoid.
 func (r *Runner) applyPatchAndReconcile(t manifest.UpdateTest) error {
 	if err := r.Patch(t.Field, t.Value); err != nil {
 		return err
@@ -1000,10 +1000,21 @@ func (r *Runner) applyPatchAndReconcile(t manifest.UpdateTest) error {
 // reconcileOnce clears status conditions and waits for Ready, so the caller
 // can block on the NEXT reconcile's outcome rather than the stale
 // conditions already present. Clearing conditions does not by itself
-// trigger that next reconcile — see NudgeReconcile and
-// applyPatchAndReconcile for what does.
+// trigger that next reconcile: most generated controllers watch with
+// resource.DesiredStateChanged(), which reacts only to an annotation,
+// label, or generation (spec) change, so the status-only clear is filtered
+// out and never reaches the reconciler on its own. The caller's preceding
+// Patch() usually does trigger a reconcile through that same watch filter,
+// but there is no guarantee it wins the race against ClearConditions: when
+// the spec-patch reconcile has already landed by the time ClearConditions
+// runs, the clear wipes the Ready it just set and nothing is left to set it
+// again until the provider's background poll tick. NudgeReconcile closes
+// that gap the same way it does for nudgeAndReconcile.
 func (r *Runner) reconcileOnce() error {
 	if err := r.ClearConditions(); err != nil {
+		return err
+	}
+	if err := r.NudgeReconcile(); err != nil {
 		return err
 	}
 	return r.WaitReady()

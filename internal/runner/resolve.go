@@ -151,7 +151,7 @@ func (r *Runner) stripExternalName() error {
 }
 
 // waitForRecoveryReconcile clears status conditions BEFORE removing the
-// paused annotation, mirroring nudgeAndReconcile's ordering rationale: the
+// paused annotation, mirroring reconcileOnce's ordering rationale: the
 // unpause patch below is what actually triggers the recovery reconcile (an
 // annotation change satisfies generated controllers'
 // resource.DesiredStateChanged() watch predicate, the same mechanism

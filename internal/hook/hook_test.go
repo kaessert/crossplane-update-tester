@@ -163,8 +163,9 @@ func TestDerive(t *testing.T) {
 			want:       "examples/network-v6/network-v6.yaml",
 		},
 		{
-			// The fallback strips only ONE segment, and it strips the last:
-			// a three-word slug falls back to its two-word parent directory.
+			// The fallback strips the last segment first, and stops there
+			// when that already resolves: a three-word slug falls back to
+			// its two-word parent directory rather than continuing further.
 			name: "SiblingVariantFallbackStripsLastSegmentOnly",
 			files: []string{
 				"examples/foo-bar/foo-bar-baz.yaml",
@@ -172,6 +173,27 @@ func TestDerive(t *testing.T) {
 			},
 			invocation: "post-assert-foo-bar-baz.sh",
 			want:       "examples/foo-bar/foo-bar-baz.yaml",
+		},
+		{
+			// Two segments deep: a ProviderConfig-scoped namespaced variant
+			// stacks "-namespaced" and "-pc" past its resource directory.
+			// Neither single-strip candidate exists, so the loop must try a
+			// second strip rather than stopping after the first miss.
+			name:       "SiblingVariantFallbackMultiLevel",
+			files:      []string{"examples/record-a/record-a-namespaced-pc.yaml"},
+			invocation: "post-assert-record-a-namespaced-pc.sh",
+			want:       "examples/record-a/record-a-namespaced-pc.yaml",
+		},
+		{
+			// When more than one level would resolve, the nearer directory
+			// wins — same guarantee as the single-strip case, generalized.
+			name: "SiblingVariantFallbackNearestLevelWinsOverFurther",
+			files: []string{
+				"examples/foo-bar/foo-bar-baz-qux.yaml",
+				"examples/foo/foo-bar-baz-qux.yaml",
+			},
+			invocation: "post-assert-foo-bar-baz-qux.sh",
+			want:       "examples/foo-bar/foo-bar-baz-qux.yaml",
 		},
 		{
 			// The -ns guard runs first: the slug's own directory exists but is
@@ -292,6 +314,19 @@ func TestDeriveErrors(t *testing.T) {
 			wantTried: []string{
 				"examples/network-v6/network-v6.yaml",
 				"examples/network/network-v6.yaml",
+			},
+		},
+		{
+			// Every level the multi-strip fallback tried is named, not just
+			// the first — an operator debugging a three-word slug needs to
+			// see all the directories considered.
+			name:       "MultiLevelFallbackReportsEveryCandidate",
+			invocation: "post-assert-alpha-beta-gamma.sh",
+			wantSlug:   "alpha-beta-gamma",
+			wantTried: []string{
+				"examples/alpha-beta-gamma/alpha-beta-gamma.yaml",
+				"examples/alpha-beta/alpha-beta-gamma.yaml",
+				"examples/alpha/alpha-beta-gamma.yaml",
 			},
 		},
 		{

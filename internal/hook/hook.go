@@ -69,8 +69,18 @@ const examplesDir = "examples"
 // kind — an alternate variant such as examples/network/network-v6.yaml sitting
 // beside examples/network/network.yaml, each with its own post-assert symlink.
 // The variant's slug ("network-v6") names no directory of its own, so the
-// primary derivation misses. The fallback strips the slug's last hyphenated
-// segment and looks for the same leaf filename inside that shorter directory.
+// primary derivation misses. The fallback strips the slug's trailing
+// hyphenated segments, one at a time, and looks for the same leaf filename
+// inside each progressively shorter directory — stopping at the first match.
+//
+// One strip is enough for a variant like "network-v6" (directory "network"),
+// but a variant's own scope suffix can stack more than one segment away from
+// its directory: "record-a-namespaced-pc" (a ProviderConfig-scoped namespaced
+// variant of "record-a") resolves only after stripping BOTH "-pc" and
+// "-namespaced", landing on directory "record-a". The loop tries the nearest
+// candidate first, so a closer match always wins over a more distant one even
+// when both would resolve — the earlier one-strip behavior is the loop's
+// first iteration, unchanged.
 //
 // The fallback runs only when the primary path does not exist. That guard is
 // what keeps it safe: every slug that already resolves directly keeps its
@@ -87,12 +97,18 @@ func Derive(root, invocationName string) (string, error) {
 	}
 
 	tried := []string{primary}
+	leaf := filepath.Base(primary)
 
-	// Sibling-variant fallback: same leaf filename, one directory level up in
-	// slug terms. Only meaningful when the resource has a hyphen to strip.
-	if idx := strings.LastIndex(resource, "-"); idx > 0 {
-		parent := resource[:idx]
-		alt := filepath.Join(root, examplesDir, parent, filepath.Base(primary))
+	// Sibling-variant fallback: same leaf filename, progressively shorter
+	// directories formed by stripping one trailing hyphenated segment at a
+	// time until a match is found or no segment is left to strip.
+	for {
+		idx := strings.LastIndex(resource, "-")
+		if idx <= 0 {
+			break
+		}
+		resource = resource[:idx]
+		alt := filepath.Join(root, examplesDir, resource, leaf)
 		if fileExists(alt) {
 			return alt, nil
 		}

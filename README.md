@@ -176,8 +176,11 @@ file) and reports, per field, whether the manifest's annotation covers it:
 - `tested` / `skipped` — the field appears in the annotation.
 - `immutable` — the field carries a `self == oldSelf` validation marker, so it
   has no update semantics.
-- `reference-plumbing` — the field is a generated `*Ref` / `*Selector`
-  companion whose base value field is present in the same struct.
+- `reference-plumbing` — the field is a generated `*Ref` / `*Refs` /
+  `*Selector` companion whose base value field is present in the same
+  struct. A scalar base field gets the singular `*Ref`; a list-typed
+  (`[]string`) base field gets the plural `*Refs`; either cardinality also
+  gets one `*Selector`.
 - `MISSING` — none of the above; the command exits non-zero.
 
 This is what stops an annotation from quietly falling behind the API type as

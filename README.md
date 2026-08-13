@@ -83,6 +83,13 @@ For each entry in the manifest's `crossplane.io/update-test` annotation, `run`:
 7. **Diffs for side effects.** The top-level keys of `status.atProvider` are
    compared before and after, excluding the field under test; anything else
    that moved is printed alongside the result.
+8. **Asserts declared fields never move.** Every field named by the
+   manifest's `assert-unchanged:` directive is checked against its pre-run
+   baseline after every patch in the run. This is `run`'s own GATING check,
+   not the diagnostic side-effect diff in point 7 above: a field named here
+   fails the whole `run` invocation the moment it drifts, wherever in the
+   run that happens. See "`crossplane.io/update-test`" below for the
+   annotation syntax and what this exists to catch.
 
 Point 6 is the reason this tool exists rather than a `kubectl patch` followed by
 a value assertion. A value match alone cannot distinguish "the controller
@@ -249,7 +256,7 @@ a manifest that does not follow the convention.
 ### `crossplane.io/update-test`
 
 A YAML block scalar holding a list of per-field entries, optionally preceded by
-a single top-level `converge-skip:` line.
+two top-level directive lines: `converge-skip:` and `assert-unchanged:`.
 
 | Key | Meaning |
 |---|---|
@@ -258,9 +265,44 @@ a single top-level `converge-skip:` line.
 | `expect` | Optional. The value expected in `status.atProvider` when the backend normalises what it stores. Defaults to `value`. |
 | `skip` | Optional. A reason for not testing this field. The entry is reported as `SKIPPED` and still counts as coverage for `validate`. |
 
-`converge-skip: <reason>` is not valid YAML as a sibling of top-level sequence
-items, so the line is extracted before the rest of the block is parsed as a
-sequence. It must be unindented.
+Neither `converge-skip: <reason>` nor `assert-unchanged: <fields>` is valid
+YAML as a sibling of top-level sequence items, so both lines are extracted
+before the rest of the block is parsed as a sequence. Each must be unindented.
+
+#### `assert-unchanged:` — silent-wipe guard
+
+A comma-separated list of dot-separated `status.atProvider` field paths that
+must hold the SAME value for the entire `run`, regardless of which other
+field is being patched:
+
+```yaml
+crossplane.io/update-test: |
+  assert-unchanged: ruleChoice.legacyRuleList
+  - field: comment
+    value: "updated"
+```
+
+This exists for a backend that silently defaults an omitted field on every
+write — for example, a PUT that omits a union field causes the backend to
+reset it to an empty default and still return `200`, even though the request
+never mentioned that field at all. A value-only assertion on the field being
+patched cannot see this, because the field the backend corrupts is never the
+one under test; `run`'s own side-effect diff (see its point 7 above) surfaces
+the same drift, but only as a printed diagnostic, not a failure. Declaring the
+vulnerable field here makes `run` check it after every patch in the run and
+GATE — fail the whole invocation — the moment it moves, attributing the
+failure to whichever field test's patch was in flight when the drift first
+appeared. A field that never drifts is still printed, so a reviewer scanning a
+green log can see the guard ran.
+
+A field may not appear in both `assert-unchanged:` and as an entry's own
+`field:` — patching a field and asserting it never changes are contradictory
+requests, so that combination is rejected at parse time, before any cluster is
+touched.
+
+The mechanism is generic: it reads whatever field paths the manifest declares
+and compares live values against a baseline, with no knowledge of any
+particular resource, API, or backend.
 
 Worked example:
 

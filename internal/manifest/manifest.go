@@ -50,6 +50,21 @@ type Manifest struct {
 	// Empty means the manifest declares no external-name-prefix
 	// expectation — see ExpectExternalNamePrefixKey.
 	ExpectExternalNamePrefix string
+	// AssertUnchanged lists dot-separated status.atProvider field paths that
+	// must hold the SAME value for the entire duration of a `run` (the
+	// per-field update tests), regardless of which other field is being
+	// patched. It is populated from the "assert-unchanged:" directive line
+	// in the crossplane.io/update-test annotation — see ParseAnnotation.
+	//
+	// This exists for a backend that silently defaults an omitted field on
+	// every write: a PUT that patches one unrelated field can still cause
+	// the backend to reset a field the request never mentioned, and that
+	// reset returns the same 200 a genuine update would. A value-only
+	// assertion on the field being patched cannot see this, because the
+	// field it corrupts is never the one under test. Declaring the
+	// vulnerable field here makes the runner check it after every patch in
+	// the run and fail the run the moment it moves — see runner.Runner.RunTests.
+	AssertUnchanged []string
 }
 
 // manifestDoc is the intermediate YAML structure for parsing.
@@ -158,73 +173,119 @@ func manifestFromDoc(doc manifestDoc) (*Manifest, error) {
 		return m, nil
 	}
 
-	tests, convergeSkip, err := ParseAnnotation(annotation)
+	tests, convergeSkip, assertUnchanged, err := ParseAnnotation(annotation)
 	if err != nil {
 		return nil, fmt.Errorf("parsing %s annotation: %w", AnnotationKey, err)
 	}
 	m.Tests = tests
 	m.ConvergeSkip = convergeSkip
+	m.AssertUnchanged = assertUnchanged
 	return m, nil
 }
 
 // ParseAnnotation parses the update-test annotation YAML string into a slice
-// of UpdateTest entries, plus an optional top-level "converge-skip" reason.
+// of UpdateTest entries, plus two optional top-level directives:
+// "converge-skip" (a reason string) and "assert-unchanged" (a field-path
+// list).
 //
-// The annotation format allows a top-level "converge-skip: <reason>" line to
-// appear alongside the list of field entries:
+// The annotation format allows both directives to appear, each on its own
+// unindented line, alongside the list of field entries:
 //
 //	crossplane.io/update-test: |
 //	  converge-skip: "atProvider.lastSyncTime changes every observe cycle"
+//	  assert-unchanged: ruleChoice.legacyRuleList
 //	  - field: name
 //	    value: "updated"
 //
-// This is not valid as a single YAML document (a mapping key cannot be a
-// sibling of top-level sequence items), so the "converge-skip:" line is
+// Neither is valid as a single YAML document (a mapping key cannot be a
+// sibling of top-level sequence items), so both directive lines are
 // extracted first and the remainder is parsed as a plain YAML sequence.
-func ParseAnnotation(annotation string) ([]UpdateTest, string, error) {
-	rest, convergeSkip, err := extractConvergeSkip(annotation)
+//
+// "assert-unchanged" takes a comma-separated list of dot-separated
+// status.atProvider field paths — see Manifest.AssertUnchanged for what the
+// runner does with them. A field named there may not also appear as an
+// update-test entry's own field: patching a field and asserting it never
+// changes are contradictory requests, so that combination is a parse error
+// rather than a runtime race between the two.
+func ParseAnnotation(annotation string) ([]UpdateTest, string, []string, error) {
+	rest, convergeSkip, assertUnchanged, err := extractDirectives(annotation)
 	if err != nil {
-		return nil, "", fmt.Errorf("parsing converge-skip: %w", err)
+		return nil, "", nil, fmt.Errorf("parsing directives: %w", err)
 	}
 
 	rest = strings.TrimSpace(rest)
 	var tests []UpdateTest
 	if rest != "" {
 		if err := yaml.Unmarshal([]byte(rest), &tests); err != nil {
-			return nil, "", fmt.Errorf("unmarshalling annotation: %w", err)
+			return nil, "", nil, fmt.Errorf("unmarshalling annotation: %w", err)
 		}
 	}
 
+	testedFields := make(map[string]bool, len(tests))
 	for i, t := range tests {
 		if t.Field == "" {
-			return nil, "", fmt.Errorf("entry %d: field is required", i)
+			return nil, "", nil, fmt.Errorf("entry %d: field is required", i)
 		}
 		if t.Value == nil && t.Skip == "" {
-			return nil, "", fmt.Errorf("entry %d (%s): value is required unless skip is set", i, t.Field)
+			return nil, "", nil, fmt.Errorf("entry %d (%s): value is required unless skip is set", i, t.Field)
+		}
+		testedFields[t.Field] = true
+	}
+	for _, f := range assertUnchanged {
+		if testedFields[f] {
+			return nil, "", nil, fmt.Errorf(
+				"assert-unchanged field %q is also an update-test field; a field cannot be both patched and asserted unchanged in the same run", f)
 		}
 	}
-	return tests, convergeSkip, nil
+	return tests, convergeSkip, assertUnchanged, nil
 }
 
-// extractConvergeSkip scans the annotation text line by line for a top-level
-// (unindented) "converge-skip:" mapping entry, removes it from the text, and
-// returns the remaining text plus the extracted reason string (empty if
-// absent).
-func extractConvergeSkip(annotation string) (rest string, convergeSkip string, err error) {
+// extractDirectives scans the annotation text line by line for the two
+// top-level (unindented) directive lines — "converge-skip:" and
+// "assert-unchanged:" — removes them from the text, and returns the
+// remaining text plus what each directive carries (empty/nil when absent).
+//
+// Both are extracted the same way and for the same reason: neither is valid
+// as a sibling of the top-level sequence of field entries in a single YAML
+// document, so each is pulled out of the raw text before the remainder is
+// parsed as a plain YAML sequence.
+func extractDirectives(annotation string) (rest string, convergeSkip string, assertUnchanged []string, err error) {
 	lines := strings.Split(annotation, "\n")
 	kept := make([]string, 0, len(lines))
 	for _, line := range lines {
 		trimmed := strings.TrimLeft(line, " \t")
 		indent := len(line) - len(trimmed)
-		if indent == 0 && strings.HasPrefix(trimmed, "converge-skip:") {
+		switch {
+		case indent == 0 && strings.HasPrefix(trimmed, "converge-skip:"):
 			var single map[string]string
 			if uerr := yaml.Unmarshal([]byte(line), &single); uerr != nil {
-				return "", "", fmt.Errorf("parsing converge-skip line %q: %w", line, uerr)
+				return "", "", nil, fmt.Errorf("parsing converge-skip line %q: %w", line, uerr)
 			}
 			convergeSkip = single["converge-skip"]
-			continue
+		case indent == 0 && strings.HasPrefix(trimmed, "assert-unchanged:"):
+			var single map[string]string
+			if uerr := yaml.Unmarshal([]byte(line), &single); uerr != nil {
+				return "", "", nil, fmt.Errorf("parsing assert-unchanged line %q: %w", line, uerr)
+			}
+			assertUnchanged = splitFieldList(single["assert-unchanged"])
+		default:
+			kept = append(kept, line)
 		}
-		kept = append(kept, line)
 	}
-	return strings.Join(kept, "\n"), convergeSkip, nil
+	return strings.Join(kept, "\n"), convergeSkip, assertUnchanged, nil
+}
+
+// splitFieldList splits a comma-separated field-path list, trimming
+// surrounding whitespace from each entry and dropping empty ones. Returns
+// nil for an empty or whitespace-only input, matching the "absent" state
+// callers already treat len(...) == 0 as.
+func splitFieldList(raw string) []string {
+	var out []string
+	for _, f := range strings.Split(raw, ",") {
+		f = strings.TrimSpace(f)
+		if f != "" {
+			out = append(out, f)
+		}
+	}
+	return out
 }

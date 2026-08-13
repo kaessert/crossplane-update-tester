@@ -185,6 +185,17 @@ type fakeCluster struct {
 	// path and RunConverge's degrade-and-proceed behaviour. Takes priority
 	// over readyAfterCalls.
 	neverReady bool
+
+	// silentWipeField and silentWipeValue, when silentWipeField is
+	// non-empty, simulate a backend that resets an UNRELATED atProvider
+	// field to silentWipeValue on every real field patch — the exact
+	// defect the assert-unchanged directive exists to catch (see
+	// checkAssertUnchanged). The tester's own merge patch never mentions
+	// this field at all; the wipe happens purely as a side effect of
+	// handlePatch, mirroring a backend that defaults an omitted union
+	// member on every write regardless of which field the request touched.
+	silentWipeField string
+	silentWipeValue interface{}
 }
 
 // readyCondition reports the status.conditions entry handleGet should embed
@@ -413,6 +424,13 @@ func (f *fakeCluster) handlePatch(args []string) (string, error) {
 	// read already matches — these tests are about the no-op guard, not
 	// about polling behaviour.
 	mergeInto(f.atProvider, forProviderRaw)
+
+	// Simulate a backend that silently resets an unrelated atProvider field
+	// on EVERY write, regardless of which field the merge patch actually
+	// named — see silentWipeField's doc comment.
+	if f.silentWipeField != "" {
+		f.atProvider[f.silentWipeField] = f.silentWipeValue
+	}
 
 	f.generation++
 	f.patchCalls++
@@ -1271,7 +1289,7 @@ func TestRunTestsResetsEventBurstBeforeCeiling(t *testing.T) {
 	r := newFakeRunner(f)
 
 	m := manifestWithSequentialFieldTests(numFields)
-	results, err := r.RunTests(m)
+	results, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
@@ -1321,7 +1339,7 @@ func TestRunTestsWithoutRestartWiringStillDetectsGenuineNonEvidence(t *testing.T
 	r := newFakeRunner(f)
 
 	m := manifestWithSequentialFieldTests(numFields)
-	results, err := r.RunTests(m)
+	results, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
@@ -1333,6 +1351,139 @@ func TestRunTestsWithoutRestartWiringStillDetectsGenuineNonEvidence(t *testing.T
 		if res.Passed {
 			t.Errorf("field %d (%s): got Passed=true, want false", i, res.Field)
 		}
+	}
+}
+
+// TestRunTestsAssertUnchangedGatesOnSilentWipe is the acceptance case for
+// the assert-unchanged directive (see manifest.Manifest.AssertUnchanged):
+// a manifest declares a field that must survive the whole run, the backend
+// (simulated by fakeCluster.silentWipeField) resets it on every write as a
+// side effect of an unrelated patch, and RunTests must report a GATING
+// violation — not merely a diagnostic — attributing it to the field test
+// whose patch was in flight when the drift first appeared.
+func TestRunTestsAssertUnchangedGatesOnSilentWipe(t *testing.T) {
+	f := &fakeCluster{
+		forProvider: map[string]interface{}{testFieldNotifyDelay: float64(0)},
+		atProvider: map[string]interface{}{
+			testFieldNotifyDelay: float64(0),
+			"legacyRuleList":     []interface{}{"rule-a"},
+		},
+		generation:        1,
+		kind:              testKindExample,
+		name:              testNameExample,
+		recordUpdateEvent: true,
+		// Every real field patch silently resets legacyRuleList to an empty
+		// list — mirroring a backend that defaults an omitted union member
+		// on every write, regardless of which field the request touched.
+		silentWipeField: "legacyRuleList",
+		silentWipeValue: []interface{}{},
+	}
+	r := newFakeRunner(f)
+
+	m := &manifest.Manifest{
+		Kind: testKindExample, Name: testNameExample,
+		Tests:           []manifest.UpdateTest{{Field: testFieldNotifyDelay, Value: float64(1)}},
+		AssertUnchanged: []string{"legacyRuleList"},
+	}
+
+	results, violations, err := r.RunTests(m)
+	if err != nil {
+		t.Fatalf("RunTests: unexpected error: %v", err)
+	}
+	if len(results) != 1 || !results[0].Passed {
+		t.Fatalf("expected the (unrelated) field test itself to pass, got %+v", results)
+	}
+
+	if len(violations) != 1 {
+		t.Fatalf("got %d assert-unchanged violations, want 1: %+v", len(violations), violations)
+	}
+	v := violations[0]
+	if v.Field != "legacyRuleList" {
+		t.Errorf("violation Field = %q, want %q", v.Field, "legacyRuleList")
+	}
+	if v.Baseline != `["rule-a"]` {
+		t.Errorf("violation Baseline = %q, want %q", v.Baseline, `["rule-a"]`)
+	}
+	if v.Observed != "[]" {
+		t.Errorf("violation Observed = %q, want %q", v.Observed, "[]")
+	}
+	if v.AfterField != testFieldNotifyDelay {
+		t.Errorf("violation AfterField = %q, want %q (the field whose patch triggered the wipe)", v.AfterField, testFieldNotifyDelay)
+	}
+}
+
+// TestRunTestsAssertUnchangedPassesWhenFieldHolds is the negative
+// counterpart: a manifest that declares an assert-unchanged field whose
+// value genuinely survives the whole run reports zero violations, proving
+// the directive does not fire on its own — only on an actual observed
+// drift.
+func TestRunTestsAssertUnchangedPassesWhenFieldHolds(t *testing.T) {
+	f := &fakeCluster{
+		forProvider: map[string]interface{}{testFieldNotifyDelay: float64(0)},
+		atProvider: map[string]interface{}{
+			testFieldNotifyDelay: float64(0),
+			"legacyRuleList":     []interface{}{"rule-a"},
+		},
+		generation: 1,
+		kind:       testKindExample,
+		name:       testNameExample,
+		// No silentWipeField: the backend behaves correctly.
+	}
+	r := newFakeRunner(f)
+
+	m := &manifest.Manifest{
+		Kind: testKindExample, Name: testNameExample,
+		Tests:           []manifest.UpdateTest{{Field: testFieldNotifyDelay, Value: float64(1)}},
+		AssertUnchanged: []string{"legacyRuleList"},
+	}
+
+	_, violations, err := r.RunTests(m)
+	if err != nil {
+		t.Fatalf("RunTests: unexpected error: %v", err)
+	}
+	if len(violations) != 0 {
+		t.Errorf("got %d assert-unchanged violations, want 0: %+v", len(violations), violations)
+	}
+}
+
+// TestRunTestsAssertUnchangedReportsDriftOnceAcrossMultipleFieldTests
+// confirms a wiped field is reported exactly once even though it stays
+// wiped for the remainder of the run — the drift is attributed to the
+// FIRST field test whose patch exposed it, not to every subsequent one.
+func TestRunTestsAssertUnchangedReportsDriftOnceAcrossMultipleFieldTests(t *testing.T) {
+	f := &fakeCluster{
+		forProvider: map[string]interface{}{testFieldNotifyDelay: float64(0)},
+		atProvider: map[string]interface{}{
+			testFieldNotifyDelay: float64(0),
+			"legacyRuleList":     []interface{}{"rule-a"},
+		},
+		generation:      1,
+		kind:            testKindExample,
+		name:            testNameExample,
+		silentWipeField: "legacyRuleList",
+		silentWipeValue: []interface{}{},
+	}
+	r := newFakeRunner(f)
+
+	m := &manifest.Manifest{
+		Kind: testKindExample, Name: testNameExample,
+		Tests: []manifest.UpdateTest{
+			{Field: testFieldNotifyDelay, Value: float64(1)},
+			{Field: testFieldFeatureEnabled, Value: true},
+		},
+		AssertUnchanged: []string{"legacyRuleList"},
+	}
+
+	_, violations, err := r.RunTests(m)
+	if err != nil {
+		t.Fatalf("RunTests: unexpected error: %v", err)
+	}
+	if len(violations) != 1 {
+		t.Fatalf("got %d violations, want exactly 1 (reported once, not once per field test): %+v", len(violations), violations)
+	}
+	if violations[0].AfterField != testFieldNotifyDelay {
+		t.Errorf("violation attributed to %q, want %q (the first field test whose patch exposed the drift)",
+			violations[0].AfterField, testFieldNotifyDelay)
 	}
 }
 
@@ -1352,7 +1503,7 @@ func TestRunTestsBelowCeilingNeverRestarts(t *testing.T) {
 	r := newFakeRunner(f)
 
 	m := manifestWithSequentialFieldTests(numFields)
-	if _, err := r.RunTests(m); err != nil {
+	if _, _, err := r.RunTests(m); err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
 
@@ -1388,7 +1539,7 @@ func TestRunTestsRestartFailureDoesNotAbortRun(t *testing.T) {
 	}
 
 	m := manifestWithSequentialFieldTests(numFields)
-	results, err := r.RunTests(m)
+	results, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
@@ -1447,7 +1598,7 @@ func TestRunTestsAmbiguousProviderDeploymentDegradesToUntrusted(t *testing.T) {
 	r.restartFunc = nil
 
 	m := manifestWithSequentialFieldTests(numFields)
-	results, err := r.RunTests(m)
+	results, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}

@@ -178,6 +178,79 @@ func TestUntrustedResultFailsTheRun(t *testing.T) {
 	}
 }
 
+// TestPrintUnchangedAssertions covers printUnchangedAssertions directly —
+// the gating verdict cmdRun relies on for the assert-unchanged directive
+// (see manifest.Manifest.AssertUnchanged): no fields declared prints
+// nothing and never fails, every declared field holding its baseline prints
+// a PASS line for each and never fails, and a violated field prints a
+// WIPED line naming the triggering field test and fails the run. This is
+// also the recorded proof that a deliberately-broken assertion produces a
+// FAILED run: DriftedFieldFails's output line is the artifact.
+func TestPrintUnchangedAssertions(t *testing.T) {
+	tests := []struct {
+		name       string
+		fields     []string
+		violations []runner.UnchangedAssertion
+		wantFailed bool
+		contains   []string
+		wantEmpty  bool
+	}{
+		{
+			name:      "NoFieldsDeclaredPrintsNothing",
+			fields:    nil,
+			wantEmpty: true,
+		},
+		{
+			name:       "EveryFieldHoldsIsVisibleAndDoesNotFail",
+			fields:     []string{"legacyRuleList"},
+			violations: nil,
+			wantFailed: false,
+			contains:   []string{"Unchanged-field assertions:", `  ✓ legacyRuleList: unchanged across run`},
+		},
+		{
+			name:   "DriftedFieldFails",
+			fields: []string{"legacyRuleList"},
+			violations: []runner.UnchangedAssertion{{
+				Field: "legacyRuleList", Baseline: `["rule-a"]`, Observed: "[]", AfterField: "comment",
+			}},
+			wantFailed: true,
+			contains:   []string{`  ✗ legacyRuleList: WIPED after patching "comment" (was "[\"rule-a\"]", now "[]")`},
+		},
+		{
+			name:   "OnlyTheDriftedFieldAmongSeveralIsMarkedFailed",
+			fields: []string{"stableField", "legacyRuleList"},
+			violations: []runner.UnchangedAssertion{{
+				Field: "legacyRuleList", Baseline: `["rule-a"]`, Observed: "[]", AfterField: "comment",
+			}},
+			wantFailed: true,
+			contains: []string{
+				`  ✓ stableField: unchanged across run`,
+				`  ✗ legacyRuleList: WIPED after patching "comment" (was "[\"rule-a\"]", now "[]")`,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			gotFailed := printUnchangedAssertions(&buf, tc.fields, tc.violations)
+			out := buf.String()
+
+			if tc.wantEmpty && out != "" {
+				t.Errorf("expected no output for a manifest with no assert-unchanged fields, got:\n%s", out)
+			}
+			if gotFailed != tc.wantFailed {
+				t.Errorf("printUnchangedAssertions() = %v, want %v", gotFailed, tc.wantFailed)
+			}
+			for _, want := range tc.contains {
+				if !strings.Contains(out, want) {
+					t.Errorf("output missing %q\noutput:\n%s", want, out)
+				}
+			}
+		})
+	}
+}
+
 // TestPassTransition pins passTransition's two shapes directly: a known
 // pre-patch value produces a plain arrow, and an unknown one falls back to
 // explicit labels rather than printing an arrow with a blank or misleading

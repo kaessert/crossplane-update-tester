@@ -665,16 +665,32 @@ func (r *Runner) slowObserveThreshold() time.Duration {
 // limit before the proactive reset fires.
 const eventBurstCeiling = 20
 
-// RunTests executes all update tests from the manifest and returns results.
-func (r *Runner) RunTests(m *manifest.Manifest) ([]TestResult, error) {
+// RunTests executes all update tests from the manifest and returns results,
+// plus every manifest-declared assert-unchanged field (see
+// manifest.Manifest.AssertUnchanged) that drifted from its pre-run baseline
+// at any point during the run — a GATING failure the caller must treat the
+// same as a failed field test. See UnchangedAssertion and
+// checkAssertUnchanged.
+func (r *Runner) RunTests(m *manifest.Manifest) ([]TestResult, []UnchangedAssertion, error) {
 	if err := r.ResolveResource(m); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	snapshot, err := r.Snapshot()
 	if err != nil {
-		return nil, fmt.Errorf("initial snapshot: %w", err)
+		return nil, nil, fmt.Errorf("initial snapshot: %w", err)
 	}
+
+	baselines, err := readAssertUnchangedBaselines(snapshot, m.AssertUnchanged)
+	if err != nil {
+		return nil, nil, err
+	}
+	// violatedFields tracks which assert-unchanged fields have already been
+	// reported, so a field that stays wiped for the rest of the run is
+	// reported exactly once — attributed to the field test that first moved
+	// it — rather than once per remaining field test.
+	violatedFields := make(map[string]bool, len(m.AssertUnchanged))
+	var violations []UnchangedAssertion
 
 	var results []TestResult
 	var attemptsSinceReset int
@@ -734,9 +750,20 @@ func (r *Runner) RunTests(m *manifest.Manifest) ([]TestResult, error) {
 		if !result.NoOp {
 			attemptsSinceReset++
 		}
+
+		// Assert-unchanged check: a skipped or no-op test never advances
+		// snapshot past its pre-loop value, so there is nothing new to
+		// check against the baseline either way.
+		if !result.Skipped && !result.NoOp {
+			newViolations, cerr := checkAssertUnchanged(snapshot, m.AssertUnchanged, baselines, violatedFields, t.Field)
+			if cerr != nil && results[len(results)-1].Error == nil {
+				results[len(results)-1].Error = fmt.Errorf("checking assert-unchanged fields: %w", cerr)
+			}
+			violations = append(violations, newViolations...)
+		}
 	}
 
-	return results, nil
+	return results, violations, nil
 }
 
 // providerDeploymentNamespace is where the Crossplane package manager

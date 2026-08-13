@@ -219,7 +219,7 @@ func cmdRun(args []string) error {
 	fmt.Printf("Testing %s/%s (%d fields, %d skipped)\n",
 		m.Kind, m.Name, len(m.Tests), skipped)
 
-	results, err := runner.NewRunner(opts.manifestPath, opts.timeout).
+	results, unchangedViolations, err := runner.NewRunner(opts.manifestPath, opts.timeout).
 		WithPollInterval(opts.pollInterval).
 		RunTests(m)
 	if err != nil {
@@ -227,15 +227,54 @@ func cmdRun(args []string) error {
 	}
 
 	passed, failed, noop, notEvidenced, untrusted := printResults(os.Stdout, results)
+	assertUnchangedFailed := printUnchangedAssertions(os.Stdout, m.AssertUnchanged, unchangedViolations)
 
 	total := passed + failed
 	fmt.Printf("%s: %d/%d tested, %d/%d skipped, %d no-op, %d not-evidenced, %d untrusted\n",
-		verdict(failed == 0), passed, total, skipped, len(m.Tests), noop, notEvidenced, untrusted)
+		verdict(failed == 0 && !assertUnchangedFailed), passed, total, skipped, len(m.Tests), noop, notEvidenced, untrusted)
 
+	if failed > 0 && assertUnchangedFailed {
+		return fmt.Errorf("%d of %d field tests failed, and %d assert-unchanged field(s) drifted", failed, total, len(unchangedViolations))
+	}
 	if failed > 0 {
 		return fmt.Errorf("%d of %d field tests failed", failed, total)
 	}
+	if assertUnchangedFailed {
+		return fmt.Errorf("%d assert-unchanged field(s) drifted during the run", len(unchangedViolations))
+	}
 	return nil
+}
+
+// printUnchangedAssertions prints the outcome of every manifest-declared
+// assert-unchanged field (see manifest.Manifest.AssertUnchanged), whether it
+// held for the whole run or drifted, and reports whether any drifted. A
+// manifest that declares none prints nothing and reports no failure — this
+// is a strict opt-in on top of ordinary per-field update-test behaviour.
+//
+// A passing field is printed alongside a failing one, not just a failing
+// one, so a reviewer scanning a green E2E log can still see the guard ran —
+// the same reason a PASS line exists in printResults above.
+func printUnchangedAssertions(w io.Writer, fields []string, violations []runner.UnchangedAssertion) (anyFailed bool) {
+	if len(fields) == 0 {
+		return false
+	}
+
+	byField := make(map[string]runner.UnchangedAssertion, len(violations))
+	for _, v := range violations {
+		byField[v.Field] = v
+	}
+
+	printfTo(w, "Unchanged-field assertions:\n")
+	for _, f := range fields {
+		if v, ok := byField[f]; ok {
+			anyFailed = true
+			printfTo(w, "  \u2717 %s: WIPED after patching %q (was %q, now %q)\n", f, v.AfterField, v.Baseline, v.Observed)
+			continue
+		}
+		printfTo(w, "  \u2713 %s: unchanged across run\n", f)
+	}
+	printfTo(w, "\n")
+	return anyFailed
 }
 
 // printResults prints one line per test result (plus any side effects) and

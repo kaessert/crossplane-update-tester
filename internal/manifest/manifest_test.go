@@ -328,3 +328,127 @@ func TestParseBytesInvalidDocuments(t *testing.T) {
 		})
 	}
 }
+
+// TestParseBytesAssertUnchanged covers the "assert-unchanged:" directive:
+// absent (the default for every manifest that predates it), a single field,
+// several comma-separated fields with incidental whitespace, and alongside
+// converge-skip and the field-entry list in the same annotation.
+func TestParseBytesAssertUnchanged(t *testing.T) {
+	cases := map[string]struct {
+		reason string
+		yaml   string
+		want   []string
+	}{
+		"Absent": {
+			reason: "a manifest without the directive parses with a nil AssertUnchanged, not an error",
+			yaml: `
+apiVersion: network.example.crossplane.io/v1alpha1
+kind: Network
+metadata:
+  name: example-network
+  annotations:
+    crossplane.io/update-test: |
+      - field: comment
+        value: "updated"
+`,
+			want: nil,
+		},
+		"SingleField": {
+			reason: "a single dot-separated field path is extracted verbatim",
+			yaml: `
+apiVersion: network.example.crossplane.io/v1alpha1
+kind: Network
+metadata:
+  name: example-network
+  annotations:
+    crossplane.io/update-test: |
+      assert-unchanged: ruleChoice.legacyRuleList
+      - field: comment
+        value: "updated"
+`,
+			want: []string{"ruleChoice.legacyRuleList"},
+		},
+		"MultipleFieldsWithWhitespace": {
+			reason: "a comma-separated list is split, and surrounding whitespace on each entry is trimmed",
+			yaml: `
+apiVersion: network.example.crossplane.io/v1alpha1
+kind: Network
+metadata:
+  name: example-network
+  annotations:
+    crossplane.io/update-test: |
+      assert-unchanged: ruleChoice.legacyRuleList,  otherField , thirdField
+      - field: comment
+        value: "updated"
+`,
+			want: []string{"ruleChoice.legacyRuleList", "otherField", "thirdField"},
+		},
+		"AlongsideConvergeSkipAndFieldEntries": {
+			reason: "both top-level directives extract independently and the field-entry list still parses",
+			yaml: `
+apiVersion: network.example.crossplane.io/v1alpha1
+kind: Network
+metadata:
+  name: example-network
+  annotations:
+    crossplane.io/update-test: |
+      converge-skip: "status field churns every observe cycle"
+      assert-unchanged: ruleChoice.legacyRuleList
+      - field: comment
+        value: "updated"
+`,
+			want: []string{"ruleChoice.legacyRuleList"},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			m, err := ParseBytes([]byte(tc.yaml))
+			if err != nil {
+				t.Fatalf("%s: ParseBytes() error = %v", tc.reason, err)
+			}
+			if !stringSlicesEqual(m.AssertUnchanged, tc.want) {
+				t.Errorf("%s: AssertUnchanged = %#v, want %#v", tc.reason, m.AssertUnchanged, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseAnnotationAssertUnchangedRejectsOverlapWithTestedField pins the
+// parse-time guard: a field cannot be both an update-test entry's own field
+// (patched) and an assert-unchanged field (asserted to never move) in the
+// same run — that pairing can never be satisfied and is rejected before any
+// cluster is touched, rather than surfacing as a confusing runtime failure
+// on the very first field test.
+func TestParseAnnotationAssertUnchangedRejectsOverlapWithTestedField(t *testing.T) {
+	annotation := `
+assert-unchanged: comment
+- field: comment
+  value: "updated"
+`
+	_, _, _, err := ParseAnnotation(annotation)
+	if err == nil {
+		t.Fatal("ParseAnnotation() error = nil, want an error rejecting the overlapping field")
+	}
+	wantSubstr := `assert-unchanged field "comment" is also an update-test field`
+	if !strings.Contains(err.Error(), wantSubstr) {
+		t.Errorf("ParseAnnotation() error = %q, want it to contain %q", err.Error(), wantSubstr)
+	}
+}
+
+// stringSlicesEqual compares two string slices for equality, treating nil
+// and empty as distinct only when one is nil and the other is non-nil with
+// elements — a plain reflect.DeepEqual would report nil != []string{} as
+// unequal even when both mean "no fields declared", which is not the
+// distinction these tests care about testing.
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

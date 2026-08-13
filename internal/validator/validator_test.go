@@ -17,6 +17,7 @@ const (
 	fieldName          = "name"
 	fieldOwner         = "owner"
 	fieldOwnerRef      = "ownerRef"
+	fieldOwnerRefs     = "ownerRefs"
 	fieldOwnerSelector = "ownerSelector"
 	fieldComment       = "comment"
 	fieldRegion        = "region"
@@ -45,6 +46,18 @@ func TestIsReferencePlumbingField(t *testing.T) {
 			jsonName: fieldOwnerRef,
 			fieldSet: map[string]bool{fieldOwner: true, fieldOwnerRef: true},
 			want:     true,
+		},
+		"RefsWithBaseField": {
+			reason:   "ownerRefs (plural, the list-typed base's Ref companion) is reference plumbing when owner exists — angryjet emits a plural Refs slice alongside a singular Selector for []string base fields",
+			jsonName: fieldOwnerRefs,
+			fieldSet: map[string]bool{fieldOwner: true, fieldOwnerRefs: true},
+			want:     true,
+		},
+		"RefsWithoutBaseField": {
+			reason:   "a *Refs field with no matching base value field is not excused — it must be reported MISSING, same as the singular *Ref case",
+			jsonName: "danglingRefs",
+			fieldSet: map[string]bool{"danglingRefs": true},
+			want:     false,
 		},
 		"SelectorWithBaseField": {
 			reason:   "ownerSelector is reference plumbing when owner exists",
@@ -108,14 +121,17 @@ func TestIsReferencePlumbingField(t *testing.T) {
 }
 
 // TestValidateManifestReferencePlumbingExclusion is the regression test for
-// the false positive this exclusion closes: ownerRef/ownerSelector must not
-// be reported MISSING when only the base owner field is covered by the
-// update-test annotation.
+// the false positive this exclusion closes: ownerRef/ownerRefs/ownerSelector
+// must not be reported MISSING when only the base owner field is covered by
+// the update-test annotation. ownerRefs stands in for the plural companion
+// angryjet generates for a list-typed base field ([]string), which real
+// generated types carry alongside the singular Selector.
 func TestValidateManifestReferencePlumbingExclusion(t *testing.T) {
 	fields := []FieldInfo{
 		{GoName: "Name", JSONName: fieldName},
 		{GoName: "Owner", JSONName: fieldOwner},
 		{GoName: "OwnerRef", JSONName: fieldOwnerRef},
+		{GoName: "OwnerRefs", JSONName: fieldOwnerRefs},
 		{GoName: "OwnerSelector", JSONName: fieldOwnerSelector},
 		{GoName: "Comment", JSONName: fieldComment},
 		{GoName: "Region", JSONName: fieldRegion, Immutable: true},
@@ -133,7 +149,7 @@ func TestValidateManifestReferencePlumbingExclusion(t *testing.T) {
 	result := ValidateManifest(m, fields)
 
 	if !result.AllGood {
-		t.Fatalf("expected AllGood=true (ownerRef/ownerSelector should be excluded, not MISSING); got fields: %+v", result.Fields)
+		t.Fatalf("expected AllGood=true (ownerRef/ownerRefs/ownerSelector should be excluded, not MISSING); got fields: %+v", result.Fields)
 	}
 
 	statusByName := statusMap(result)
@@ -142,6 +158,7 @@ func TestValidateManifestReferencePlumbingExclusion(t *testing.T) {
 		fieldName:          statusSkipped,
 		fieldOwner:         statusTested,
 		fieldOwnerRef:      statusRefPlumbing,
+		fieldOwnerRefs:     statusRefPlumbing,
 		fieldOwnerSelector: statusRefPlumbing,
 		fieldComment:       statusTested,
 		fieldRegion:        statusImmutable,

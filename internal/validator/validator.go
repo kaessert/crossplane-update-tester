@@ -51,15 +51,18 @@ var (
 
 // referencePlumbingSuffixes are the JSON-name suffixes angryjet appends to a
 // base value field's name when it generates the companion cross-resource
-// reference fields (convention: base field + "Ref" + "Selector", e.g.
-// "owner" + "ownerRef" + "ownerSelector"). These are Crossplane
-// reference-resolution machinery, not independent API fields, so they have
-// no update semantics of their own to exercise.
-var referencePlumbingSuffixes = []string{"Ref", "Selector"}
+// reference fields. A scalar base field gets a singular companion pair
+// ("owner" + "ownerRef" + "ownerSelector"); a list-typed base field
+// (`[]string`) gets a PLURAL "Refs" companion alongside the same singular
+// "Selector" — angryjet emits one Selector regardless of base cardinality,
+// e.g. "attachVpc" + "attachVpcRefs" + "attachVpcSelector". Both are
+// Crossplane reference-resolution machinery, not independent API fields, so
+// neither has update semantics of its own to exercise.
+var referencePlumbingSuffixes = []string{"Ref", "Refs", "Selector"}
 
 // isReferencePlumbingField reports whether jsonName is a generated
-// reference-plumbing field (a "*Ref" or "*Selector" companion to a base
-// value field) whose base field is present in fieldSet. Fields are only
+// reference-plumbing field (a "*Ref", "*Refs", or "*Selector" companion to a
+// base value field) whose base field is present in fieldSet. Fields are only
 // classified as reference plumbing when the matching base field actually
 // exists — this way a genuinely missing or renamed base value field is
 // still reported as MISSING rather than silently excused.

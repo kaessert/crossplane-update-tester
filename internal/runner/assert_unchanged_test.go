@@ -130,6 +130,53 @@ func TestReadAssertUnchangedBaselines(t *testing.T) {
 			t.Fatal("expected an error for a field path that does not exist on the snapshot, got nil")
 		}
 	})
+
+	// A field that is genuinely present but happens to hold an empty-string
+	// value is a different case from UnresolvablePathIsAnError above: the
+	// path resolves, the value is simply empty. It must be accepted as a
+	// legitimate baseline, not rejected as "no such field" — rejecting it
+	// would turn every guarded field that happens to start empty into a
+	// false positive.
+	t.Run("PresentButEmptyFieldIsAcceptedAsABaseline", func(t *testing.T) {
+		empty := []byte(`{"legacyRuleList":"","otherField":"x"}`)
+		got, err := readAssertUnchangedBaselines(empty, []string{"legacyRuleList"})
+		if err != nil {
+			t.Fatalf("unexpected error for a present-but-empty field: %v", err)
+		}
+		if v, ok := got["legacyRuleList"]; !ok || v != "" {
+			t.Errorf("baselines[%q] = %q (present=%v), want \"\" (present=true)", "legacyRuleList", v, ok)
+		}
+	})
+
+	// Accepting an empty baseline is only useful if it still gates: a field
+	// that starts empty and later moves off empty is exactly the silent
+	// drift assert-unchanged exists to catch. This exercises the baseline
+	// reader and checkAssertUnchanged together, the same composition the
+	// runner drives in practice.
+	t.Run("EmptyBaselineStillGatesWhenFieldMovesOffEmpty", func(t *testing.T) {
+		empty := []byte(`{"legacyRuleList":"","otherField":"x"}`)
+		baselines, err := readAssertUnchangedBaselines(empty, []string{"legacyRuleList"})
+		if err != nil {
+			t.Fatalf("unexpected error reading baseline: %v", err)
+		}
+
+		drifted := []byte(`{"legacyRuleList":"rule-x","otherField":"x"}`)
+		violated := map[string]bool{}
+		got, err := checkAssertUnchanged(drifted, []string{"legacyRuleList"}, baselines, violated, "algo")
+		if err != nil {
+			t.Fatalf("unexpected error checking drift: %v", err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("got %d violations, want 1: %+v", len(got), got)
+		}
+		v := got[0]
+		if v.Field != "legacyRuleList" || v.Baseline != "" || v.Observed != "rule-x" || v.AfterField != "algo" {
+			t.Errorf("got %+v, want Field=legacyRuleList Baseline=\"\" Observed=rule-x AfterField=algo", v)
+		}
+		if !violated["legacyRuleList"] {
+			t.Error("expected checkAssertUnchanged to mark the field as violated")
+		}
+	})
 }
 
 // TestCheckAssertUnchanged covers checkAssertUnchanged directly: a field

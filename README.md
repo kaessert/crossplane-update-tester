@@ -280,7 +280,7 @@ field is being patched:
 
 ```yaml
 crossplane.io/update-test: |
-  assert-unchanged: ruleChoice.legacyRuleList
+  assert-unchanged: legacyRuleList
   - field: comment
     value: "updated"
 ```
@@ -302,6 +302,14 @@ A field may not appear in both `assert-unchanged:` and as an entry's own
 `field:` — patching a field and asserting it never changes are contradictory
 requests, so that combination is rejected at parse time, before any cluster is
 touched.
+
+A declared path that does not resolve on the object — a typo, a stray
+container segment, a field the backend has not populated yet — is also
+rejected, at the start of `run`, before any field test patches anything. An
+unresolvable path is never treated as an implicit empty baseline: doing so
+would make the field compare `""` against `""` for the whole run regardless
+of what the backend actually does, which is a guard that always reports
+green without ever having measured anything.
 
 The mechanism is generic: it reads whatever field paths the manifest declares
 and compares live values against a baseline, with no knowledge of any

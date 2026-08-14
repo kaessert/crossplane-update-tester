@@ -5,33 +5,53 @@ import (
 )
 
 // TestReadSnapshotField covers navigation of a Runner.Snapshot() result: a
-// plain scalar, a nested dot-separated path, a missing field (nil, no
-// error), and a snapshot that is not even a JSON object.
+// plain scalar, a nested dot-separated path, a missing field (empty value,
+// exists=false, no error), a present-but-empty field (empty value,
+// exists=true — the case a bare value comparison cannot tell apart from
+// missing), and a snapshot that is not even a JSON object.
 func TestReadSnapshotField(t *testing.T) {
 	cases := map[string]struct {
-		reason   string
-		snapshot string
-		field    string
-		want     string
-		wantErr  bool
+		reason     string
+		snapshot   string
+		field      string
+		want       string
+		wantExists bool
+		wantErr    bool
 	}{
 		"TopLevelScalar": {
-			reason:   "a plain top-level field is stringified the same way ReadField would render it",
-			snapshot: `{"comment":"hello"}`,
-			field:    "comment",
-			want:     "hello",
+			reason:     "a plain top-level field is stringified the same way ReadField would render it",
+			snapshot:   `{"comment":"hello"}`,
+			field:      "comment",
+			want:       "hello",
+			wantExists: true,
 		},
 		"NestedField": {
-			reason:   "a dot-separated path descends through nested objects",
-			snapshot: `{"ruleChoice":{"legacyRuleList":{"rules":["a"]}}}`,
-			field:    "ruleChoice.legacyRuleList",
-			want:     `{"rules":["a"]}`,
+			reason:     "a dot-separated path descends through nested objects",
+			snapshot:   `{"ruleChoice":{"legacyRuleList":{"rules":["a"]}}}`,
+			field:      "ruleChoice.legacyRuleList",
+			want:       `{"rules":["a"]}`,
+			wantExists: true,
 		},
 		"MissingField": {
-			reason:   "a missing field reads as an empty string, not an error — mirrors ReadField/navigateJSONPath",
-			snapshot: `{"comment":"hello"}`,
-			field:    "absent",
-			want:     "",
+			reason:     "a missing field reads as an empty string with exists=false, not an error — mirrors ReadField/navigateJSONPath",
+			snapshot:   `{"comment":"hello"}`,
+			field:      "absent",
+			want:       "",
+			wantExists: false,
+		},
+		"PresentButEmptyField": {
+			reason:     "a field present with an empty-string value reads as exists=true — distinguishable from MissingField even though both stringify to \"\"",
+			snapshot:   `{"comment":""}`,
+			field:      "comment",
+			want:       "",
+			wantExists: true,
+		},
+		"PresentButNullField": {
+			reason:     "a field present with a JSON null value also reads as exists=true",
+			snapshot:   `{"comment":null}`,
+			field:      "comment",
+			want:       "",
+			wantExists: true,
 		},
 		"MalformedSnapshot": {
 			reason:   "a snapshot that fails to parse as JSON is an error, not a silently empty read",
@@ -43,7 +63,7 @@ func TestReadSnapshotField(t *testing.T) {
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			got, err := readSnapshotField([]byte(tc.snapshot), tc.field)
+			got, exists, err := readSnapshotField([]byte(tc.snapshot), tc.field)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("%s: readSnapshotField() error = nil, want an error", tc.reason)
@@ -55,6 +75,9 @@ func TestReadSnapshotField(t *testing.T) {
 			}
 			if got != tc.want {
 				t.Errorf("%s: readSnapshotField() = %q, want %q", tc.reason, got, tc.want)
+			}
+			if exists != tc.wantExists {
+				t.Errorf("%s: readSnapshotField() exists = %v, want %v", tc.reason, exists, tc.wantExists)
 			}
 		})
 	}
@@ -92,6 +115,19 @@ func TestReadAssertUnchangedBaselines(t *testing.T) {
 	t.Run("MalformedSnapshotIsAnError", func(t *testing.T) {
 		if _, err := readAssertUnchangedBaselines([]byte("not json"), []string{"legacyRuleList"}); err == nil {
 			t.Fatal("expected an error reading the baseline from a malformed snapshot")
+		}
+	})
+
+	// A field path that does not resolve on the object used to read as an
+	// empty-string baseline (indistinguishable from a legitimately empty
+	// field, and indistinguishable from every later observation of the
+	// same absent path), so the assertion could never fail no matter what
+	// the backend actually did. It must be rejected up front, before any
+	// field test runs.
+	t.Run("UnresolvablePathIsAnError", func(t *testing.T) {
+		_, err := readAssertUnchangedBaselines(snapshot, []string{"ruleChoice.legacyRuleList"})
+		if err == nil {
+			t.Fatal("expected an error for a field path that does not exist on the snapshot, got nil")
 		}
 	})
 }

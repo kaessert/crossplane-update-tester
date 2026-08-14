@@ -153,6 +153,8 @@ chmod +x "$TREE/test/hooks/run-update-tester.sh"
 
 ln -s run-update-tester.sh "$TREE/test/hooks/post-assert-network-v6.sh"
 ln -s run-update-tester.sh "$TREE/test/hooks/post-assert-widget.sh"
+ln -s run-update-tester.sh "$TREE/test/hooks/post-assert-wipe.sh"
+ln -s run-update-tester.sh "$TREE/test/hooks/post-assert-wipe-badpath.sh"
 
 # A third example, generated rather than checked in: it carries more mutable
 # fields than the runner's event-burst ceiling (20), which is the only way to
@@ -190,7 +192,7 @@ export UPDATE_TESTER_TIMEOUT="5"
 # manifest entry whose `expect:` differs from its `value:`.
 export SMOKE_UPPERCASE_FIELDS="routingHint"
 
-echo "   tree ready (stub module, 3 examples, 2 post-assert symlinks, fake kubectl)"
+echo "   tree ready (stub module, 5 examples, 4 post-assert symlinks, fake kubectl)"
 
 # ─── helpers ───────────────────────────────────────────────────────────────
 
@@ -660,6 +662,78 @@ if [ "$loop_banners" = "converge," ]; then
   ok "aborted at step 1: the remaining 4 steps never ran"
 else
   bad "expected the hook to stop after 'converge', got: $loop_banners"
+fi
+
+section "7d. failure injection: assert-unchanged silent-wipe guard"
+
+run_hook post-assert-wipe.sh wipe-ok
+
+if [ "$RC" -eq 0 ]; then
+  ok "hook exited 0 when the asserted field held its baseline for the whole run"
+else
+  bad "hook exited $RC despite the asserted field never drifting"
+  dump "hook output" "$OUT"
+fi
+
+if grep -q 'legacyRuleList: unchanged across run' "$OUT"; then
+  ok "reported: legacyRuleList unchanged across run"
+else
+  bad "expected 'legacyRuleList: unchanged across run' in the output"
+  dump "hook output" "$OUT"
+fi
+
+export SMOKE_WIPE_FIELD=legacyRuleList
+export SMOKE_WIPE_TO=""
+run_hook post-assert-wipe.sh wipe-drift
+unset SMOKE_WIPE_FIELD SMOKE_WIPE_TO
+
+if [ "$RC" -ne 0 ]; then
+  ok "hook exited $RC (non-zero) when the backend silently wiped the asserted field"
+else
+  bad "hook exited 0 despite the asserted field being wiped by an unrelated patch"
+  dump "hook output" "$OUT"
+fi
+
+if grep -q 'legacyRuleList: WIPED after patching "algo" (was "rule-a,rule-b", now "")' "$OUT"; then
+  ok "reported: legacyRuleList WIPED after patching \"algo\""
+else
+  bad "expected the WIPED line naming algo as the triggering field"
+  dump "hook output" "$OUT"
+fi
+
+wipe_banners="$(banners "$OUT" | cut -f1 | tr '\n' ',')"
+if [ "$wipe_banners" = "converge,run," ]; then
+  ok "aborted inside 'run': the post-update converge never ran"
+else
+  bad "expected the hook to stop after 'run', got: $wipe_banners"
+  dump "hook output" "$OUT"
+fi
+
+# The negative case: a declared path that does not resolve on the object at
+# all must fail loudly, not read as an implicit empty baseline that can
+# never drift. No SMOKE_WIPE_FIELD is set here — the baseline read fails
+# before any patch is even attempted, so a wipe is not needed to prove it.
+run_hook post-assert-wipe-badpath.sh wipe-badpath
+
+if [ "$RC" -ne 0 ]; then
+  ok "hook exited $RC (non-zero) for an assert-unchanged path that does not resolve on the object"
+else
+  bad "hook exited 0 despite an assert-unchanged path that does not exist — the exact vacuous-pass regression this guards against"
+  dump "hook output" "$OUT"
+fi
+
+if grep -q 'no such field' "$OUT"; then
+  ok "reported: no such field, naming the unresolvable path"
+else
+  bad "expected a 'no such field' style error for the unresolvable assert-unchanged path"
+  dump "hook output" "$OUT"
+fi
+
+if grep -qE '^patch ' "$TMP/state-wipe-badpath/kubectl.log"; then
+  bad "the hook patched the resource before the unresolvable path was rejected"
+  dump "kubectl transcript" "$TMP/state-wipe-badpath/kubectl.log"
+else
+  ok "no patch was issued before the baseline check rejected the unresolvable path"
 fi
 
 # ─── summary ───────────────────────────────────────────────────────────────

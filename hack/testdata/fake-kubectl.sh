@@ -49,11 +49,22 @@
 #                            "backend" normalises to upper case when storing
 #                            them, so a manifest entry's `expect:` differing
 #                            from its `value:` is exercised.
+#   SMOKE_WIPE_FIELD         name of an atProvider field the "backend"
+#                            silently resets to SMOKE_WIPE_TO on every
+#                            accepted spec patch, regardless of which field
+#                            was actually patched — the exact defect an
+#                            `assert-unchanged:` directive exists to catch
+#                            (an omitted union member reset to its default on
+#                            every write). Unset (the default): no wipe.
+#   SMOKE_WIPE_TO            value SMOKE_WIPE_FIELD is reset to. Defaults to
+#                            the empty string.
 set -euo pipefail
 
 STATE="${SMOKE_STATE:?fake kubectl: SMOKE_STATE is not set}"
 FAIL_MODE="${SMOKE_FAIL_MODE:-}"
 UPPERCASE_FIELDS="${SMOKE_UPPERCASE_FIELDS:-}"
+WIPE_FIELD="${SMOKE_WIPE_FIELD:-}"
+WIPE_TO="${SMOKE_WIPE_TO:-}"
 
 mkdir -p "$STATE/res"
 LOG="$STATE/kubectl.log"
@@ -420,6 +431,14 @@ cmd_patch() {
           fi
         done
         printf '%s' "$stored" >"$dir/at/$field"
+      fi
+
+      # SMOKE_WIPE_FIELD simulates a backend that silently resets an
+      # unrelated field on every accepted write — independent of FAIL_MODE
+      # and independent of which field was actually patched, mirroring a
+      # backend bug that is not scoped to the field under test.
+      if [ -n "$WIPE_FIELD" ]; then
+        printf '%s' "$WIPE_TO" >"$dir/at/$WIPE_FIELD"
       fi
       ;;
 

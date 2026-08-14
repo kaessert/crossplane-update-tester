@@ -33,15 +33,29 @@ type UnchangedAssertion struct {
 // run's baseline before any field test patches anything. Returns nil, nil
 // when fields is empty, so a manifest that declares no assert-unchanged
 // fields pays no cost beyond the check.
+//
+// A field path that does not resolve on the object is an error here, not a
+// silent "" baseline. Without this check, a typo'd path (a stray container
+// segment, a renamed field) reads as absent on every snapshot — baseline and
+// every later observation alike — so it compares "" to "" for the whole run
+// and the guard reports a green checkmark while never having measured
+// anything. Rejecting it at baseline time, before any field test has
+// patched the resource, turns that silent no-op into a loud, immediate
+// parse-time-adjacent failure instead of a false sense of coverage.
 func readAssertUnchangedBaselines(snapshot []byte, fields []string) (map[string]string, error) {
 	if len(fields) == 0 {
 		return nil, nil
 	}
 	baselines := make(map[string]string, len(fields))
 	for _, f := range fields {
-		v, err := readSnapshotField(snapshot, f)
+		v, exists, err := readSnapshotField(snapshot, f)
 		if err != nil {
 			return nil, fmt.Errorf("reading assert-unchanged baseline for %q: %w", f, err)
+		}
+		if !exists {
+			return nil, fmt.Errorf(
+				"assert-unchanged field %q: no such field in status.atProvider — check the path for a typo, "+
+					"a stray container segment, or a field the backend has not populated yet", f)
 		}
 		baselines[f] = v
 	}
@@ -52,20 +66,25 @@ func readAssertUnchangedBaselines(snapshot []byte, fields []string) (map[string]
 // status.atProvider subtree, already unwrapped) to a dot-separated field
 // path and stringifies the value found there using the same rules
 // Runner.ReadField uses for a live read, so a baseline captured here and a
-// later observation captured the same way are directly comparable.
-func readSnapshotField(snapshot []byte, field string) (string, error) {
+// later observation captured the same way are directly comparable. The
+// returned bool reports whether the field actually exists — see
+// navigateJSONPath — so a caller that needs to reject a genuinely-absent
+// field (readAssertUnchangedBaselines) can tell that apart from one that
+// exists but stringifies to the same empty value.
+func readSnapshotField(snapshot []byte, field string) (string, bool, error) {
 	var atProvider map[string]interface{}
 	if err := json.Unmarshal(snapshot, &atProvider); err != nil {
-		return "", fmt.Errorf("parsing snapshot: %w", err)
+		return "", false, fmt.Errorf("parsing snapshot: %w", err)
 	}
 	// The snapshot IS the atProvider subtree already (Snapshot marshals it
 	// directly), so there is no container to descend through first — unlike
 	// navigateAtProvider, which starts from the whole resource object.
-	val, err := navigateJSONPath(atProvider, nil, field)
+	val, exists, err := navigateJSONPath(atProvider, nil, field)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
-	return stringifyFieldValue(val, field)
+	s, err := stringifyFieldValue(val, field)
+	return s, exists, err
 }
 
 // checkAssertUnchanged compares the current value of every not-yet-violated
@@ -87,7 +106,7 @@ func checkAssertUnchanged(snapshot []byte, fields []string, baselines map[string
 		if violated[f] {
 			continue
 		}
-		cur, err := readSnapshotField(snapshot, f)
+		cur, _, err := readSnapshotField(snapshot, f)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("reading %q: %w", f, err)

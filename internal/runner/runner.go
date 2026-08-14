@@ -238,7 +238,7 @@ func (r *Runner) Snapshot() ([]byte, error) {
 	// Navigating with jsonKeyAtProvider as the field (rather than as part
 	// of the container) reuses the same descent ReadField uses, and gives
 	// the whole subtree instead of one leaf under it.
-	val, err := navigateJSONPath(obj, []string{jsonKeyStatus}, jsonKeyAtProvider)
+	val, _, err := navigateJSONPath(obj, []string{jsonKeyStatus}, jsonKeyAtProvider)
 	if err != nil {
 		return nil, fmt.Errorf("reading status.atProvider: %w", err)
 	}
@@ -377,7 +377,7 @@ func (r *Runner) ReadField(field string) (string, error) {
 		return "", fmt.Errorf("reading field %s: %w", field, err)
 	}
 
-	val, err := navigateAtProvider(obj, field)
+	val, _, err := navigateAtProvider(obj, field)
 	if err != nil {
 		return "", err
 	}
@@ -396,13 +396,13 @@ func (r *Runner) readCurrentValue(field string) (string, error) {
 		return "", fmt.Errorf("reading resource for no-op check on %s: %w", field, err)
 	}
 
-	val, err := navigateSpecForProvider(obj, field)
+	val, _, err := navigateSpecForProvider(obj, field)
 	if err == nil && val != nil {
 		return stringifyFieldValue(val, field)
 	}
 
 	// Fall back to the live observed state.
-	atVal, atErr := navigateAtProvider(obj, field)
+	atVal, _, atErr := navigateAtProvider(obj, field)
 	if atErr != nil {
 		return "", atErr
 	}
@@ -438,34 +438,47 @@ const (
 )
 
 // navigateAtProvider navigates a resource JSON object to
-// status.atProvider.<dot-separated-field> and returns the value found there.
-// Returns nil, nil when any intermediate segment is missing.
-func navigateAtProvider(obj map[string]interface{}, field string) (interface{}, error) {
+// status.atProvider.<dot-separated-field> and returns the value found there,
+// plus whether the field actually exists (see navigateJSONPath for why the
+// distinction matters).
+func navigateAtProvider(obj map[string]interface{}, field string) (interface{}, bool, error) {
 	return navigateJSONPath(obj, []string{jsonKeyStatus, jsonKeyAtProvider}, field)
 }
 
 // navigateSpecForProvider navigates a resource JSON object to
-// spec.forProvider.<dot-separated-field> and returns the value found there.
-// Returns nil, nil when any intermediate segment is missing.
-func navigateSpecForProvider(obj map[string]interface{}, field string) (interface{}, error) {
+// spec.forProvider.<dot-separated-field> and returns the value found there,
+// plus whether the field actually exists (see navigateJSONPath for why the
+// distinction matters).
+func navigateSpecForProvider(obj map[string]interface{}, field string) (interface{}, bool, error) {
 	return navigateJSONPath(obj, []string{"spec", "forProvider"}, field)
 }
 
 // navigateJSONPath descends obj through each key in container (e.g.
 // ["status", "atProvider"]), then further descends through the
-// dot-separated field path under that container. Returns nil, nil when any
-// segment — container or field — is missing, and an error if a
+// dot-separated field path under that container. Returns exists=false when
+// any segment — container or field — is missing, and an error if a
 // non-terminal segment resolves to something other than a JSON object.
-func navigateJSONPath(obj map[string]interface{}, container []string, field string) (interface{}, error) {
+//
+// The returned bool is what lets a caller tell a genuinely-absent field
+// apart from one that is present but holds a JSON null or empty value: both
+// stringify to the same "" via stringifyFieldValue, so a caller that only
+// ever looked at the value (as this function used to do, returning a bare
+// nil for "missing") cannot recover that distinction after the fact. Most
+// callers still don't need it — ReadField and readCurrentValue treat both
+// cases as "nothing to report" — but readAssertUnchangedBaselines does: a
+// silently-absent field there is a typo in the manifest, not a legitimate
+// empty baseline, and letting the two collapse into the same "" is exactly
+// the defect that let an unresolvable assert-unchanged path pass vacuously.
+func navigateJSONPath(obj map[string]interface{}, container []string, field string) (interface{}, bool, error) {
 	var curr interface{} = obj
 	for _, key := range container {
 		m, ok := curr.(map[string]interface{})
 		if !ok {
-			return nil, fmt.Errorf("%s is not a JSON object", strings.Join(container, "."))
+			return nil, false, fmt.Errorf("%s is not a JSON object", strings.Join(container, "."))
 		}
 		v, exists := m[key]
 		if !exists {
-			return nil, nil
+			return nil, false, nil
 		}
 		curr = v
 	}
@@ -473,15 +486,15 @@ func navigateJSONPath(obj map[string]interface{}, container []string, field stri
 	for _, part := range strings.Split(field, ".") {
 		m, ok := curr.(map[string]interface{})
 		if !ok {
-			return nil, fmt.Errorf("cannot navigate to %q: parent is not a JSON object", part)
+			return nil, false, fmt.Errorf("cannot navigate to %q: parent is not a JSON object", part)
 		}
 		v, exists := m[part]
 		if !exists {
-			return nil, nil
+			return nil, false, nil
 		}
 		curr = v
 	}
-	return curr, nil
+	return curr, true, nil
 }
 
 // jsonEqual compares an expected Go value (from a YAML annotation) with an

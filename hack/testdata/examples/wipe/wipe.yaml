@@ -1,0 +1,24 @@
+# Exercises the assert-unchanged: silent-wipe guard end to end (see
+# hack/smoke-test.sh section "7d"): a backend that resets an unrelated
+# field to some other value on every accepted write, independent of which
+# field was actually patched.
+#
+# No crossplane.io/expect-external-name-prefix annotation, so this manifest
+# opts out of the two identity checks — the hook runs the 3-step sequence
+# (converge -> run -> converge), the same shape widget.yaml exercises.
+apiVersion: wipe.example.crossplane.io/v1alpha1
+kind: Wipe
+metadata:
+  name: example-wipe
+  annotations:
+    uptest.upbound.io/post-assert-hook: ../../test/hooks/post-assert-wipe.sh
+    crossplane.io/update-test: |
+      assert-unchanged: legacyRuleList
+      - field: algo
+        value: "LEAST_REQUEST"
+spec:
+  forProvider:
+    algo: ROUND_ROBIN
+    legacyRuleList: rule-a,rule-b
+  providerConfigRef:
+    name: default

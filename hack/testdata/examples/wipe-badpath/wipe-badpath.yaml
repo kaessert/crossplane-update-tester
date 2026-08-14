@@ -1,0 +1,22 @@
+# The negative counterpart to wipe.yaml: assert-unchanged declares a path
+# that does not resolve on the object at all (a stray "ruleChoice."
+# container segment that this resource's status.atProvider never had). Used
+# by hack/smoke-test.sh section "7d" to prove an unresolvable path is
+# rejected up front, before any field test patches anything — never treated
+# as an implicit empty baseline.
+apiVersion: wipe.example.crossplane.io/v1alpha1
+kind: Wipe
+metadata:
+  name: example-wipe-badpath
+  annotations:
+    uptest.upbound.io/post-assert-hook: ../../test/hooks/post-assert-wipe-badpath.sh
+    crossplane.io/update-test: |
+      assert-unchanged: ruleChoice.legacyRuleList
+      - field: algo
+        value: "LEAST_REQUEST"
+spec:
+  forProvider:
+    algo: ROUND_ROBIN
+    legacyRuleList: rule-a,rule-b
+  providerConfigRef:
+    name: default

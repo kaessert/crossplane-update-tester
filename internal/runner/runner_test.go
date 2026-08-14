@@ -1038,14 +1038,16 @@ func TestReadCurrentValueFallsBackToAtProvider(t *testing.T) {
 
 // TestNavigateJSONPath covers navigateAtProvider and navigateSpecForProvider
 // (both backed by navigateJSONPath), including nested fields, missing
-// containers, missing leaves, and non-object intermediates.
+// containers, missing leaves, non-object intermediates, and the
+// present-vs-absent distinction the exists return value carries.
 func TestNavigateJSONPath(t *testing.T) {
 	cases := map[string]struct {
-		reason  string
-		obj     map[string]interface{}
-		field   string
-		want    interface{}
-		wantErr bool
+		reason     string
+		obj        map[string]interface{}
+		field      string
+		want       interface{}
+		wantExists bool
+		wantErr    bool
 	}{
 		"TopLevelField": {
 			reason: "a direct child of atProvider resolves",
@@ -1054,8 +1056,9 @@ func TestNavigateJSONPath(t *testing.T) {
 					jsonKeyAtProvider: map[string]interface{}{"name": "example"},
 				},
 			},
-			field: "name",
-			want:  "example",
+			field:      "name",
+			want:       "example",
+			wantExists: true,
 		},
 		"NestedField": {
 			reason: "a dot-path descends through nested objects",
@@ -1066,24 +1069,38 @@ func TestNavigateJSONPath(t *testing.T) {
 					},
 				},
 			},
-			field: "parent.child",
-			want:  "value",
+			field:      "parent.child",
+			want:       "value",
+			wantExists: true,
 		},
 		"MissingContainer": {
-			reason: "a missing status key returns nil, nil rather than erroring",
-			obj:    map[string]interface{}{},
-			field:  "name",
-			want:   nil,
+			reason:     "a missing status key returns nil, exists=false, rather than erroring",
+			obj:        map[string]interface{}{},
+			field:      "name",
+			want:       nil,
+			wantExists: false,
 		},
 		"MissingLeaf": {
-			reason: "a leaf absent from an otherwise present object returns nil, nil",
+			reason: "a leaf absent from an otherwise present object returns nil, exists=false",
 			obj: map[string]interface{}{
 				jsonKeyStatus: map[string]interface{}{
 					jsonKeyAtProvider: map[string]interface{}{"other": "x"},
 				},
 			},
-			field: "name",
-			want:  nil,
+			field:      "name",
+			want:       nil,
+			wantExists: false,
+		},
+		"PresentButNullLeaf": {
+			reason: "a leaf explicitly set to JSON null is present (exists=true), unlike a leaf that is simply absent",
+			obj: map[string]interface{}{
+				jsonKeyStatus: map[string]interface{}{
+					jsonKeyAtProvider: map[string]interface{}{"name": nil},
+				},
+			},
+			field:      "name",
+			want:       nil,
+			wantExists: true,
 		},
 		"NonObjectIntermediate": {
 			reason: "descending through a scalar intermediate is an error",
@@ -1099,7 +1116,7 @@ func TestNavigateJSONPath(t *testing.T) {
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			got, err := navigateAtProvider(tc.obj, tc.field)
+			got, exists, err := navigateAtProvider(tc.obj, tc.field)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("%s: expected error, got nil", tc.reason)
@@ -1111,6 +1128,9 @@ func TestNavigateJSONPath(t *testing.T) {
 			}
 			if got != tc.want {
 				t.Errorf("%s: got %v, want %v", tc.reason, got, tc.want)
+			}
+			if exists != tc.wantExists {
+				t.Errorf("%s: exists = %v, want %v", tc.reason, exists, tc.wantExists)
 			}
 		})
 	}

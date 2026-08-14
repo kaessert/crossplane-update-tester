@@ -193,7 +193,7 @@ func manifestFromDoc(doc manifestDoc) (*Manifest, error) {
 //
 //	crossplane.io/update-test: |
 //	  converge-skip: "atProvider.lastSyncTime changes every observe cycle"
-//	  assert-unchanged: ruleChoice.legacyRuleList
+//	  assert-unchanged: legacyRuleList
 //	  - field: name
 //	    value: "updated"
 //

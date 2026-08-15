@@ -17,6 +17,12 @@ type FieldInfo struct {
 	GoName    string
 	JSONName  string
 	Immutable bool
+	// GoType is the field's declared Go type, exactly as written in source
+	// (e.g. "*string", "[]FooBar", "map[string]string",
+	// "*xpv2.NamespacedReference"). It is used to resolve the corresponding
+	// generated Observation struct for object/list-of-object fields — see
+	// structElemType and CheckObservability in observability.go.
+	GoType string
 }
 
 // ValidationResult holds the outcome of validating a manifest against types.
@@ -37,16 +43,22 @@ var (
 	// Matches a struct field line like:
 	//   Name string `json:"name" ...`
 	//   Path *string `json:"path,omitempty" ...`
+	// Group 1 is the Go field name, group 2 is the raw declared Go type
+	// (a single token — Go type literals never contain whitespace), group 3
+	// is the JSON tag name.
 	reStructField = regexp.MustCompile(
-		`^\s+(\w+)\s+\S+.*` + "`" + `.*json:"([^",]+).*` + "`",
+		`^\s+(\w+)\s+(\S+).*` + "`" + `.*json:"([^",]+).*` + "`",
 	)
 
 	// Matches XValidation marker for immutability.
 	// Looks for: rule="self == oldSelf" in a comment or marker above the field.
 	reImmutable = regexp.MustCompile(`self\s*==\s*oldSelf`)
 
-	// Matches the start of a Parameters struct.
-	reParamsStruct = regexp.MustCompile(`^type\s+(\w*Parameters)\s+struct\s*\{`)
+	// Matches the start of any named struct — used to locate both the
+	// target {Kind}Parameters struct and, separately, arbitrary nested
+	// struct types (e.g. a {Kind}{X}Observation companion) that
+	// CheckObservability resolves by name.
+	reAnyStruct = regexp.MustCompile(`^type\s+(\w+)\s+struct\s*\{`)
 )
 
 // referencePlumbingSuffixes are the JSON-name suffixes angryjet appends to a
@@ -80,14 +92,14 @@ func isReferencePlumbingField(jsonName string, fieldSet map[string]bool) bool {
 }
 
 // goTypesParser is a small state machine that scans a Go source file line by
-// line looking for the {targetKind}Parameters struct, skipping over any
-// other *Parameters structs it encounters along the way (e.g. nested config
-// structs). It uses basic regex parsing.
+// line looking for the named targetStruct, skipping over any other struct
+// declarations it encounters along the way (e.g. nested config structs,
+// sibling Observation variants). It uses basic regex parsing.
 type goTypesParser struct {
 	targetStruct string
 	fields       []FieldInfo
 	inTarget     bool // inside the struct we actually want to parse
-	inOther      bool // inside a non-matching *Parameters struct (skipping)
+	inOther      bool // inside a non-matching struct (skipping)
 	braceDepth   int
 	prevLines    []string // buffer of preceding comment/marker lines
 	done         bool
@@ -122,10 +134,10 @@ func (p *goTypesParser) handleLine(line string) {
 	p.parseFieldLine(line)
 }
 
-// tryEnterStruct checks whether line opens a *Parameters struct and, if so,
+// tryEnterStruct checks whether line opens any named struct and, if so,
 // starts tracking it (either as the target struct or one to skip past).
 func (p *goTypesParser) tryEnterStruct(line string) {
-	m := reParamsStruct.FindStringSubmatch(line)
+	m := reAnyStruct.FindStringSubmatch(line)
 	if m == nil {
 		return
 	}
@@ -148,7 +160,7 @@ func (p *goTypesParser) parseFieldLine(line string) {
 	matches := reStructField.FindStringSubmatch(line)
 	switch {
 	case matches != nil:
-		p.addField(matches[1], matches[2], line)
+		p.addField(matches[1], matches[2], matches[3], line)
 	case isCommentOrMarkerLine(line):
 		// Accumulate comment/marker lines.
 		p.prevLines = append(p.prevLines, line)
@@ -167,7 +179,7 @@ func isCommentOrMarkerLine(line string) bool {
 
 // addField records a parsed field declaration, determining immutability from
 // the buffered preceding comment lines or the field line itself.
-func (p *goTypesParser) addField(goName, jsonName, line string) {
+func (p *goTypesParser) addField(goName, goType, jsonName, line string) {
 	// Check if any preceding comment lines contain immutability marker.
 	immutable := false
 	for _, pl := range p.prevLines {
@@ -185,16 +197,26 @@ func (p *goTypesParser) addField(goName, jsonName, line string) {
 		GoName:    goName,
 		JSONName:  jsonName,
 		Immutable: immutable,
+		GoType:    goType,
 	})
 	p.prevLines = nil
 }
 
 // ParseGoTypes reads a Go source file and extracts fields from the
-// {targetKind}Parameters struct. It skips other *Parameters structs
-// (e.g. nested config structs) until it finds the one matching targetKind.
+// {targetKind}Parameters struct. It skips other structs (e.g. nested config
+// structs, Observation variants) until it finds the one matching targetKind.
 func ParseGoTypes(path, targetKind string) ([]FieldInfo, error) {
-	targetStruct := targetKind + "Parameters"
+	return ParseStructFields(path, targetKind+"Parameters")
+}
 
+// ParseStructFields reads a Go source file and extracts fields from the
+// named struct, skipping over every other struct declaration it encounters
+// along the way. Unlike ParseGoTypes it takes the exact struct name rather
+// than a {Kind} and an implied "Parameters" suffix, so it can also resolve
+// an arbitrary nested struct — most importantly a {Kind}{X}Observation
+// companion type — which CheckObservability needs to determine whether a
+// field's declared shape is observable.
+func ParseStructFields(path, structName string) ([]FieldInfo, error) {
 	// #nosec G304 -- path is an operator-supplied CLI argument (the
 	// generated types file to validate), not attacker-controlled input.
 	f, err := os.Open(path)
@@ -205,7 +227,7 @@ func ParseGoTypes(path, targetKind string) ([]FieldInfo, error) {
 		_ = f.Close()
 	}()
 
-	p := &goTypesParser{targetStruct: targetStruct}
+	p := &goTypesParser{targetStruct: structName}
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		p.handleLine(scanner.Text())
@@ -219,7 +241,7 @@ func ParseGoTypes(path, targetKind string) ([]FieldInfo, error) {
 	}
 
 	if len(p.fields) == 0 {
-		return nil, fmt.Errorf("no %s struct found in %s", targetStruct, path)
+		return nil, fmt.Errorf("no %s struct found in %s", structName, path)
 	}
 
 	return p.fields, nil
@@ -307,4 +329,26 @@ func PrintValidation(r *ValidationResult) {
 	} else {
 		fmt.Println("FAIL: some mutable fields are not covered.")
 	}
+}
+
+// PrintObservability outputs any ObservabilityFinding results to stdout. It
+// is a distinct diagnostic block from PrintValidation's MISSING report: a
+// field can be fully "covered" by an update-test entry (a value exists for
+// every mutable field) while that entry's expectation still names a key
+// that can never appear in status.atProvider — coverage and observability
+// are different properties, and this prints the second one separately so
+// the two are never conflated in the output.
+func PrintObservability(findings []ObservabilityFinding) {
+	if len(findings) == 0 {
+		return
+	}
+
+	fmt.Println()
+	fmt.Println("Unobservable expectations:")
+	for _, f := range findings {
+		fmt.Printf("  ✗ %s: UNOBSERVABLE — key(s) %s excluded from the generated Observation struct by construction (input-only reference field); add expect: with the resolved value\n",
+			f.Field, strings.Join(f.Keys, ", "))
+	}
+	fmt.Println()
+	fmt.Println("FAIL: some update-test expectations are structurally unobservable in atProvider.")
 }

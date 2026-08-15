@@ -411,8 +411,14 @@ func cmdValidate(args []string) error {
 	result := validator.ValidateManifest(m, fields)
 	validator.PrintValidation(result)
 
+	findings := validator.CheckObservability(opts.typesFile, fields, m.Tests)
+	validator.PrintObservability(findings)
+
 	if !result.AllGood {
 		return errors.New("mutable-field coverage is incomplete")
+	}
+	if len(findings) > 0 {
+		return errors.New("update-test expectation is structurally unobservable in atProvider")
 	}
 	return nil
 }

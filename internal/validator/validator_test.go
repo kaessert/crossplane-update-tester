@@ -253,11 +253,11 @@ func TestParseGoTypes(t *testing.T) {
 	}
 
 	want := []FieldInfo{
-		{GoName: "Name", JSONName: fieldName},
-		{GoName: "Owner", JSONName: fieldOwner},
-		{GoName: "OwnerRef", JSONName: fieldOwnerRef},
-		{GoName: "OwnerSelector", JSONName: fieldOwnerSelector},
-		{GoName: "Region", JSONName: fieldRegion, Immutable: true},
+		{GoName: "Name", JSONName: fieldName, GoType: "*string"},
+		{GoName: "Owner", JSONName: fieldOwner, GoType: "*string"},
+		{GoName: "OwnerRef", JSONName: fieldOwnerRef, GoType: "*xpv1.Reference"},
+		{GoName: "OwnerSelector", JSONName: fieldOwnerSelector, GoType: "*xpv1.Selector"},
+		{GoName: "Region", JSONName: fieldRegion, Immutable: true, GoType: "*string"},
 	}
 	if len(fields) != len(want) {
 		t.Fatalf("got %d fields, want %d: %+v", len(fields), len(want), fields)

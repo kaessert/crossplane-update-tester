@@ -170,8 +170,9 @@ rolling counters). If a resource cannot converge for a structural reason, put a
 ### `validate` — offline coverage check
 
 `validate` needs no cluster. It scans a generated `types.go` for the
-`<Kind>Parameters` struct (skipping any other `*Parameters` structs in the
-file) and reports, per field, whether the manifest's annotation covers it:
+`<Kind>Parameters` struct (skipping every other struct declaration in the
+file, not only other `*Parameters` structs) and reports, per field, whether
+the manifest's annotation covers it:
 
 - `tested` / `skipped` — the field appears in the annotation.
 - `immutable` — the field carries a `self == oldSelf` validation marker, so it
@@ -185,6 +186,47 @@ file) and reports, per field, whether the manifest's annotation covers it:
 
 This is what stops an annotation from quietly falling behind the API type as
 fields are added.
+
+`validate` also checks a second, unrelated property, and fails the command
+for it independently of coverage: an annotation can report zero `MISSING`
+fields and `validate` can still exit non-zero. Coverage asks "does an
+annotation exist for this field?"; this second check asks "can the field's
+new value actually be read back afterwards?" — and answers no for a specific,
+detectable shape.
+
+An `expect:` or `value:` object (or list of objects) that names a top-level
+key absent from the field's generated `*Observation` struct is printed as
+
+```
+✗ customDataTypes: UNOBSERVABLE — key(s) customDataTypesRef ...
+```
+
+and the command exits non-zero. This fires when the entry's expectation is
+built around a `*Ref` / `*Selector` cross-resource reference — those fields
+are input-only by construction and the generator never mirrors them into
+`atProvider`, so no amount of polling will ever observe the value the test
+asserted. The test cannot pass by waiting longer; it cannot pass at all as
+written. When you see this, do not add a `skip:` entry — that only hides the
+gap. Instead, replace the reference key in the entry with an `expect:` that
+names the value actually resolved into `atProvider` (the field the reference
+points at, not the reference itself), so the check reads back a value the API
+genuinely returns.
+
+This check is deliberately conservative, so its silence is not a guarantee.
+It resolves `<ElemType>Observation` by name **in the same `--types-file`**
+that was passed on the command line, and says nothing for any of: a `skip:`
+entry, a dotted field path (e.g. `cookieParams.authHmac.primKeySecretRef`), a
+scalar expectation, a cross-package type this checker cannot inspect the
+shape of, or — the case most likely to surprise you — a nested type whose
+`Observation` companion lives in a **different** generated file than the one
+`--types-file` points at. That last case is not hypothetical: a
+`tcp-loadbalancer`'s `originPoolsWeights` field carries the same unobservable
+`poolRef` key that an `http-loadbalancer`'s `defaultRoutePools` field does,
+but only the latter is flagged, because `ViewsOriginPoolWithWeightObservation`
+is declared in `zz_http_loadbalancers_types.go` while the tcp-loadbalancer
+manifest's `--types-file` points at `zz_tcp_loadbalancers_types.go`. A clean
+`UNOBSERVABLE`-free run is not proof the entry is observable — only that this
+check, scoped to one file, could not prove otherwise.
 
 ### `check-external-name-prefix` — identity guard (opt-in)
 

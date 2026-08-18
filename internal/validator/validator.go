@@ -148,7 +148,7 @@ func (p *goTypesParser) tryEnterStruct(line string) {
 		p.prevLines = nil
 		return
 	}
-	// Different *Parameters struct — track depth so we can skip past it.
+	// Some other struct declaration — track depth so we can skip past it.
 	p.inOther = true
 	p.braceDepth = 1
 }

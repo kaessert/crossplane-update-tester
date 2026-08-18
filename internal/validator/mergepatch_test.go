@@ -58,6 +58,35 @@ func TestCheckMergePatchSiblings(t *testing.T) {
 			},
 			wantKeys: nil,
 		},
+		"ExpectNamingServerBackfilledSiblingNotFlagged": {
+			reason: "the real log-receiver tlsServer shape — the runner compares against status.atProvider, not this check's spec-derived merge simulation, so a correct expect: block legitimately records defaultSyslogTlsPort even though no create-time value or merge simulation could ever produce it; presence of the survivor key is enough, the check has no authority to also demand the exact backfilled value",
+			forProvider: map[string]interface{}{
+				"syslog": map[string]interface{}{
+					"endpoint": "syslog.example.com:6514",
+					"tlsServer": map[string]interface{}{
+						"serverName":   "syslog.example.com",
+						"trustedCaUrl": "string:///...",
+						"mtlsEnable":   map[string]interface{}{"certificate": "string:///..."},
+					},
+				},
+			},
+			tests: []manifest.UpdateTest{
+				{
+					Field: "syslog",
+					Value: map[string]interface{}{"endpoint": "syslog-updated.example.com:6514"},
+					Expect: map[string]interface{}{
+						"endpoint": "syslog-updated.example.com:6514",
+						"tlsServer": map[string]interface{}{
+							"serverName":           "syslog.example.com",
+							"trustedCaUrl":         "string:///...",
+							"mtlsEnable":           map[string]interface{}{"certificate": "string:///..."},
+							"defaultSyslogTlsPort": float64(6514),
+						},
+					},
+				},
+			},
+			wantKeys: nil,
+		},
 		"ExplicitNullClearingSiblingNotFlagged": {
 			reason: "authorRestrictions swaps its create-time allowList member out with an explicit null alongside the incoming denyList member — the a3650f74 remedy",
 			forProvider: map[string]interface{}{

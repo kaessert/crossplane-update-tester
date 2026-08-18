@@ -2,7 +2,6 @@ package validator
 
 import (
 	"fmt"
-	"reflect"
 	"sort"
 	"strings"
 
@@ -45,9 +44,14 @@ type MergePatchSiblingFinding struct {
 //   - a top-level key the patch DOES mention, whether to overwrite it or to
 //     clear it with an explicit null — either way the key is addressed, not
 //     left to survive unaddressed
-//   - a survivor key already named, with the correct merged value, in an
-//     "expect:" block — that is this check's own remedy for the
-//     non-union form of the trap, and the check must not fight it
+//   - a survivor key already named in an "expect:" block, whatever its
+//     value — that is this check's own remedy for the non-union form of
+//     the trap, and the check must not fight it. The runner compares
+//     against status.atProvider, not a spec-derived merge simulation, so a
+//     correct expect: block can legitimately record a server-back-filled
+//     value this check has no way to predict; a wrong-but-present value is
+//     an ordinary expectation mismatch the live run catches, not this
+//     check's job to adjudicate
 //
 // Everything needed to decide this is in the manifest itself — the
 // "crossplane.io/update-test" annotation and the same file's
@@ -76,14 +80,7 @@ func CheckMergePatchSiblings(m *manifest.Manifest) []MergePatchSiblingFinding {
 			continue
 		}
 
-		merged, ok := mergePatch(createObj, patch).(map[string]interface{})
-		if !ok {
-			// mergePatch(map, map) always returns a map; this branch is
-			// unreachable but guarded rather than asserted through.
-			continue
-		}
-
-		bad := survivingSiblingKeys(createObj, patch, merged, effectiveExpectation(t))
+		bad := survivingSiblingKeys(createObj, patch, effectiveExpectation(t))
 		if len(bad) == 0 {
 			continue
 		}
@@ -104,9 +101,14 @@ func effectiveExpectation(t manifest.UpdateTest) interface{} {
 
 // survivingSiblingKeys returns the sorted top-level keys of createObj that
 // the patch never mentions (neither to overwrite nor to null out) and that
-// the effective expectation does not separately account for with the
-// correct merged value.
-func survivingSiblingKeys(createObj, patch, merged map[string]interface{}, effective interface{}) []string {
+// the effective expectation does not separately name.
+//
+// Presence in the effective expectation is enough — the same standard
+// already applied to patch above. The check cannot predict a server
+// back-filled value (the runner compares against status.atProvider, not
+// this function's spec-derived merge simulation), so it has no authority to
+// adjudicate the value; it only confirms the key was accounted for at all.
+func survivingSiblingKeys(createObj, patch map[string]interface{}, effective interface{}) []string {
 	effObj, _ := effective.(map[string]interface{})
 
 	var bad []string
@@ -118,9 +120,10 @@ func survivingSiblingKeys(createObj, patch, merged map[string]interface{}, effec
 			continue
 		}
 		if effObj != nil {
-			if ev, ok := effObj[key]; ok && reflect.DeepEqual(ev, merged[key]) {
-				// The author already recorded the merged shape — the
-				// remedy this check exists to push toward.
+			if _, ok := effObj[key]; ok {
+				// The author already named this key in the effective
+				// expectation — the remedy this check exists to push
+				// toward. Its value is not this check's to adjudicate.
 				continue
 			}
 		}

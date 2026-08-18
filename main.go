@@ -414,11 +414,17 @@ func cmdValidate(args []string) error {
 	findings := validator.CheckObservability(opts.typesFile, fields, m.Tests)
 	validator.PrintObservability(findings)
 
+	siblingFindings := validator.CheckMergePatchSiblings(m)
+	validator.PrintMergePatchSiblings(siblingFindings)
+
 	if !result.AllGood {
 		return errors.New("mutable-field coverage is incomplete")
 	}
 	if len(findings) > 0 {
 		return errors.New("update-test expectation is structurally unobservable in atProvider")
+	}
+	if len(siblingFindings) > 0 {
+		return errors.New("update-test entry leaves a sibling key surviving an RFC 7386 merge patch unaddressed")
 	}
 	return nil
 }

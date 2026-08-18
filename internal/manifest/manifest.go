@@ -65,6 +65,15 @@ type Manifest struct {
 	// vulnerable field here makes the runner check it after every patch in
 	// the run and fail the run the moment it moves — see runner.Runner.RunTests.
 	AssertUnchanged []string
+	// ForProvider is the manifest's own spec.forProvider, decoded as plain
+	// JSON-shaped data (map[string]interface{}, []interface{}, and scalars —
+	// gopkg.in/yaml.v3 already decodes mapping nodes as map[string]interface{}
+	// with string keys, so no further normalisation is needed). It is the
+	// create-time value the runner's first Patch() call merges against, and
+	// exists so an offline check can simulate that RFC 7386 merge without a
+	// live cluster — see validator.CheckMergePatchSiblings. Nil when the
+	// manifest has no spec.forProvider at all.
+	ForProvider map[string]interface{}
 }
 
 // manifestDoc is the intermediate YAML structure for parsing.
@@ -76,6 +85,9 @@ type manifestDoc struct {
 		Namespace   string            `yaml:"namespace"`
 		Annotations map[string]string `yaml:"annotations"`
 	} `yaml:"metadata"`
+	Spec struct {
+		ForProvider map[string]interface{} `yaml:"forProvider"`
+	} `yaml:"spec"`
 }
 
 // Parse reads a YAML manifest file and extracts metadata and update test
@@ -160,10 +172,11 @@ func manifestFromDoc(doc manifestDoc) (*Manifest, error) {
 	}
 
 	m := &Manifest{
-		APIVersion: doc.APIVersion,
-		Kind:       doc.Kind,
-		Name:       doc.Metadata.Name,
-		Namespace:  doc.Metadata.Namespace,
+		APIVersion:  doc.APIVersion,
+		Kind:        doc.Kind,
+		Name:        doc.Metadata.Name,
+		Namespace:   doc.Metadata.Namespace,
+		ForProvider: doc.Spec.ForProvider,
 	}
 
 	m.ExpectExternalNamePrefix = doc.Metadata.Annotations[ExpectExternalNamePrefixKey]

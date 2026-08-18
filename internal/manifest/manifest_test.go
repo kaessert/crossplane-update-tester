@@ -452,3 +452,105 @@ func stringSlicesEqual(a, b []string) bool {
 	}
 	return true
 }
+
+// TestParseBytesForProvider verifies that spec.forProvider is decoded onto
+// Manifest.ForProvider as plain map[string]interface{}/[]interface{} data —
+// the shape validator.CheckMergePatchSiblings needs to simulate an RFC 7386
+// merge without a live cluster.
+func TestParseBytesForProvider(t *testing.T) {
+	cases := map[string]struct {
+		reason   string
+		yaml     string
+		wantKeys []string // top-level keys expected in m.ForProvider, nil means m.ForProvider must be nil
+	}{
+		"NestedObjectAndScalar": {
+			reason: "a nested object field and a scalar field both decode as plain map data with string keys",
+			yaml: `apiVersion: network.example.crossplane.io/v1alpha1
+kind: Network
+metadata:
+  name: example-network
+spec:
+  forProvider:
+    interval: 15
+    httpHealthCheck:
+      path: /healthz
+      useOriginServerName: {}
+`,
+			wantKeys: []string{"interval", "httpHealthCheck"},
+		},
+		"NoSpec": {
+			reason: "a manifest with no spec at all (e.g. a companion Secret document) decodes to a nil ForProvider, not an error",
+			yaml: `apiVersion: v1
+kind: Secret
+metadata:
+  name: example-network-credentials
+`,
+			wantKeys: nil,
+		},
+		"SpecWithoutForProvider": {
+			reason: "a spec that never mentions forProvider also decodes to a nil ForProvider",
+			yaml: `apiVersion: network.example.crossplane.io/v1alpha1
+kind: Network
+metadata:
+  name: example-network
+spec:
+  providerConfigRef:
+    name: default
+`,
+			wantKeys: nil,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			m, err := ParseBytes([]byte(tc.yaml))
+			if err != nil {
+				t.Fatalf("%s: ParseBytes() error = %v", tc.reason, err)
+			}
+			if tc.wantKeys == nil {
+				if m.ForProvider != nil {
+					t.Errorf("%s: ForProvider = %#v, want nil", tc.reason, m.ForProvider)
+				}
+				return
+			}
+			for _, k := range tc.wantKeys {
+				if _, ok := m.ForProvider[k]; !ok {
+					t.Errorf("%s: ForProvider missing key %q: %#v", tc.reason, k, m.ForProvider)
+				}
+			}
+		})
+	}
+}
+
+// TestParseBytesForProviderMultiDocumentSelectsAnnotatedDoc verifies that
+// ForProvider, like every other field, comes from the SELECTED document (the
+// one carrying the update-test annotation) rather than a leading companion
+// document — a companion Secret has no spec.forProvider at all, so picking
+// the wrong document would silently report a nil ForProvider for a manifest
+// that actually declares one.
+func TestParseBytesForProviderMultiDocumentSelectsAnnotatedDoc(t *testing.T) {
+	yaml := `apiVersion: v1
+kind: Secret
+metadata:
+  name: example-network-credentials
+---
+apiVersion: network.example.crossplane.io/v1alpha1
+kind: Network
+metadata:
+  name: example-network
+  annotations:
+    crossplane.io/update-test: |
+      - field: comment
+        value: "Updated by update-tester"
+spec:
+  forProvider:
+    comment: "original"
+`
+	m, err := ParseBytes([]byte(yaml))
+	if err != nil {
+		t.Fatalf("ParseBytes() error = %v", err)
+	}
+	if got, want := m.ForProvider["comment"], "original"; got != want {
+		t.Errorf("ForProvider[comment] = %v, want %v", got, want)
+	}
+}

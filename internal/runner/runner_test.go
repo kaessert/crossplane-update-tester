@@ -465,12 +465,30 @@ func mergeInto(dst, patch map[string]interface{}) {
 	}
 }
 
+// testEvidenceWindow is the evidenceWindow every test in this file gets via
+// newFakeRunner: long enough that evidenceOutcome's retry loop can run
+// through more than one iteration, short enough that the suite's many
+// genuinely-never-evidenced regression tests (e.g.
+// TestRunTestsWithoutRestartWiringStillDetectsGenuineNonEvidence, which
+// exercises it once per field across dozens of fields) do not each spend
+// evidenceRetryWindow's real 10 seconds finding that out. A test proving
+// the retry mechanism itself overrides this with its own value — see
+// TestEvidenceOutcomeRetriesUntilEventVisible and
+// TestEvidenceOutcomeReportsNotEvidencedWhenNeverGrows.
+const testEvidenceWindow = 5 * time.Millisecond
+
 func newFakeRunner(f *fakeCluster) *Runner {
 	return &Runner{
 		resourceName: testResourceIdentifier,
 		timeout:      "5s",
 		execFunc:     f.exec,
 		restartFunc:  f.restart,
+		// sleepFunc/evidenceWindow: keep evidenceOutcome's post-patch
+		// retry (see evidenceRetryWindow) fast under test rather than
+		// spending real wall-clock time on every NotEvidenced case this
+		// file exercises.
+		sleepFunc:      func(time.Duration) {},
+		evidenceWindow: testEvidenceWindow,
 	}
 }
 
@@ -968,6 +986,99 @@ func TestRunFieldTestZeroCountEventStillEvidencesUpdate(t *testing.T) {
 	}
 	if result.NotEvidenced {
 		t.Errorf("expected NotEvidenced=false, got %+v", result)
+	}
+}
+
+// evidenceEventsSource is a minimal fake for the "get events" kubectl call,
+// used only by the evidenceOutcome-level tests below. Unlike fakeCluster
+// (which models a whole live resource and increments its event count
+// synchronously from handlePatch), this models the aggregated event count
+// exactly as the reconciler's asynchronous EventRecorder does: the caller
+// controls independently of any patch when a LIST call starts observing the
+// grown count, so the retry loop's own behaviour — not the surrounding
+// patch/reconcile machinery — is what's under test.
+type evidenceEventsSource struct {
+	// visibleFromCall is the 1-indexed handleGetEvents call number from
+	// which the grown count first becomes visible. 0 means never.
+	visibleFromCall int
+	calls           int
+}
+
+func (s *evidenceEventsSource) exec(args []string) (string, error) {
+	if len(args) < 2 || args[0] != kubectlGetSubcommand || args[1] != "events" {
+		return "", fmt.Errorf("evidenceEventsSource: unexpected exec call: %v", args)
+	}
+	s.calls++
+	list := eventList{}
+	if s.visibleFromCall > 0 && s.calls >= s.visibleFromCall {
+		// A zero-value InvolvedObject matches the zero-value
+		// kind/name/namespace/apiVersion both tests below pass into
+		// evidenceOutcome.
+		list.Items = append(list.Items, eventItem{Reason: eventReasonUpdated, Count: 1})
+	}
+	b, err := json.Marshal(list)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// TestEvidenceOutcomeRetriesUntilEventVisible is the fix's acceptance case:
+// evidenceOutcome must not conclude NOT-EVIDENCED off a single synchronous
+// recount when the update event genuinely exists but has not yet been
+// indexed by a LIST call — it must keep re-listing within its retry window
+// and report evidenced as soon as the count grows, proving the retry
+// actually closes the race rather than a fixed sleep merely delaying the
+// same single check.
+func TestEvidenceOutcomeRetriesUntilEventVisible(t *testing.T) {
+	const visibleFromCall = 4 // absent on the first 3 recounts, present from the 4th
+	src := &evidenceEventsSource{visibleFromCall: visibleFromCall}
+	r := &Runner{
+		execFunc:       src.exec,
+		sleepFunc:      func(time.Duration) {},
+		evidenceWindow: time.Second,
+	}
+
+	checked, evidenced, err := r.evidenceOutcome("", "", "", "", 0, nil)
+	if err != nil {
+		t.Fatalf("evidenceOutcome() error = %v", err)
+	}
+	if !checked {
+		t.Fatal("checked = false, want true")
+	}
+	if !evidenced {
+		t.Fatalf("evidenced = false, want true — the count grows on recount %d, well inside the retry window", visibleFromCall)
+	}
+	if src.calls < visibleFromCall {
+		t.Errorf("evidenceOutcome recounted only %d time(s) before reporting evidenced, want at least %d — it must genuinely retry, not report evidenced without having observed the growth",
+			src.calls, visibleFromCall)
+	}
+}
+
+// TestEvidenceOutcomeReportsNotEvidencedWhenNeverGrows is the retry's
+// ceiling case: a count that never grows within the retry window must still
+// report NOT-EVIDENCED, proving the retry does not mask a genuine missing
+// Update() by retrying forever or by treating "still absent" as success.
+func TestEvidenceOutcomeReportsNotEvidencedWhenNeverGrows(t *testing.T) {
+	src := &evidenceEventsSource{} // visibleFromCall left 0: never visible
+	r := &Runner{
+		execFunc:       src.exec,
+		sleepFunc:      func(time.Duration) {},
+		evidenceWindow: testEvidenceWindow,
+	}
+
+	checked, evidenced, err := r.evidenceOutcome("", "", "", "", 0, nil)
+	if err != nil {
+		t.Fatalf("evidenceOutcome() error = %v", err)
+	}
+	if !checked {
+		t.Fatal("checked = false, want true")
+	}
+	if evidenced {
+		t.Fatal("evidenced = true, want false — the count never grows, so this must not mask a genuine missing Update()")
+	}
+	if src.calls < 2 {
+		t.Errorf("evidenceOutcome recounted only %d time(s), want a genuine retry (>1) before giving up within the window", src.calls)
 	}
 }
 

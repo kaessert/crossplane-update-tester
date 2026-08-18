@@ -49,11 +49,21 @@ type Runner struct {
 	restartFunc func() error
 
 	// sleepFunc, when set, overrides the wait between iterations of a
-	// bounded poll loop (waitReady, waitGenerationSettled). Tests inject a
-	// no-op or near-instant stand-in so every poll iteration's logic — not
-	// just its first pass — runs without spending real wall-clock time;
-	// production code leaves it nil and sleep() calls time.Sleep for real.
+	// bounded poll loop (waitReady, waitGenerationSettled, evidenceOutcome's
+	// retry). Tests inject a no-op or near-instant stand-in so every poll
+	// iteration's logic — not just its first pass — runs without spending
+	// real wall-clock time; production code leaves it nil and sleep() calls
+	// time.Sleep for real.
 	sleepFunc func(time.Duration)
+
+	// evidenceWindow, when set (> 0), overrides evidenceRetryWindow — the
+	// bounded window evidenceOutcome retries the post-patch event recount
+	// before concluding an update was never evidenced. Tests set a small
+	// value here so both the eventually-evidenced and the
+	// genuinely-never-evidenced cases resolve near-instantly instead of
+	// each spending evidenceRetryWindow's real 10 seconds; production code
+	// leaves it zero and evidenceOutcome falls back to evidenceRetryWindow.
+	evidenceWindow time.Duration
 }
 
 // sleep waits d, calling sleepFunc instead of time.Sleep when a test has
@@ -1103,23 +1113,61 @@ func (r *Runner) applyEvidenceCheck(result *TestResult, kind, name, namespace, a
 	}
 }
 
+// evidenceRetryWindow bounds how long evidenceOutcome retries the
+// post-patch event recount before concluding an update was never
+// evidenced. The status write WaitReady confirms is synchronous, but the
+// matching Event object's visibility to a LIST call is not: the event
+// recorder queues and the API server indexes it separately, so there is no
+// guarantee the event already exists the instant WaitReady returns. A
+// single synchronous recount loses that race often enough to report
+// NOT-EVIDENCED on a value that updated correctly. The window stays well
+// under the per-field --timeout budget (120s default), so a genuinely
+// missing update still fails within a small fraction of it.
+const evidenceRetryWindow = 10 * time.Second
+
+// evidenceRetryInterval is how often evidenceOutcome re-lists events while
+// inside evidenceRetryWindow.
+const evidenceRetryInterval = 2 * time.Second
+
 // evidenceOutcome counts update-related events for (kind, name, namespace,
 // apiVersion) and reports whether the aggregated count grew relative to
 // eventsBefore — proof that Update() executed, independent of wall-clock
 // convergence timing. checked is false when the count could not be
-// established (the pre-patch baseline errored, or the post-patch recount
+// established (the pre-patch baseline errored, or a post-patch recount
 // errored); in that case evidenced is meaningless and err explains what
 // went wrong, but the caller should not treat the absence of a count as
 // absence of an update.
+//
+// The post-patch count is retried for up to evidenceRetryWindow rather than
+// read once: the event that proves Update() ran may not yet be visible to a
+// LIST call the instant this is first called (see evidenceRetryWindow). The
+// retry stops the moment the count grows, so an event that is already
+// visible resolves exactly as fast as before this window existed — the
+// window only ever delays a call that would otherwise have reported a false
+// NOT-EVIDENCED.
 func (r *Runner) evidenceOutcome(kind, name, namespace, apiVersion string, eventsBefore int, eventsBeforeErr error) (checked, evidenced bool, err error) {
 	if eventsBeforeErr != nil {
 		return false, false, fmt.Errorf("counting update events before patch: %w", eventsBeforeErr)
 	}
-	eventsAfter, afterErr := r.countUpdateEvents(kind, name, namespace, apiVersion)
-	if afterErr != nil {
-		return false, false, fmt.Errorf("counting update events after patch: %w", afterErr)
+
+	window := r.evidenceWindow
+	if window <= 0 {
+		window = evidenceRetryWindow
 	}
-	return true, eventsAfter > eventsBefore, nil
+	deadline := time.Now().Add(window)
+	for {
+		eventsAfter, afterErr := r.countUpdateEvents(kind, name, namespace, apiVersion)
+		if afterErr != nil {
+			return false, false, fmt.Errorf("counting update events after patch: %w", afterErr)
+		}
+		if eventsAfter > eventsBefore {
+			return true, true, nil
+		}
+		if time.Now().After(deadline) {
+			return true, false, nil
+		}
+		r.sleep(evidenceRetryInterval)
+	}
 }
 
 // pollField polls status.atProvider for the given field until it matches

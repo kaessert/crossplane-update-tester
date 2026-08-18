@@ -133,37 +133,6 @@ func survivingSiblingKeys(createObj, patch map[string]interface{}, effective int
 	return bad
 }
 
-// mergePatch simulates an RFC 7386 JSON merge patch — exactly what
-// `kubectl patch --type=merge` sends to the API and what a merge-patch
-// server applies on receipt (see runner.buildMergePatch, which builds the
-// same shape of patch this function consumes). It recurses into nested
-// objects; a key present in patch with an explicit null value is DELETED
-// from the result rather than merged further. A non-object patch (a scalar
-// or a list) replaces target wholesale, per RFC 7386 §1.
-func mergePatch(target, patch interface{}) interface{} {
-	patchObj, ok := patch.(map[string]interface{})
-	if !ok {
-		return patch
-	}
-	targetObj, ok := target.(map[string]interface{})
-	if !ok {
-		targetObj = map[string]interface{}{}
-	}
-
-	out := make(map[string]interface{}, len(targetObj)+len(patchObj))
-	for k, v := range targetObj {
-		out[k] = v
-	}
-	for k, v := range patchObj {
-		if v == nil {
-			delete(out, k)
-			continue
-		}
-		out[k] = mergePatch(out[k], v)
-	}
-	return out
-}
-
 // navigateForProvider walks forProvider along a dot-separated field path and
 // returns the value found there. This mirrors the dotted-path convention the
 // update-test annotation and the runner's own navigateSpecForProvider use

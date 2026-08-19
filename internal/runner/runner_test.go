@@ -113,6 +113,19 @@ type fakeCluster struct {
 	// returned.
 	resourceLines string
 
+	// logLines, when non-empty, is what `kubectl logs -l <selector>` returns
+	// for the convergence window — the controller-log loop instrument's raw
+	// input (see countUpdateLogCalls). Left empty, a single benign reconcile
+	// line is returned: a LIVE controller that made no Update() call, which
+	// is what every test not exercising the instrument means by "quiet".
+	// Distinguishing that from the empty string matters, because an empty
+	// window is reported as "the instrument observed nothing", not as zero
+	// Update() calls.
+	logLines string
+	// logErr, when non-nil, makes `kubectl logs` fail — the instrument is
+	// unavailable rather than quiet.
+	logErr error
+
 	// providerPods holds the pkg.crossplane.io/revision label value of each
 	// provider controller Pod the fake cluster is running, in the order
 	// `kubectl get pods` would list them. Left empty, a single Pod for
@@ -244,6 +257,8 @@ func (f *fakeCluster) exec(args []string) (string, error) {
 	case "rollout":
 		f.rolloutCalls++
 		return "", nil
+	case "logs":
+		return f.handleLogs()
 	default:
 		return "", fmt.Errorf("fakeCluster: unhandled kubectl subcommand %q", args[0])
 	}
@@ -291,6 +306,22 @@ func (f *fakeCluster) handleGetResourceName() (string, error) {
 		return f.resourceLines, nil
 	}
 	return testResourceIdentifier + "\n", nil
+}
+
+// handleLogs backs `kubectl logs -n crossplane-system -l <selector>
+// --tail=-1 --since=Ns`, the controller-log loop instrument's only cluster
+// call. The default is one benign reconcile line — a controller that is
+// demonstrably alive and logging, and that made no Update() call in the
+// window — because "alive and quiet" and "not logging at all" are different
+// verdicts and every test that does not set logLines means the former.
+func (f *fakeCluster) handleLogs() (string, error) {
+	if f.logErr != nil {
+		return "", f.logErr
+	}
+	if f.logLines != "" {
+		return f.logLines, nil
+	}
+	return testReconcileLogLine + "\n", nil
 }
 
 // handleGetPods backs `kubectl get pods -l pkg.crossplane.io/revision -o

@@ -17,6 +17,37 @@ const (
 	eventReasonCannotUpdate = "CannotUpdateExternalResource"
 )
 
+// Log messages emitted by the crossplane-runtime managed reconciler on every
+// external.Update() call, from the SAME call site as the event reasons above:
+//
+//	log.Debug("Successfully requested update of external resource", ...)
+//	record.Event(managed, event.Normal(reasonUpdated, "Successfully requested..."))
+//
+// Two channels carrying one fact, with opposite failure modes — which is why
+// this check reads both rather than picking one.
+//
+// The event channel is aggregated and rate-limited by client-go. A resource
+// updating on every poll tick has its aggregated .count frozen for minutes at
+// a time and then flushed in a single jump: measured against a live 10s-poll
+// provider, one count sat unchanged across ~13 Update() calls spanning 135s
+// before jumping by 15 at once. A convergence window of PollInterval*1.5
+// landing inside such a gap observes a delta of zero and reports a resource
+// that has never stopped calling Update() as stable. Measured over six
+// windows on that provider, the event delta detected the loop in none of
+// them.
+//
+// The log channel is neither aggregated nor rate-limited — one line per call,
+// always — and detected the same loop in every window, with no false positive
+// on either a healthy resource or the healthy sibling scope of the looping
+// one. Its own failure mode is that the reconciler logs this at DEBUG, so a
+// provider started without --debug emits nothing; countUpdateLogLinesIn
+// reports the instrument's liveness separately so that silence is never read
+// as "zero Update() calls".
+const (
+	logMsgUpdated      = "Successfully requested update of external resource"
+	logMsgCannotUpdate = "Cannot update external resource"
+)
+
 // EventReasonCreated is the event reason emitted by the crossplane-runtime
 // managed reconciler on every external.Create() call. Counting occurrences
 // of this reason across a resource's entire lifecycle is the signal that
@@ -145,12 +176,19 @@ func (r *Runner) RunConverge(m *manifest.Manifest, opts ConvergeOptions) (*Conve
 		return nil, err
 	}
 
+	// Read the controller's own log for the window just waited out. A failure
+	// here is carried into the verdict rather than returned: an unreadable log
+	// costs this check its most reliable instrument, which the operator must
+	// be told about, but it is not itself evidence about the resource.
+	logCalls, logLines, logErr := r.countUpdateLogCalls(m, waitDur)
+	logObs := updateLogObservation{Calls: logCalls, Lines: logLines, Err: logErr, Window: waitDur}
+
 	diff, err := differ.DiffSnapshotsExcluding(before, after, opts.IgnoreFields)
 	if err != nil {
 		return nil, fmt.Errorf("diff: %w", err)
 	}
 
-	return buildConvergeResult(diff, gen, afterGen, beforeEvents, afterEvents, afterReady, notes), nil
+	return buildConvergeResult(diff, gen, afterGen, beforeEvents, afterEvents, afterReady, logObs, notes), nil
 }
 
 // recordConvergeBaseline snapshots atProvider and the update-event count
@@ -193,17 +231,19 @@ func (r *Runner) recordConvergeOutcome(m *manifest.Manifest) (snapshot []byte, e
 }
 
 // buildConvergeResult evaluates the pre/post snapshots, event counts,
-// generations, and final readiness, and assembles the final ConvergeResult.
+// controller-log observation, generations, and final readiness, and assembles
+// the final ConvergeResult.
 // notes are informational diagnostics (e.g. the baseline readiness-timeout
 // note) that are always surfaced, whether or not they change the verdict —
 // they must never be lost behind a field-level diagnostic, and must never
 // silently replace one either.
-func buildConvergeResult(diff []differ.FieldChange, gen, afterGen int64, beforeEvents, afterEvents int, afterReady bool, notes []string) *ConvergeResult {
+func buildConvergeResult(diff []differ.FieldChange, gen, afterGen int64, beforeEvents, afterEvents int, afterReady bool, logObs updateLogObservation, notes []string) *ConvergeResult {
 	var problems []string
 	passed := true
-	// loopSignal is true only for the two failure modes that are actually
+	// loopSignal is true only for the failure modes that are actually
 	// evidence of the controller repeatedly writing something: the
-	// atProvider snapshot moved, or a new update event fired. A readiness
+	// atProvider snapshot moved, a new update event fired, or the
+	// controller's own log records Update() calls it made. A readiness
 	// flap or a bare generation change are signs the resource has not
 	// settled, not signs of a loop, so they must never earn the headline
 	// on their own.
@@ -219,6 +259,33 @@ func buildConvergeResult(diff []differ.FieldChange, gen, afterGen int64, beforeE
 		loopSignal = true
 		problems = append(problems, fmt.Sprintf("%d new update event(s) observed (%s/%s)",
 			afterEvents-beforeEvents, eventReasonUpdated, eventReasonCannotUpdate))
+	}
+	// The controller-log instrument. It is read in addition to the event
+	// delta above, never instead of it: the two channels fail in opposite
+	// directions (see logMsgUpdated), and OR-ing them can only ever add a
+	// signal, never suppress one. Neither is redundant — the event delta is
+	// the only instrument left when a provider runs without --debug, and the
+	// log is the only one that survives client-go's rate limiter.
+	switch {
+	case logObs.Err != nil:
+		notes = append(notes, fmt.Sprintf(
+			"controller-log instrument unavailable (%v); loop detection fell back to the update-event delta alone, which client-go rate-limits and which under-reports a resource looping at poll cadence",
+			logObs.Err))
+	case logObs.Window > 0 && logObs.Lines == 0:
+		// Told apart from "zero Update() calls" deliberately: the reconciler
+		// writes these lines at DEBUG, so an empty window means the
+		// instrument saw nothing at all rather than seeing a quiet
+		// controller. Reporting that as a clean pass is the exact silence
+		// this check was added to end.
+		notes = append(notes, fmt.Sprintf(
+			"controller log returned no lines over the %s window — the log instrument observed nothing rather than observing zero Update() calls; check the provider is running with --debug",
+			logObs.Window))
+	case logObs.Calls > 0:
+		passed = false
+		loopSignal = true
+		problems = append(problems, fmt.Sprintf(
+			"%d Update() call(s) in the controller log over %s",
+			logObs.Calls, logObs.Window))
 	}
 	if afterGen != gen {
 		passed = false
@@ -240,9 +307,10 @@ func buildConvergeResult(diff []differ.FieldChange, gen, afterGen int64, beforeE
 	case passed:
 		result.Message = fmt.Sprintf("resource stable (1 cycle observed, %d updates)", afterEvents-beforeEvents)
 	case loopSignal:
-		// A genuine atProvider drift or update-event delta: this is what
-		// operators and past tickets search for, so the string stays
-		// verbatim regardless of what else also failed alongside it.
+		// A genuine atProvider drift, update-event delta, or Update() call
+		// recorded in the controller's own log: this is what operators and
+		// past tickets search for, so the string stays verbatim regardless
+		// of what else also failed alongside it.
 		result.Message = "RECONCILIATION LOOP DETECTED"
 	default:
 		// The only problems are a readiness flap and/or an unsettled
@@ -337,6 +405,122 @@ func (r *Runner) countUpdateEvents(kind, name, namespace, apiVersion string) (in
 // (rather than a stored ref) without duplicating — see RunResolveRecover.
 func (r *Runner) countCreateEvents(kind, name, namespace, apiVersion string) (int, error) {
 	return r.countEventsByReason(kind, name, namespace, apiVersion, EventReasonCreated)
+}
+
+// updateLogObservation is what the controller-log instrument saw across one
+// convergence window. Calls is the number of Update() calls attributed to the
+// resource under test; Lines is every line the window returned, whatever it
+// said, and exists so that "saw nothing" can be told apart from "saw zero
+// Update() calls"; Err records that the instrument could not be read at all.
+// A zero Window means the observation was never taken.
+type updateLogObservation struct {
+	Calls  int
+	Lines  int
+	Err    error
+	Window time.Duration
+}
+
+// reconcileRequest is the controller-runtime reconcile.Request embedded in
+// every structured log line the managed reconciler writes.
+type reconcileRequest struct {
+	Name      string `json:"name"`
+	Namespace string `json:"namespace"`
+}
+
+// updateLogWindowSlack widens the log query past the convergence window,
+// because kubectl's --since takes whole seconds and a line written a fraction
+// before the window opened would otherwise be lost to rounding. Over-reading
+// is safe in the direction that matters: this check fails on a non-zero count,
+// so a slightly wide window can only make a genuine loop easier to see, never
+// manufacture one on a resource that made no calls at all.
+const updateLogWindowSlack = time.Second
+
+// countUpdateLogCalls reads the provider controller's own log across the
+// convergence window and reports how many Update() calls it made for this
+// resource — the loop signal that the event delta rate-limits away (see
+// logMsgUpdated).
+func (r *Runner) countUpdateLogCalls(m *manifest.Manifest, window time.Duration) (calls, lines int, err error) {
+	since := int((window + updateLogWindowSlack).Seconds())
+	if since < 1 {
+		since = 1
+	}
+	out, err := r.runRaw("logs",
+		"-n", providerDeploymentNamespace,
+		"-l", providerDeploymentSelector,
+		// --tail=-1 is NOT redundant. kubectl defaults --tail to 10
+		// whenever a SELECTOR is used, and to -1 only for a single named
+		// pod — so the obvious `logs -l ... --since=Ns` returns the last
+		// ten lines of the controller's output rather than the window,
+		// silently and with a zero exit. Measured against a live looping
+		// resource, that default alone turned detection in every window
+		// into detection in two windows out of three, because the ten most
+		// recent lines are mostly other resources' reconcile chatter.
+		"--tail=-1",
+		fmt.Sprintf("--since=%ds", since))
+	if err != nil {
+		return 0, 0, fmt.Errorf("reading controller log: %w", err)
+	}
+	calls, lines = countUpdateLogLinesIn(out, m.Name, m.Namespace)
+	return calls, lines, nil
+}
+
+// countUpdateLogLinesIn attributes controller log lines to one resource.
+//
+// A line counts as an Update() call when it carries one of the reconciler's
+// Update() messages AND its structured payload's reconcile request names
+// exactly this resource. Attribution is by parsed request rather than by
+// substring: the unified example-manifest convention every dual-scope
+// provider follows lets a resource's cluster-scoped and namespaced variants
+// share a Kind and a Name, differing only in whether the request carries a
+// namespace — so a substring match on the name would credit the namespaced
+// sibling's loop to the cluster-scoped resource, the same cross-scope
+// confusion sumEventOccurrencesByReason exists to prevent on the event side.
+// A cluster-scoped resource's namespace is the empty string and matches only
+// a request carrying no namespace at all.
+//
+// lines counts every line the window returned, whatever it said. It is the
+// instrument's liveness proxy: the reconciler writes these at DEBUG, so a
+// provider started without --debug returns nothing, and zero calls out of
+// zero lines means "could not see" rather than "did not happen".
+func countUpdateLogLinesIn(out, name, namespace string) (calls, lines int) {
+	for _, line := range strings.Split(out, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		lines++
+		if !strings.Contains(line, logMsgUpdated) && !strings.Contains(line, logMsgCannotUpdate) {
+			continue
+		}
+		req, ok := reconcileRequestOf(line)
+		if !ok {
+			continue
+		}
+		if req.Name == name && req.Namespace == namespace {
+			calls++
+		}
+	}
+	return calls, lines
+}
+
+// reconcileRequestOf decodes the reconcile request out of a structured log
+// line, whose JSON payload begins at the line's first '{'. A line that
+// carries no payload, or one that does not name a request, is reported as
+// unattributable rather than guessed at.
+func reconcileRequestOf(line string) (reconcileRequest, bool) {
+	i := strings.IndexByte(line, '{')
+	if i < 0 {
+		return reconcileRequest{}, false
+	}
+	var payload struct {
+		Request reconcileRequest `json:"request"`
+	}
+	if err := json.Unmarshal([]byte(line[i:]), &payload); err != nil {
+		return reconcileRequest{}, false
+	}
+	if payload.Request.Name == "" {
+		return reconcileRequest{}, false
+	}
+	return payload.Request, true
 }
 
 // countEventsByReason lists cluster events and sums the aggregated

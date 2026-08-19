@@ -16,6 +16,7 @@
 #   get pods -n crossplane-system -l pkg.crossplane.io/revision -o jsonpath={range ...}
 #   rollout restart deploy/<name> -n crossplane-system
 #   rollout status  deploy/<name> -n crossplane-system --timeout=<d>
+#   logs -n crossplane-system -l pkg.crossplane.io/revision --tail=-1 --since=<n>s
 #
 # Anything else is a hard error: an unhandled argv means the tool changed the
 # contract this fake encodes, and silently returning success there would let a
@@ -45,6 +46,14 @@
 #                                Update() repeatedly — the event-count half
 #                                of what `converge` catches, independent of
 #                                the atProvider-diff half "drift" exercises.
+#                            "logloop" — the same stuck reconciler as "loop",
+#                                but visible ONLY in the controller log:
+#                                `get events` never moves, exactly as
+#                                client-go's rate limiter behaves for a
+#                                resource updating on every poll tick. This
+#                                is the measured live failure the log
+#                                instrument exists for, and the one every
+#                                other instrument reports as stable.
 #   SMOKE_UPPERCASE_FIELDS   space-separated forProvider field names the
 #                            "backend" normalises to upper case when storing
 #                            them, so a manifest entry's `expect:` differing
@@ -500,6 +509,50 @@ cmd_wait() {
   printf '%s condition met\n' "$rd"
 }
 
+cmd_logs() {
+  # logs -n crossplane-system -l pkg.crossplane.io/revision --tail=-1 --since=<n>s
+  case "$*" in
+    *"-n crossplane-system"*) ;;
+    *) die "logs not scoped to crossplane-system: $*" ;;
+  esac
+  case "$*" in
+    *"-l pkg.crossplane.io/revision"*) ;;
+    *) die "logs not selecting the provider revision: $*" ;;
+  esac
+  # --tail=-1 is asserted, not merely tolerated. kubectl defaults --tail to 10
+  # whenever a selector is used, so a caller that omits it reads the last ten
+  # lines instead of the window and under-counts silently. That is a contract
+  # this fake exists to pin, not an implementation detail.
+  case "$*" in
+    *"--tail=-1"*) ;;
+    *) die "logs must pass --tail=-1 with a selector, or kubectl silently truncates to 10 lines: $*" ;;
+  esac
+
+  # One benign reconcile line per resource in state: a controller that is
+  # demonstrably alive and logging, having made no Update() call. "Alive and
+  # quiet" must be distinguishable from "not logging at all", which is what a
+  # provider running without --debug produces.
+  local dir name namespace req
+  for dir in "$STATE"/res/*/; do
+    [ -d "$dir" ] || continue
+    name=$(cat "$dir/name")
+    namespace=$(cat "$dir/namespace")
+    if [ -n "$namespace" ]; then
+      req="{\"name\":\"$(json_escape "$name")\",\"namespace\":\"$(json_escape "$namespace")\"}"
+    else
+      req="{\"name\":\"$(json_escape "$name")\"}"
+    fi
+    printf '2026-01-01T00:00:00Z\tDEBUG\tprovider-fake\tReconciling\t{"request": %s}\n' "$req"
+    # FAIL_MODE=logloop adds the Update() line the managed reconciler writes
+    # on every call, while `get events` stays frozen — the live signature of
+    # client-go's rate limiter holding an aggregated count still across a
+    # resource that is updating on every poll tick.
+    if [ "$FAIL_MODE" = "logloop" ]; then
+      printf '2026-01-01T00:00:00Z\tDEBUG\tprovider-fake\tSuccessfully requested update of external resource\t{"request": %s, "version": "1"}\n' "$req"
+    fi
+  done
+}
+
 cmd_rollout() {
   local action=$1 target=$2
   case "$target" in
@@ -532,6 +585,7 @@ main() {
     patch) cmd_patch "$@" ;;
     wait) cmd_wait "$@" ;;
     rollout) cmd_rollout "$@" ;;
+    logs) cmd_logs "$@" ;;
     *) die "unhandled subcommand: $verb $*" ;;
   esac
 }

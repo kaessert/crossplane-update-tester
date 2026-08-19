@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -40,6 +41,39 @@ const (
 	testAPIVersionClusterScoped = "example.crossplane.io/v1alpha1"
 	testAPIVersionNamespaced    = "example.m.crossplane.io/v1alpha1"
 )
+
+// testReconcileLogLine is a benign structured controller log line — the
+// reconciler announcing a reconcile, not an Update() call. It is the
+// fakeCluster's default `kubectl logs` output, standing for a controller
+// that is demonstrably alive and logging while making no backend writes.
+const testReconcileLogLine = `2026-01-01T00:00:00Z	DEBUG	provider-example	Reconciling	{"controller": "exampleresource.cluster", "request": {"name":"example-resource"}}`
+
+// newTestUpdateLogLine builds the controller log line the managed reconciler
+// writes on a successful Update(), for the given reconcile request. An empty
+// namespace produces the cluster-scoped shape, where the request carries no
+// namespace key at all — which is exactly how a cluster-scoped resource is
+// told apart from a namespaced sibling sharing its Kind and Name.
+func newTestUpdateLogLine(name, namespace string) string {
+	req := `{"name":"` + name + `"}`
+	if namespace != "" {
+		req = `{"name":"` + name + `","namespace":"` + namespace + `"}`
+	}
+	return "2026-01-01T00:00:00Z\tDEBUG\tprovider-example\t" + logMsgUpdated +
+		"\t{\"controller\": \"exampleresource\", \"request\": " + req + `, "version": "1"}`
+}
+
+// errTestLogUnavailable stands for any reason `kubectl logs` could not be
+// read — RBAC, a pod that has gone away, an API server hiccup.
+var errTestLogUnavailable = errors.New("logs forbidden")
+
+// quietLogObservation is a live-but-quiet controller-log observation: the
+// instrument ran, saw the controller logging, and attributed no Update()
+// call to the resource under test. It is what every buildConvergeResult test
+// that is not itself exercising the log instrument means by "the log said
+// nothing was wrong".
+func quietLogObservation() updateLogObservation {
+	return updateLogObservation{Lines: 1, Window: time.Second}
+}
 
 // newTestEventItem builds a CLUSTER-SCOPED eventItem for the given reason,
 // aggregated count, kind, and name — reducing repetition of the anonymous
@@ -354,7 +388,7 @@ func TestBuildConvergeResultReportsAggregatedUpdateDelta(t *testing.T) {
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			result := buildConvergeResult(nil, 1, 1, tc.beforeEvents, tc.afterEvents, true, nil)
+			result := buildConvergeResult(nil, 1, 1, tc.beforeEvents, tc.afterEvents, true, quietLogObservation(), nil)
 			if result.Passed != tc.wantPassed {
 				t.Errorf("Passed = %v, want %v (diagnostics: %v)", result.Passed, tc.wantPassed, result.Diagnostics)
 			}
@@ -369,7 +403,7 @@ func TestBuildConvergeResultReportsAggregatedUpdateDelta(t *testing.T) {
 func TestBuildConvergeResultFailsOnAtProviderDrift(t *testing.T) {
 	diff := []differ.FieldChange{{Field: "someCounter", OldValue: "1", NewValue: "2"}}
 
-	result := buildConvergeResult(diff, 1, 1, 0, 0, true, nil)
+	result := buildConvergeResult(diff, 1, 1, 0, 0, true, quietLogObservation(), nil)
 	if result.Passed {
 		t.Fatalf("expected Passed=false when atProvider drifted, got %+v", result)
 	}
@@ -384,7 +418,7 @@ func TestBuildConvergeResultFailsOnAtProviderDrift(t *testing.T) {
 // (zero diff, zero new events, unchanged generation) still fails the check
 // if it is not Ready at the final snapshot.
 func TestBuildConvergeResultReadinessFlapFailsIndependently(t *testing.T) {
-	result := buildConvergeResult(nil, 1, 1, 0, 0, false, nil)
+	result := buildConvergeResult(nil, 1, 1, 0, 0, false, quietLogObservation(), nil)
 	if result.Passed {
 		t.Fatalf("expected Passed=false on a readiness flap with no atProvider drift, got %+v", result)
 	}
@@ -457,7 +491,7 @@ func TestBuildConvergeResultHeadline(t *testing.T) {
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			result := buildConvergeResult(tc.diff, tc.gen, tc.afterGen, tc.beforeEvents, tc.afterEvents, tc.afterReady, nil)
+			result := buildConvergeResult(tc.diff, tc.gen, tc.afterGen, tc.beforeEvents, tc.afterEvents, tc.afterReady, quietLogObservation(), nil)
 			if result.Message != tc.wantMessage {
 				t.Errorf("Message = %q, want %q (diagnostics: %v)", result.Message, tc.wantMessage, result.Diagnostics)
 			}
@@ -474,7 +508,7 @@ func TestBuildConvergeResultReadinessTimeoutNoteNeverReplacesFieldDiagnostic(t *
 	diff := []differ.FieldChange{{Field: "someCounter", OldValue: "1", NewValue: "2"}}
 	notes := []string{"readiness pre-check: Ready condition did not reach True within 1s before the baseline snapshot; proceeding with field-level diagnostics"}
 
-	result := buildConvergeResult(diff, 1, 1, 0, 0, true, notes)
+	result := buildConvergeResult(diff, 1, 1, 0, 0, true, quietLogObservation(), notes)
 	if result.Passed {
 		t.Fatalf("expected Passed=false: the atProvider diff is a real reconciliation-loop signal, got %+v", result)
 	}
@@ -496,7 +530,7 @@ func TestBuildConvergeResultReadinessTimeoutNoteNeverReplacesFieldDiagnostic(t *
 func TestBuildConvergeResultReadinessTimeoutNoteSurvivesAPass(t *testing.T) {
 	notes := []string{"readiness pre-check: Ready condition did not reach True within 1s before the baseline snapshot; proceeding with field-level diagnostics"}
 
-	result := buildConvergeResult(nil, 1, 1, 0, 0, true, notes)
+	result := buildConvergeResult(nil, 1, 1, 0, 0, true, quietLogObservation(), notes)
 	if !result.Passed {
 		t.Fatalf("expected Passed=true: nothing actually drifted, got %+v", result)
 	}
@@ -735,5 +769,223 @@ func TestRunConvergeIgnoresSiblingScopeEvents(t *testing.T) {
 	}
 	if result.Message != "resource stable (1 cycle observed, 0 updates)" {
 		t.Errorf("Message = %q, want the stable-resource message with 0 updates — the sibling's 5 new events must not be counted", result.Message)
+	}
+}
+
+// TestCountUpdateLogLinesInAttributesByReconcileRequest pins the attribution
+// rule: an Update() log line belongs to the resource whose reconcile request
+// it names, matched on name AND namespace. The fixture is the case that
+// motivated parsing over substring matching — a cluster-scoped resource and a
+// namespaced sibling sharing one Kind and one Name, as the unified
+// example-manifest convention allows.
+func TestCountUpdateLogLinesInAttributesByReconcileRequest(t *testing.T) {
+	out := strings.Join([]string{
+		testReconcileLogLine,
+		newTestUpdateLogLine(testNameExample, ""),                   // cluster-scoped
+		newTestUpdateLogLine(testNameExample, testNamespaceExample), // namespaced sibling
+		newTestUpdateLogLine(testNameExample, testNamespaceExample),
+		newTestUpdateLogLine(testNameOtherInstance, ""), // a different resource
+	}, "\n")
+
+	tests := []struct {
+		name      string
+		resource  string
+		namespace string
+		wantCalls int
+	}{
+		{"cluster-scoped resource counts only its own namespace-less request", testNameExample, "", 1},
+		{"namespaced sibling counts only its own namespaced requests", testNameExample, testNamespaceExample, 2},
+		{"a namespace it does not live in counts nothing", testNameExample, testNamespaceOther, 0},
+		{"a resource that made no calls counts nothing", testNameOther, "", 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			calls, lines := countUpdateLogLinesIn(out, tc.resource, tc.namespace)
+			if calls != tc.wantCalls {
+				t.Errorf("calls = %d, want %d", calls, tc.wantCalls)
+			}
+			if lines != 5 {
+				t.Errorf("lines = %d, want 5 — every line counts toward liveness, whatever it says", lines)
+			}
+		})
+	}
+}
+
+// TestCountUpdateLogLinesInLivenessIsNotZeroCalls pins the distinction the
+// whole instrument rests on: no output at all means the instrument saw
+// nothing (a provider not running with --debug), which is a different fact
+// from a live controller that made zero Update() calls.
+func TestCountUpdateLogLinesInLivenessIsNotZeroCalls(t *testing.T) {
+	calls, lines := countUpdateLogLinesIn("", testNameExample, "")
+	if calls != 0 || lines != 0 {
+		t.Fatalf("empty output: calls, lines = %d, %d; want 0, 0", calls, lines)
+	}
+	calls, lines = countUpdateLogLinesIn(testReconcileLogLine, testNameExample, "")
+	if calls != 0 || lines != 1 {
+		t.Fatalf("live but quiet: calls, lines = %d, %d; want 0, 1", calls, lines)
+	}
+}
+
+// TestCountUpdateLogLinesInIgnoresUnattributableLines proves a line that
+// carries an Update() message but no usable reconcile request is dropped
+// rather than guessed at — it must not be credited to the resource under
+// test just because it is the resource being checked.
+func TestCountUpdateLogLinesInIgnoresUnattributableLines(t *testing.T) {
+	out := strings.Join([]string{
+		"plain text " + logMsgUpdated,                       // no JSON payload at all
+		logMsgUpdated + `\t{"controller": "x"}`,             // payload without a request
+		logMsgUpdated + `\t{"request": {"name":""}}`,        // request without a name
+		logMsgUpdated + `\t{"request": {"name": not-json}}`, // malformed payload
+	}, "\n")
+	calls, lines := countUpdateLogLinesIn(out, testNameExample, "")
+	if calls != 0 {
+		t.Errorf("calls = %d, want 0 — an unattributable line must not be credited to any resource", calls)
+	}
+	if lines != 4 {
+		t.Errorf("lines = %d, want 4", lines)
+	}
+}
+
+// TestBuildConvergeResultLogInstrumentCatchesWhatEventsMiss is the measured
+// case this instrument was added for: a resource calling Update() on every
+// poll tick, whose aggregated event count did not move because client-go's
+// rate limiter had not flushed inside the window. Live measurement on a
+// 10s-poll provider: the event delta detected this in none of six windows,
+// the log in all of them.
+func TestBuildConvergeResultLogInstrumentCatchesWhatEventsMiss(t *testing.T) {
+	logObs := updateLogObservation{Calls: 2, Lines: 40, Window: 15 * time.Second}
+	// No atProvider drift, no event delta, generation unchanged, Ready true:
+	// every pre-existing signal says stable.
+	result := buildConvergeResult(nil, 7, 7, 100, 100, true, logObs, nil)
+
+	if result.Passed {
+		t.Fatalf("expected Passed=false: 2 Update() calls in the log is a loop however quiet the event channel was, got %+v", result)
+	}
+	if result.Message != "RECONCILIATION LOOP DETECTED" {
+		t.Errorf("Message = %q, want the verbatim loop headline operators grep for", result.Message)
+	}
+	if !strings.Contains(strings.Join(result.Diagnostics, "\n"), "2 Update() call(s) in the controller log") {
+		t.Errorf("Diagnostics = %v, want the Update() call count named", result.Diagnostics)
+	}
+}
+
+// TestBuildConvergeResultLogInstrumentSilenceIsReported covers the two ways
+// the log instrument can fail to observe. Neither may be reported as a clean
+// pass without saying so: a silently blind instrument is the exact failure
+// this check exists to end.
+func TestBuildConvergeResultLogInstrumentSilenceIsReported(t *testing.T) {
+	tests := []struct {
+		name   string
+		logObs updateLogObservation
+		want   string
+	}{
+		{
+			name:   "unreadable log names the fallback and its weakness",
+			logObs: updateLogObservation{Err: errTestLogUnavailable, Window: 15 * time.Second},
+			want:   "controller-log instrument unavailable",
+		},
+		{
+			name:   "empty window is observed-nothing, not zero calls",
+			logObs: updateLogObservation{Lines: 0, Window: 15 * time.Second},
+			want:   "observed nothing rather than observing zero Update() calls",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := buildConvergeResult(nil, 1, 1, 0, 0, true, tc.logObs, nil)
+			if !result.Passed {
+				t.Errorf("Passed = false: an unobservable instrument is not itself evidence against the resource, got %+v", result)
+			}
+			if !strings.Contains(strings.Join(result.Diagnostics, "\n"), tc.want) {
+				t.Errorf("Diagnostics = %v, want one containing %q", result.Diagnostics, tc.want)
+			}
+		})
+	}
+}
+
+// TestRunConvergeDetectsLoopFromControllerLogAlone drives the whole check
+// end to end against a fake cluster whose resource is stable in every way
+// the old instruments could see, and which is calling Update() on every
+// tick. Before the log instrument this run reported "resource stable".
+func TestRunConvergeDetectsLoopFromControllerLogAlone(t *testing.T) {
+	m := &manifest.Manifest{
+		Kind:       testKindExample,
+		Name:       testNameExample,
+		APIVersion: testAPIVersionClusterScoped,
+	}
+	f := &fakeCluster{
+		generation:      3,
+		readyAfterCalls: 1,
+		atProvider:      map[string]interface{}{"zone": "a"},
+		kind:            testKindExample,
+		name:            testNameExample,
+		apiVersion:      testAPIVersionClusterScoped,
+		// The event channel never moves — the rate limiter has not flushed.
+		generations: []int32{0},
+		logLines: strings.Join([]string{
+			testReconcileLogLine,
+			newTestUpdateLogLine(testNameExample, ""),
+			newTestUpdateLogLine(testNameExample, ""),
+		}, "\n"),
+	}
+	r := newFakeRunner(f)
+	r.sleepFunc = func(time.Duration) {}
+
+	result, err := r.RunConverge(m, ConvergeOptions{
+		PollInterval:     time.Millisecond,
+		ReadinessTimeout: time.Second,
+		Timeout:          time.Second,
+	})
+	if err != nil {
+		t.Fatalf("RunConverge() error = %v", err)
+	}
+	if result.Passed {
+		t.Fatalf("expected Passed=false, got %+v", result)
+	}
+	if result.Message != "RECONCILIATION LOOP DETECTED" {
+		t.Errorf("Message = %q, want RECONCILIATION LOOP DETECTED", result.Message)
+	}
+}
+
+// TestRunConvergeIgnoresSiblingScopeLogLines is the log-side counterpart of
+// TestRunConvergeIgnoresSiblingScopeEvents: the namespaced variant is the
+// resource under test, its cluster-scoped sibling shares Kind and Name and is
+// genuinely looping, and that must not be attributed here.
+func TestRunConvergeIgnoresSiblingScopeLogLines(t *testing.T) {
+	m := &manifest.Manifest{
+		Kind:       testKindExample,
+		Name:       testNameExample,
+		Namespace:  testNamespaceExample,
+		APIVersion: testAPIVersionNamespaced,
+	}
+	f := &fakeCluster{
+		generation:      1,
+		readyAfterCalls: 1,
+		atProvider:      map[string]interface{}{"zone": "a"},
+		kind:            testKindExample,
+		name:            testNameExample,
+		namespace:       testNamespaceExample,
+		apiVersion:      testAPIVersionNamespaced,
+		generations:     []int32{0},
+		logLines: strings.Join([]string{
+			testReconcileLogLine,
+			// The CLUSTER-SCOPED sibling loops; the resource under test does not.
+			newTestUpdateLogLine(testNameExample, ""),
+			newTestUpdateLogLine(testNameExample, ""),
+		}, "\n"),
+	}
+	r := newFakeRunner(f)
+	r.sleepFunc = func(time.Duration) {}
+
+	result, err := r.RunConverge(m, ConvergeOptions{
+		PollInterval:     time.Millisecond,
+		ReadinessTimeout: time.Second,
+		Timeout:          time.Second,
+	})
+	if err != nil {
+		t.Fatalf("RunConverge() error = %v", err)
+	}
+	if !result.Passed {
+		t.Fatalf("expected Passed=true: the sibling scope's Update() calls must not be attributed to this resource, got %+v", result)
 	}
 }

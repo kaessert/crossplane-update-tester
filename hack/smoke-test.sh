@@ -664,6 +664,54 @@ else
   bad "expected the hook to stop after 'converge', got: $loop_banners"
 fi
 
+section "7e. failure injection: reconciliation loop visible ONLY in the controller log"
+
+# The measured live failure. A resource calling Update() on every poll tick
+# while status.atProvider holds still and client-go's rate limiter keeps the
+# aggregated event count frozen: every instrument converge had before this
+# scenario reports "resource stable". Measured on a 10s-poll provider, the
+# event delta caught this in none of six windows and the controller log in
+# all six.
+run_hook post-assert-network-v6.sh logloop logloop
+
+if [ "$RC" -ne 0 ]; then
+  ok "hook exited $RC (non-zero) when only the controller log showed Update() calls"
+else
+  bad "hook exited 0 — a loop the event channel rate-limits away must still fail the check"
+  dump "hook output" "$OUT"
+fi
+
+if grep -q 'RECONCILIATION LOOP DETECTED' "$OUT"; then
+  ok "reported: RECONCILIATION LOOP DETECTED"
+else
+  bad "expected 'RECONCILIATION LOOP DETECTED' in the output"
+  dump "hook output" "$OUT"
+fi
+
+# The counterpart of 7c's assertion, and the proof the verdict came from the
+# log rather than from an event delta that this scenario deliberately holds
+# at zero.
+if grep -qE '[1-9][0-9]* Update\(\) call\(s\) in the controller log' "$OUT"; then
+  ok "diagnostic names a non-zero Update() call count read from the controller log"
+else
+  bad "expected an 'N Update() call(s) in the controller log' diagnostic"
+  dump "hook output" "$OUT"
+fi
+
+if grep -qE '[1-9][0-9]* new update event\(s\) observed' "$OUT"; then
+  bad "the event delta moved — this scenario must isolate the LOG as the only signal"
+  dump "hook output" "$OUT"
+else
+  ok "the event delta stayed at zero: the log alone carried the verdict"
+fi
+
+logloop_banners="$(banners "$OUT" | cut -f1 | tr '\n' ',')"
+if [ "$logloop_banners" = "converge," ]; then
+  ok "aborted at step 1: the remaining 4 steps never ran"
+else
+  bad "expected the hook to stop after 'converge', got: $logloop_banners"
+fi
+
 section "7d. failure injection: assert-unchanged silent-wipe guard"
 
 run_hook post-assert-wipe.sh wipe-ok

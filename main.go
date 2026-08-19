@@ -417,6 +417,9 @@ func cmdValidate(args []string) error {
 	siblingFindings := validator.CheckMergePatchSiblings(m)
 	validator.PrintMergePatchSiblings(siblingFindings)
 
+	incompleteFindings := validator.CheckIncompleteExpectations(opts.typesFile, fields, m)
+	validator.PrintIncompleteExpectations(incompleteFindings)
+
 	if !result.AllGood {
 		return errors.New("mutable-field coverage is incomplete")
 	}
@@ -425,6 +428,9 @@ func cmdValidate(args []string) error {
 	}
 	if len(siblingFindings) > 0 {
 		return errors.New("update-test entry leaves a sibling key surviving an RFC 7386 merge patch unaddressed")
+	}
+	if len(incompleteFindings) > 0 {
+		return errors.New("update-test expectation omits a non-omitempty Observation struct member")
 	}
 	return nil
 }

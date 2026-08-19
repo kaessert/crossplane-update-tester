@@ -23,6 +23,14 @@ type FieldInfo struct {
 	// generated Observation struct for object/list-of-object fields — see
 	// structElemType and CheckObservability in observability.go.
 	GoType string
+	// Omitempty reports whether the field's json tag carries the
+	// "omitempty" option. A field WITHOUT omitempty — most commonly a
+	// +nullable marker's generated companion — always marshals, as an
+	// explicit null when unset. resolveObservationFields in
+	// observability.go uses this to find Observation struct members an
+	// update-test expectation cannot safely omit; see
+	// CheckIncompleteExpectations in incompleteexpect.go.
+	Omitempty bool
 }
 
 // ValidationResult holds the outcome of validating a manifest against types.
@@ -45,9 +53,11 @@ var (
 	//   Path *string `json:"path,omitempty" ...`
 	// Group 1 is the Go field name, group 2 is the raw declared Go type
 	// (a single token — Go type literals never contain whitespace), group 3
-	// is the JSON tag name.
+	// is the JSON tag name, group 4 is whatever follows it inside the same
+	// quoted tag value (e.g. ",omitempty", or "" when the tag carries no
+	// further options) — addField checks it for the "omitempty" option.
 	reStructField = regexp.MustCompile(
-		`^\s+(\w+)\s+(\S+).*` + "`" + `.*json:"([^",]+).*` + "`",
+		`^\s+(\w+)\s+(\S+).*` + "`" + `.*json:"([^",]+)([^"]*)"` + `.*` + "`",
 	)
 
 	// Matches XValidation marker for immutability.
@@ -160,7 +170,7 @@ func (p *goTypesParser) parseFieldLine(line string) {
 	matches := reStructField.FindStringSubmatch(line)
 	switch {
 	case matches != nil:
-		p.addField(matches[1], matches[2], matches[3], line)
+		p.addField(matches[1], matches[2], matches[3], strings.Contains(matches[4], "omitempty"), line)
 	case isCommentOrMarkerLine(line):
 		// Accumulate comment/marker lines.
 		p.prevLines = append(p.prevLines, line)
@@ -179,7 +189,7 @@ func isCommentOrMarkerLine(line string) bool {
 
 // addField records a parsed field declaration, determining immutability from
 // the buffered preceding comment lines or the field line itself.
-func (p *goTypesParser) addField(goName, goType, jsonName, line string) {
+func (p *goTypesParser) addField(goName, goType, jsonName string, omitempty bool, line string) {
 	// Check if any preceding comment lines contain immutability marker.
 	immutable := false
 	for _, pl := range p.prevLines {
@@ -198,6 +208,7 @@ func (p *goTypesParser) addField(goName, goType, jsonName, line string) {
 		JSONName:  jsonName,
 		Immutable: immutable,
 		GoType:    goType,
+		Omitempty: omitempty,
 	})
 	p.prevLines = nil
 }

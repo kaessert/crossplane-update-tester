@@ -1,6 +1,8 @@
 package validator
 
 import (
+	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -40,7 +42,8 @@ type ObservabilityFinding struct {
 //     resolvable struct (a builtin, a map, or a cross-package type such as
 //     "xpv2.NamespacedReference" this checker cannot inspect the shape of)
 //   - a nested type whose "<Type>Observation" companion struct cannot be
-//     found in typesPath
+//     found in typesPath or any of its "zz_*_types.go" siblings (see
+//     resolveObservationFields)
 //
 // A false positive here would push implementers toward blanket "skip:"
 // entries, which is the outcome the coverage campaign this check supports
@@ -51,11 +54,10 @@ func CheckObservability(typesPath string, paramFields []FieldInfo, tests []manif
 		byJSON[f.JSONName] = f
 	}
 
-	// Cache resolved Observation struct field-name sets by element type, so
-	// a types file with many entries referencing the same nested struct is
-	// only parsed once. A nil entry (present key, nil value) records "tried
-	// and unresolvable" so a repeated miss doesn't re-parse either.
-	obsCache := make(map[string]map[string]bool)
+	// Cache resolved Observation struct fields by element type, so a types
+	// file with many entries referencing the same nested struct is only
+	// parsed (and, on a miss, sibling-file-searched) once.
+	obsCache := make(observationFieldCache)
 
 	var findings []ObservabilityFinding
 	for _, t := range tests {
@@ -96,18 +98,20 @@ func CheckObservability(typesPath string, paramFields []FieldInfo, tests []manif
 	return findings
 }
 
-// resolveObservationKeys returns the set of top-level JSON field names
-// declared on "<elemType>Observation" in typesPath, consulting/populating
-// cache so each element type is parsed at most once. A nil return means the
-// struct could not be resolved.
-func resolveObservationKeys(typesPath, elemType string, cache map[string]map[string]bool) map[string]bool {
-	if keys, cached := cache[elemType]; cached {
-		return keys
-	}
+// observationFieldCache caches resolveObservationFields results by element
+// type, shared across a single CheckObservability or
+// CheckIncompleteExpectations call so a types file with many entries
+// referencing the same nested struct is only parsed (and, on a miss,
+// sibling-file-searched) once. A nil entry (present key, nil value) records
+// "tried and unresolvable" so a repeated miss doesn't re-search either.
+type observationFieldCache map[string][]FieldInfo
 
-	fields, err := ParseStructFields(typesPath, elemType+"Observation")
-	if err != nil {
-		cache[elemType] = nil
+// resolveObservationKeys returns the set of top-level JSON field names
+// declared on "<elemType>Observation", via resolveObservationFields. A nil
+// return means the struct could not be resolved.
+func resolveObservationKeys(typesPath, elemType string, cache observationFieldCache) map[string]bool {
+	fields := resolveObservationFields(typesPath, elemType, cache)
+	if fields == nil {
 		return nil
 	}
 
@@ -115,8 +119,63 @@ func resolveObservationKeys(typesPath, elemType string, cache map[string]map[str
 	for _, f := range fields {
 		keys[f.JSONName] = true
 	}
-	cache[elemType] = keys
 	return keys
+}
+
+// resolveObservationFields returns the fields declared on
+// "<elemType>Observation", resolved first in typesPath and, failing that, in
+// every "zz_*_types.go" sibling file in the same directory — a MIXED flat
+// apis/<scope>/v1alpha1/ layout sometimes de-duplicates a generated struct,
+// declaring it once in one resource's types file and referencing it from a
+// different resource's. A plain single-file lookup can never see that
+// struct at all; this fallback does, while keeping the single-file lookup as
+// the fast path. A nil return means the struct could not be resolved
+// anywhere searched.
+func resolveObservationFields(typesPath, elemType string, cache observationFieldCache) []FieldInfo {
+	if fields, cached := cache[elemType]; cached {
+		return fields
+	}
+
+	structName := elemType + "Observation"
+	fields, err := ParseStructFields(typesPath, structName)
+	if err != nil {
+		fields, err = resolveInSiblingTypesFiles(typesPath, structName)
+	}
+	if err != nil {
+		cache[elemType] = nil
+		return nil
+	}
+
+	cache[elemType] = fields
+	return fields
+}
+
+// resolveInSiblingTypesFiles searches every "zz_*_types.go" file in the same
+// directory as typesPath (excluding typesPath itself — the caller already
+// tried it) for structName, returning the first match. Errors from the glob
+// itself, or no sibling declaring structName, both report the same "not
+// found" outcome the caller already treats as unresolvable.
+func resolveInSiblingTypesFiles(typesPath, structName string) ([]FieldInfo, error) {
+	dir := filepath.Dir(typesPath)
+	matches, err := filepath.Glob(filepath.Join(dir, "zz_*_types.go"))
+	if err != nil {
+		return nil, fmt.Errorf("globbing %s for %s siblings: %w", dir, structName, err)
+	}
+
+	self, err := filepath.Abs(typesPath)
+	if err != nil {
+		self = typesPath
+	}
+
+	for _, sibling := range matches {
+		if siblingAbs, absErr := filepath.Abs(sibling); absErr == nil && siblingAbs == self {
+			continue // already tried by the caller
+		}
+		if fields, siblingErr := ParseStructFields(sibling, structName); siblingErr == nil {
+			return fields, nil
+		}
+	}
+	return nil, fmt.Errorf("no %s struct found in %s or its zz_*_types.go siblings", structName, typesPath)
 }
 
 // unobservableKeys returns the sorted, deduplicated set of top-level keys

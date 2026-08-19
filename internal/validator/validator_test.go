@@ -255,8 +255,8 @@ func TestParseGoTypes(t *testing.T) {
 	want := []FieldInfo{
 		{GoName: "Name", JSONName: fieldName, GoType: "*string"},
 		{GoName: "Owner", JSONName: fieldOwner, GoType: "*string"},
-		{GoName: "OwnerRef", JSONName: fieldOwnerRef, GoType: "*xpv1.Reference"},
-		{GoName: "OwnerSelector", JSONName: fieldOwnerSelector, GoType: "*xpv1.Selector"},
+		{GoName: "OwnerRef", JSONName: fieldOwnerRef, GoType: "*xpv1.Reference", Omitempty: true},
+		{GoName: "OwnerSelector", JSONName: fieldOwnerSelector, GoType: "*xpv1.Selector", Omitempty: true},
 		{GoName: "Region", JSONName: fieldRegion, Immutable: true, GoType: "*string"},
 	}
 	if len(fields) != len(want) {

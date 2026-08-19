@@ -730,6 +730,42 @@ func (r *Runner) RunTests(m *manifest.Manifest) ([]TestResult, []UnchangedAssert
 	// verdict must reflect that some portion of the evidence is unreliable
 	// rather than silently reporting a clean pass.
 	var resetFailed bool
+
+	// Creation-time settling can itself exhaust the object's event
+	// spam-filter burst before this loop issues its own first patch. A
+	// resource whose desired state needs several corrective Update()
+	// rounds to reach Ready (late-init discovering server-normalized
+	// sub-fields, an oneof default settling, etc.) accumulates those as
+	// real UpdatedExternalResource/CannotUpdateExternalResource events
+	// against the SAME per-object burst attemptsSinceReset tracks below —
+	// and that consumption is invisible to attemptsSinceReset, which only
+	// counts patches THIS run issues. Once the burst is spent, a fresh,
+	// entirely legitimate Update() event from the first field test is
+	// silently dropped by the spam filter rather than delayed, so no
+	// retry window on the read side (evidenceRetryWindow) can recover it:
+	// the write itself never lands. Measured live (ticket 6bb473df):
+	// HttpLoadbalancer's own settling from six newly-populated slice
+	// fields left 32 pre-existing update events on the object — already
+	// past the ceiling below — and every field test's own patch then
+	// reported NOT-EVIDENCED with the aggregated count frozen at 32 for
+	// the whole 10s retry window on both fields, while every other
+	// resource in the same run (starting from a low, non-ceiling count)
+	// evidenced its own patch inside 200ms. Checking the SAME ceiling
+	// used mid-run, once, before the first field test, and earning a
+	// fresh burst up front when it is already spent closes that gap: the
+	// field loop below never becomes aware this happened, it just starts
+	// attemptsSinceReset from a controller guaranteed to have full
+	// headroom. A failed count here is tolerated exactly like every other
+	// count failure in this package — proceed without resetting rather
+	// than block the run on a count this method was never guaranteed to
+	// get.
+	if preExisting, preErr := r.countUpdateEvents(m.Kind, m.Name, m.Namespace, m.APIVersion); preErr == nil && preExisting >= eventBurstCeiling {
+		if err := r.resetEventBurst(); err != nil {
+			fmt.Fprintf(os.Stderr, "    warning: resetting controller event burst (pre-run, %d pre-existing events): %v\n", preExisting, err)
+			resetFailed = true
+		}
+	}
+
 	for _, t := range m.Tests {
 		if t.Skip != "" {
 			results = append(results, TestResult{
@@ -1145,6 +1181,16 @@ const evidenceRetryInterval = 2 * time.Second
 // visible resolves exactly as fast as before this window existed — the
 // window only ever delays a call that would otherwise have reported a false
 // NOT-EVIDENCED.
+//
+// Every recount is logged to stderr with its attempt number, the observed
+// count and the elapsed time since the loop started. A reproduction that
+// ends in NOT-EVIDENCED is otherwise a single opaque outcome — there is no
+// record of whether the count sat unmoving for the whole window (pointing at
+// the involvedObject match itself) or was still climbing when the deadline
+// hit (pointing at the window being too short). The log line turns that
+// question into something a rerun answers directly instead of by
+// reconstructing it from `kubectl get events` timestamps captured after the
+// cluster is already gone.
 func (r *Runner) evidenceOutcome(kind, name, namespace, apiVersion string, eventsBefore int, eventsBeforeErr error) (checked, evidenced bool, err error) {
 	if eventsBeforeErr != nil {
 		return false, false, fmt.Errorf("counting update events before patch: %w", eventsBeforeErr)
@@ -1154,12 +1200,17 @@ func (r *Runner) evidenceOutcome(kind, name, namespace, apiVersion string, event
 	if window <= 0 {
 		window = evidenceRetryWindow
 	}
-	deadline := time.Now().Add(window)
+	start := time.Now()
+	deadline := start.Add(window)
+	attempt := 0
 	for {
+		attempt++
 		eventsAfter, afterErr := r.countUpdateEvents(kind, name, namespace, apiVersion)
 		if afterErr != nil {
 			return false, false, fmt.Errorf("counting update events after patch: %w", afterErr)
 		}
+		fmt.Fprintf(os.Stderr, "    evidence: %s/%s (ns=%q) attempt %d: count=%d (before=%d), elapsed=%s\n",
+			kind, name, namespace, attempt, eventsAfter, eventsBefore, time.Since(start).Round(time.Millisecond))
 		if eventsAfter > eventsBefore {
 			return true, true, nil
 		}

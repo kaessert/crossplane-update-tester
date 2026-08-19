@@ -1449,6 +1449,96 @@ func TestRunTestsResetsEventBurstBeforeCeiling(t *testing.T) {
 	}
 }
 
+// TestRunTestsEarnsBurstBeforeFirstFieldWhenAlreadyAtCeiling is ticket
+// 6bb473df's regression: creation-time settling (late-init corrections, an
+// oneof default settling, a multi-round convergence from empty to a
+// complex desired state) can leave an object's event spam-filter burst
+// already at or past eventBurstCeiling before RunTests issues its own
+// first patch. Measured live: provider-f5xc's HttpLoadbalancer, freshly
+// created with six newly-populated slice fields, arrived at its first
+// field test with 32 pre-existing update events already recorded against
+// it — past the ceiling below. attemptsSinceReset only counts patches THIS
+// run issues, so without a pre-run check the first field test's own
+// entirely legitimate Update() event is silently dropped by the exhausted
+// burst rather than delayed, and no amount of read-side retrying
+// (evidenceRetryWindow) can recover a write that never landed — the
+// instrumented reproduction showed the aggregated count frozen at exactly
+// its pre-existing value for the whole retry window, on every field.
+// RunTests must reset the burst BEFORE the first patch when the object
+// arrives already at the ceiling, not only after eventBurstCeiling patches
+// accumulate within the run itself.
+func TestRunTestsEarnsBurstBeforeFirstFieldWhenAlreadyAtCeiling(t *testing.T) {
+	f := &fakeCluster{
+		forProvider:       map[string]interface{}{testFieldNotifyDelay: float64(0)},
+		atProvider:        map[string]interface{}{testFieldNotifyDelay: float64(0)},
+		generation:        1,
+		kind:              testKindExample,
+		name:              testNameExample,
+		recordUpdateEvent: true,
+		eventBudget:       eventBurstCeiling,
+		// generations pre-seeded AT the ceiling — simulating settling that
+		// happened entirely before RunTests was ever called. This mirrors
+		// what was measured live: the very first eventsBefore read already
+		// returns eventBurstCeiling, not a low number climbing from 0.
+		generations: []int32{eventBurstCeiling},
+	}
+	r := newFakeRunner(f)
+
+	m := manifestWithSequentialFieldTests(1)
+	results, _, err := r.RunTests(m)
+	if err != nil {
+		t.Fatalf("RunTests: unexpected error: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("got %d results, want 1", len(results))
+	}
+	if results[0].NotEvidenced {
+		t.Errorf("field 0 (%s): got NotEvidenced=true, want evidenced — a pre-run reset should have earned a fresh burst before this patch (err: %v)", results[0].Field, results[0].Error)
+	}
+	if !results[0].Passed {
+		t.Errorf("field 0 (%s): got Passed=false, want true (err: %v)", results[0].Field, results[0].Error)
+	}
+	if f.restartCalls == 0 {
+		t.Error("expected a controller restart BEFORE the first field test, since the object arrived already at the burst ceiling")
+	}
+}
+
+// TestRunTestsSkipsPreRunResetWhenBelowCeiling is
+// TestRunTestsEarnsBurstBeforeFirstFieldWhenAlreadyAtCeiling's boundary
+// counterpart: an object that arrives with pre-existing events but still
+// comfortably under the ceiling must not pay a restart it does not need —
+// the pre-run check is a targeted response to a specific measured defect,
+// not a blanket "always reset first" policy.
+func TestRunTestsSkipsPreRunResetWhenBelowCeiling(t *testing.T) {
+	f := &fakeCluster{
+		forProvider:       map[string]interface{}{testFieldNotifyDelay: float64(0)},
+		atProvider:        map[string]interface{}{testFieldNotifyDelay: float64(0)},
+		generation:        1,
+		kind:              testKindExample,
+		name:              testNameExample,
+		recordUpdateEvent: true,
+		eventBudget:       eventBurstCeiling,
+		// One short of the ceiling — must NOT trigger the pre-run reset.
+		generations: []int32{eventBurstCeiling - 1},
+	}
+	r := newFakeRunner(f)
+
+	m := manifestWithSequentialFieldTests(1)
+	results, _, err := r.RunTests(m)
+	if err != nil {
+		t.Fatalf("RunTests: unexpected error: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("got %d results, want 1", len(results))
+	}
+	if results[0].NotEvidenced {
+		t.Errorf("field 0 (%s): got NotEvidenced=true, want evidenced (err: %v)", results[0].Field, results[0].Error)
+	}
+	if f.restartCalls != 0 {
+		t.Errorf("expected no restart when pre-existing events (%d) are below the ceiling (%d), got %d restart(s)", eventBurstCeiling-1, eventBurstCeiling, f.restartCalls)
+	}
+}
+
 // TestRunTestsWithoutRestartWiringStillDetectsGenuineNonEvidence is the
 // counterpart regression case: the burst-reset machinery must never become
 // vacuously permissive. A controller that truly never emits update events

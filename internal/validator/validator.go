@@ -108,6 +108,7 @@ func isReferencePlumbingField(jsonName string, fieldSet map[string]bool) bool {
 type goTypesParser struct {
 	targetStruct string
 	fields       []FieldInfo
+	found        bool // targetStruct's declaration was located, even if it has zero fields
 	inTarget     bool // inside the struct we actually want to parse
 	inOther      bool // inside a non-matching struct (skipping)
 	braceDepth   int
@@ -154,6 +155,7 @@ func (p *goTypesParser) tryEnterStruct(line string) {
 	if m[1] == p.targetStruct {
 		// Found the struct we want — start parsing its fields.
 		p.inTarget = true
+		p.found = true
 		p.braceDepth = 1
 		p.prevLines = nil
 		return
@@ -251,8 +253,17 @@ func ParseStructFields(path, structName string) ([]FieldInfo, error) {
 		return nil, fmt.Errorf("scanning types file: %w", err)
 	}
 
-	if len(p.fields) == 0 {
+	if !p.found {
 		return nil, fmt.Errorf("no %s struct found in %s", structName, path)
+	}
+
+	// The struct was located — a nullary struct (e.g. a zero-payload union
+	// arm marker) is a real, resolvable declaration with zero members, not
+	// an unresolvable one. Callers distinguish "found" from "unresolved"
+	// solely by nil-ness of the returned slice, so a found struct must
+	// never yield nil here even when it declares no fields.
+	if p.fields == nil {
+		p.fields = []FieldInfo{}
 	}
 
 	return p.fields, nil

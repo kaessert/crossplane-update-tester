@@ -2,6 +2,7 @@ package validator
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -181,12 +182,12 @@ func resolveKindObservationFieldType(typesPath, kind, jsonName string, cache obs
 
 // resolveKindObservationFields returns the fields declared on
 // "<kind>Observation" — the resource's own top-level Observation struct,
-// not a nested one — resolved first in typesPath and, failing that, in
-// every "zz_*_types.go" sibling file in the same directory, the same
-// sibling-file fallback resolveObservationFields applies to a nested
-// struct. Cached under a "kindobs:" key namespace that cannot collide with
-// a plain elemType cache entry, since a locally-resolvable struct name
-// never starts with a lowercase letter (see stripToStructName).
+// not a nested one — resolved first in typesPath and, failing that, in every
+// other non-test Go source file in the same directory, the same sibling-file
+// fallback resolveObservationFields applies to a nested struct. Cached under
+// a "kindobs:" key namespace that cannot collide with a plain elemType cache
+// entry, since a locally-resolvable struct name never starts with a
+// lowercase letter (see stripToStructName).
 func resolveKindObservationFields(typesPath, kind string, cache observationFieldCache) []FieldInfo {
 	cacheKey := "kindobs:" + kind
 	if fields, cached := cache[cacheKey]; cached {
@@ -209,7 +210,7 @@ func resolveKindObservationFields(typesPath, kind string, cache observationField
 
 // resolveObservationFields returns the fields declared on
 // "<elemType>Observation", resolved first in typesPath and, failing that, in
-// every "zz_*_types.go" sibling file in the same directory — a MIXED flat
+// every other non-test Go source file in the same directory — a MIXED flat
 // apis/<scope>/v1alpha1/ layout sometimes de-duplicates a generated struct,
 // declaring it once in one resource's types file and referencing it from a
 // different resource's. A plain single-file lookup can never see that
@@ -235,16 +236,24 @@ func resolveObservationFields(typesPath, elemType string, cache observationField
 	return fields
 }
 
-// resolveInSiblingTypesFiles searches every "zz_*_types.go" file in the same
-// directory as typesPath (excluding typesPath itself — the caller already
-// tried it) for structName, returning the first match. Errors from the glob
-// itself, or no sibling declaring structName, both report the same "not
-// found" outcome the caller already treats as unresolvable.
+// resolveInSiblingTypesFiles searches every non-test Go source file in the
+// same directory as typesPath (excluding typesPath itself — the caller
+// already tried it) for structName, returning the first match. Go
+// guarantees at most one declaration of a given name per package, so any
+// non-"_test.go" ".go" file in the directory is an authoritative place to
+// look — a filename convention (e.g. a "zz_"-prefixed or "_types.go"-suffixed
+// glob) is narrower than that guarantee and misses declarations in
+// differently-named sibling files (e.g. a package-level setup/marker file).
+// "_test.go" is excluded because an external "_test" package may legally
+// declare a same-named struct that is not part of the production API.
+// Errors from the directory read itself, or no sibling declaring structName,
+// both report the same "not found" outcome the caller already treats as
+// unresolvable.
 func resolveInSiblingTypesFiles(typesPath, structName string) ([]FieldInfo, error) {
 	dir := filepath.Dir(typesPath)
-	matches, err := filepath.Glob(filepath.Join(dir, "zz_*_types.go"))
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, fmt.Errorf("globbing %s for %s siblings: %w", dir, structName, err)
+		return nil, fmt.Errorf("reading %s for %s siblings: %w", dir, structName, err)
 	}
 
 	self, err := filepath.Abs(typesPath)
@@ -252,7 +261,16 @@ func resolveInSiblingTypesFiles(typesPath, structName string) ([]FieldInfo, erro
 		self = typesPath
 	}
 
-	for _, sibling := range matches {
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+
+		sibling := filepath.Join(dir, name)
 		if siblingAbs, absErr := filepath.Abs(sibling); absErr == nil && siblingAbs == self {
 			continue // already tried by the caller
 		}
@@ -260,7 +278,7 @@ func resolveInSiblingTypesFiles(typesPath, structName string) ([]FieldInfo, erro
 			return fields, nil
 		}
 	}
-	return nil, fmt.Errorf("no %s struct found in %s or its zz_*_types.go siblings", structName, typesPath)
+	return nil, fmt.Errorf("no %s struct found in %s or its sibling package files", structName, typesPath)
 }
 
 // unobservableKeys returns the sorted, deduplicated set of top-level keys

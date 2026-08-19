@@ -292,6 +292,33 @@ func TestParseGoTypesMissingFile(t *testing.T) {
 	}
 }
 
+// TestParseStructFieldsFoundButEmpty pins the "struct declaration seen" vs
+// "fields parsed" distinction: a nullary struct (the shape a generated
+// zero-payload union-arm marker type takes, "type Empty struct{}") is a
+// real, resolvable declaration with zero members, not an unresolvable one.
+// Every caller downstream distinguishes "resolved" from "unresolved" solely
+// by nil-ness of the returned slice, so a found struct must come back as a
+// non-nil, zero-length slice with a nil error — never nil with a nil error,
+// which would be indistinguishable from "not found" to those callers.
+func TestParseStructFieldsFoundButEmpty(t *testing.T) {
+	src := `package v1alpha1
+
+type Empty struct{}
+`
+	path := writeFixture(t, "zz_setup.go", src)
+
+	fields, err := ParseStructFields(path, "Empty")
+	if err != nil {
+		t.Fatalf("ParseStructFields: unexpected error: %v", err)
+	}
+	if fields == nil {
+		t.Fatal("fields = nil, want a non-nil, zero-length slice for a found-but-empty struct")
+	}
+	if len(fields) != 0 {
+		t.Errorf("fields = %+v, want zero-length", fields)
+	}
+}
+
 // TestParseGoTypesEndToEnd exercises the parser, the manifest annotation
 // parser and the exclusion logic together, as the CLI wires them: a manifest
 // covering only the base owner field must fully validate against a types

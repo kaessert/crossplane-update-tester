@@ -42,7 +42,7 @@
 //
 //	update-tester run <manifest.yaml> [--timeout 120] [--poll-interval 60s]
 //	update-tester converge <manifest.yaml> [--poll-interval 60s] [--ignore-fields a,b] [--timeout 120s] [--readiness-timeout 120s]
-//	update-tester validate <manifest.yaml> --types-file <types.go>
+//	update-tester validate <manifest.yaml> --types-file <types.go> [--controller-dir <dir>]
 //	update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
 //	update-tester resolve-recover <manifest.yaml> [--timeout 120]
 //	update-tester hook <invocation-name> [--root <dir>] [--manifest <path>]
@@ -130,7 +130,7 @@ func printUsage() {
 Usage:
   update-tester run <manifest.yaml> [--timeout 120] [--poll-interval 60s]
   update-tester converge <manifest.yaml> [--poll-interval 60s] [--ignore-fields a,b] [--timeout 120s] [--readiness-timeout 120s]
-  update-tester validate <manifest.yaml> --types-file <types.go>
+  update-tester validate <manifest.yaml> --types-file <types.go> [--controller-dir <dir>]
   update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
   update-tester resolve-recover <manifest.yaml> [--timeout 120]
   update-tester hook <invocation-name> [--root <dir>] [--manifest <path>]
@@ -373,23 +373,28 @@ func printSideEffects(w io.Writer, changes []differ.FieldChange) {
 
 // validateOptions holds the parsed command line of the `validate` subcommand.
 type validateOptions struct {
-	manifestPath string
-	typesFile    string
+	manifestPath  string
+	typesFile     string
+	controllerDir string
 }
 
 func parseValidateArgs(args []string) (validateOptions, error) {
 	fs := flag.NewFlagSet("validate", flag.ContinueOnError)
 	typesFile := fs.String("types-file", "", "Path to Go types file containing Parameters struct")
+	controllerDir := fs.String("controller-dir", "",
+		"Path to the resource's controller package directory (optional). When set, also flags an expect:/value: "+
+			"object that omits a member the controller declares server-echoed via a registered go-cmp Transformer "+
+			"normalizer, even when that member carries omitempty")
 	if err := fs.Parse(cli.ReorderArgs(fs, args)); err != nil {
 		return validateOptions{}, err
 	}
 	if fs.NArg() < 1 {
-		return validateOptions{}, errors.New("usage: update-tester validate <manifest.yaml> --types-file <types.go>")
+		return validateOptions{}, errors.New("usage: update-tester validate <manifest.yaml> --types-file <types.go> [--controller-dir <dir>]")
 	}
 	if *typesFile == "" {
 		return validateOptions{}, errors.New("--types-file is required")
 	}
-	return validateOptions{manifestPath: fs.Arg(0), typesFile: *typesFile}, nil
+	return validateOptions{manifestPath: fs.Arg(0), typesFile: *typesFile, controllerDir: *controllerDir}, nil
 }
 
 func cmdValidate(args []string) error {
@@ -420,6 +425,12 @@ func cmdValidate(args []string) error {
 	incompleteFindings := validator.CheckIncompleteExpectations(opts.typesFile, fields, m)
 	validator.PrintIncompleteExpectations(incompleteFindings)
 
+	echoFindings, err := validator.CheckServerEchoedExpectations(opts.typesFile, fields, m, opts.controllerDir)
+	if err != nil {
+		return fmt.Errorf("checking server-echoed expectations: %w", err)
+	}
+	validator.PrintServerEchoedExpectations(echoFindings)
+
 	if !result.AllGood {
 		return errors.New("mutable-field coverage is incomplete")
 	}
@@ -431,6 +442,9 @@ func cmdValidate(args []string) error {
 	}
 	if len(incompleteFindings) > 0 {
 		return errors.New("update-test expectation omits a non-omitempty Observation struct member")
+	}
+	if len(echoFindings) > 0 {
+		return errors.New("update-test expectation omits a member the provider's controller declares server-echoed")
 	}
 	return nil
 }

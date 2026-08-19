@@ -678,6 +678,26 @@ func TestFlagAfterPositionalTakesEffect(t *testing.T) {
 			if got.manifestPath != path || got.typesFile != "types.go" {
 				t.Errorf("parseValidateArgs(%q) = %+v, want manifest %q and types-file types.go", args, got, path)
 			}
+			if got.controllerDir != "" {
+				t.Errorf("parseValidateArgs(%q).controllerDir = %q, want empty when --controller-dir is not passed", args, got.controllerDir)
+			}
+		}
+
+		// --controller-dir reorders like every other flag, and is
+		// optional — a caller that never mentions it gets today's
+		// behaviour (the server-echoed check disabled).
+		for _, args := range [][]string{
+			{"--types-file", "types.go", "--controller-dir", "internal/controller/widget", path},
+			{path, "--types-file", "types.go", "--controller-dir", "internal/controller/widget"},
+			{path, "--types-file=types.go", "--controller-dir=internal/controller/widget"},
+		} {
+			got, err := parseValidateArgs(args)
+			if err != nil {
+				t.Fatalf("parseValidateArgs(%q): %v", args, err)
+			}
+			if got.manifestPath != path || got.typesFile != "types.go" || got.controllerDir != "internal/controller/widget" {
+				t.Errorf("parseValidateArgs(%q) = %+v, want manifest %q, types-file types.go, controller-dir internal/controller/widget", args, got, path)
+			}
 		}
 	})
 

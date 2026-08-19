@@ -34,7 +34,7 @@ Everything it asserts is derived from two sources:
 ```
 update-tester run <manifest.yaml> [--timeout 120] [--poll-interval 60s]
 update-tester converge <manifest.yaml> [--poll-interval 60s] [--ignore-fields a,b] [--timeout 120s] [--readiness-timeout 120s]
-update-tester validate <manifest.yaml> --types-file <types.go>
+update-tester validate <manifest.yaml> --types-file <types.go> [--controller-dir <dir>]
 update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
 update-tester resolve-recover <manifest.yaml> [--timeout 120]
 update-tester hook <invocation-name> --root <provider-repo-root>
@@ -227,6 +227,40 @@ is declared in `zz_http_loadbalancers_types.go` while the tcp-loadbalancer
 manifest's `--types-file` points at `zz_tcp_loadbalancers_types.go`. A clean
 `UNOBSERVABLE`-free run is not proof the entry is observable — only that this
 check, scoped to one file, could not prove otherwise.
+
+`validate` runs a further check, opt-in via `--controller-dir <dir>`, naming
+the resource's controller package directory. Without it, this check is
+skipped entirely — everything above still runs.
+
+A controller can register a [go-cmp](https://pkg.go.dev/github.com/google/go-cmp/cmp)
+`Transformer` that clears a field before comparing desired against observed,
+because the backend echoes a default value back on every element the caller
+never set one for (e.g. an explicit `invert_match: false`, or an empty-string
+`description`) and a verbatim comparison against that echo would report a
+permanent diff — the provider calling `Update()` every reconcile on an
+otherwise idle resource. Because the desired side never encodes that default
+explicitly, the cleared field's generated struct member necessarily carries
+`omitempty`, which is exactly the shape the coverage check above excludes
+from `MISSING`. An `expect:`/`value:` object omitting such a member — at any
+depth in its nested object tree, not only the top level — is printed as
+
+```
+✗ blockedClients: SERVER-ECHOED — key(s) invertMatch are cleared by a registered normalizer ...
+```
+
+and the command exits non-zero. The remedy is the same as `UNOBSERVABLE`'s:
+add an `expect:` naming the value the backend actually returns.
+
+This check derives which struct/field pairs are server-echoed straight from
+the controller source — every `cmp.Transformer("...", someFunc)` registration
+it finds, resolving `someFunc`'s parameter type and the field it nils out —
+rather than from a hand-maintained list, so it cannot go stale independently
+of the normalizer it describes. It matches a struct in the manifest's nested
+object tree against that source struct by field-name-set fingerprint (the
+generated struct must declare at least every field the hand-written one
+does), since the two are named independently by the generator and the
+controller author. A controller package with no such registration leaves this
+check inert — no findings, no error.
 
 ### `check-external-name-prefix` — identity guard (opt-in)
 

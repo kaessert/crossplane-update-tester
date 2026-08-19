@@ -213,10 +213,16 @@ points at, not the reference itself), so the check reads back a value the API
 genuinely returns.
 
 This check is deliberately conservative, so its silence is not a guarantee.
-Resolving the target field's Observation-side shape tries, in order:
+Resolving the target field's Observation-side shape tries, in order. Both
+steps search every non-`_test.go` `.go` file in the same directory — the
+same Go package — rather than a filename pattern: Go guarantees at most one
+declaration of a given name per package, so any production source file is an
+authoritative place to look, and `_test.go` files are excluded because an
+external `_test` package may legally declare a same-named struct that is not
+part of the production API.
 
 1. `<ElemType>Observation` by name — first in `--types-file`, then in every
-   other `zz_*_types.go` file in the same directory. This is the fast path
+   other non-`_test.go` `.go` file in the same directory. This is the fast path
    for a generator layout that emits a distinct Observation companion struct,
    and it is not limited to the file named on the command line: a
    `tcp-loadbalancer`'s `originPoolsWeights` field carries the same
@@ -228,7 +234,7 @@ Resolving the target field's Observation-side shape tries, in order:
    search in step 1 finds it there.
 2. Failing that, the field of the same JSON name declared on
    `<Kind>Observation` itself — resolved the same way, in `--types-file`
-   then its `zz_*_types.go` siblings — followed by resolving THAT field's
+   then its non-`_test.go` `.go` siblings — followed by resolving THAT field's
    own declared type, again in `--types-file` then its siblings. This
    handles a generator layout that reuses the identical struct on both the
    Parameters and the Observation side of a field, with no separate

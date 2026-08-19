@@ -213,20 +213,78 @@ points at, not the reference itself), so the check reads back a value the API
 genuinely returns.
 
 This check is deliberately conservative, so its silence is not a guarantee.
-It resolves `<ElemType>Observation` by name **in the same `--types-file`**
-that was passed on the command line, and says nothing for any of: a `skip:`
-entry, a dotted field path (e.g. `cookieParams.authHmac.primKeySecretRef`), a
-scalar expectation, a cross-package type this checker cannot inspect the
-shape of, or — the case most likely to surprise you — a nested type whose
-`Observation` companion lives in a **different** generated file than the one
-`--types-file` points at. That last case is not hypothetical: a
-`tcp-loadbalancer`'s `originPoolsWeights` field carries the same unobservable
-`poolRef` key that an `http-loadbalancer`'s `defaultRoutePools` field does,
-but only the latter is flagged, because `ViewsOriginPoolWithWeightObservation`
-is declared in `zz_http_loadbalancers_types.go` while the tcp-loadbalancer
-manifest's `--types-file` points at `zz_tcp_loadbalancers_types.go`. A clean
-`UNOBSERVABLE`-free run is not proof the entry is observable — only that this
-check, scoped to one file, could not prove otherwise.
+Resolving the target field's Observation-side shape tries, in order:
+
+1. `<ElemType>Observation` by name — first in `--types-file`, then in every
+   other `zz_*_types.go` file in the same directory. This is the fast path
+   for a generator layout that emits a distinct Observation companion struct,
+   and it is not limited to the file named on the command line: a
+   `tcp-loadbalancer`'s `originPoolsWeights` field carries the same
+   unobservable `poolRef` key that an `http-loadbalancer`'s
+   `defaultRoutePools` field does, and both are flagged even though
+   `ViewsOriginPoolWithWeightObservation` is declared only in
+   `zz_http_loadbalancers_types.go` while the tcp-loadbalancer manifest's
+   `--types-file` points at `zz_tcp_loadbalancers_types.go` — the sibling
+   search in step 1 finds it there.
+2. Failing that, the field of the same JSON name declared on
+   `<Kind>Observation` itself — resolved the same way, in `--types-file`
+   then its `zz_*_types.go` siblings — followed by resolving THAT field's
+   own declared type, again in `--types-file` then its siblings. This
+   handles a generator layout that reuses the identical struct on both the
+   Parameters and the Observation side of a field, with no separate
+   `Observation` companion at all: `provider-f5xc`'s `ServicePolicyRule`
+   declares `PolicyMatcherTypeBasic` for both
+   `ServicePolicyRuleParameters.DomainMatcher` and
+   `ServicePolicyRuleObservation.DomainMatcher` verbatim, and there is no
+   `PolicyMatcherTypeBasicObservation` anywhere in the package. A
+   `domainMatcher` update-test entry that omits `exactValues` — a
+   non-omitempty member of that same reused struct — is flagged.
+
+What genuinely remains unresolved, so the "silence is not a guarantee"
+caveat still has a true basis: a `skip:` entry, a dotted field path (e.g.
+`cookieParams.authHmac.primKeySecretRef`), a scalar expectation, a
+cross-package type this checker cannot inspect the shape of, and a field
+that neither step above can resolve at all — absent from both
+`<ElemType>Observation` (searched in `--types-file` and its siblings) and
+`<Kind>Observation` (searched the same way). A clean `UNOBSERVABLE`-free run
+is not proof every entry is observable — only that neither resolution step
+could prove otherwise.
+
+`validate` also flags an `expect:`/`value:` object that leaves a sibling key
+of the create-time `spec.forProvider` object unaddressed by the patch. RFC
+7386 (`kubectl patch --type=merge`, what the `run` command actually applies)
+preserves any top-level key of an existing object the patch never mentions,
+so a partial-object `value:` update silently carries that sibling forward —
+and if the effective expectation does not separately name it, the runner's
+whole-value comparison against `status.atProvider` can never be satisfied by
+construction. This is printed as
+
+```
+✗ headerMatcher: SIBLING-SURVIVES — key(s) invertMatch are absent from value: and will survive the RFC 7386 merge patch unaddressed; either add expect: recording the merged shape, or set the surviving key(s) to null if they are a mutually exclusive alternative being replaced
+```
+
+and the command exits non-zero. This check runs entirely offline — the
+manifest's own `spec.forProvider` and `crossplane.io/update-test` annotation
+are enough — so it applies even without `--types-file`.
+
+`validate` also flags an `expect:`/`value:` object that omits a top-level key
+the target field's generated Observation struct declares WITHOUT
+`omitempty`. Such a member always marshals into `status.atProvider` — as an
+explicit `null` when the API never set it — so an expectation that never
+names it can never satisfy the runner's whole-value comparison, even for a
+field being set for the very first time (absent from `spec.forProvider`
+entirely at create time, the one case `SIBLING-SURVIVES` above has no
+create-time object to reason about). This is printed as
+
+```
+✗ domainMatcher: INCOMPLETE-EXPECT — key(s) exactValues are non-omitempty members of the generated Observation struct absent from expect:/value:, and will marshal (as null, if unset) regardless; add expect: naming the resolved value
+```
+
+and the command exits non-zero. The remedy is the same as `UNOBSERVABLE`'s:
+add an `expect:` naming the value the backend actually returns, not a
+`skip:` — that only hides the gap. A key `SIBLING-SURVIVES` already flagged
+for the same entry is never reported a second time here; it is the same
+underlying defect with the same remedy, not a second, independent one.
 
 `validate` runs a further check, opt-in via `--controller-dir <dir>`, naming
 the resource's controller package directory. Without it, this check is
@@ -240,9 +298,9 @@ never set one for (e.g. an explicit `invert_match: false`, or an empty-string
 permanent diff — the provider calling `Update()` every reconcile on an
 otherwise idle resource. Because the desired side never encodes that default
 explicitly, the cleared field's generated struct member necessarily carries
-`omitempty`, which is exactly the shape the coverage check above excludes
-from `MISSING`. An `expect:`/`value:` object omitting such a member — at any
-depth in its nested object tree, not only the top level — is printed as
+`omitempty`, which is exactly the shape `INCOMPLETE-EXPECT` above excludes.
+An `expect:`/`value:` object omitting such a member — at any depth in its
+nested object tree, not only the top level — is printed as
 
 ```
 ✗ blockedClients: SERVER-ECHOED — key(s) invertMatch are cleared by a registered normalizer ...
@@ -251,16 +309,30 @@ depth in its nested object tree, not only the top level — is printed as
 and the command exits non-zero. The remedy is the same as `UNOBSERVABLE`'s:
 add an `expect:` naming the value the backend actually returns.
 
-This check derives which struct/field pairs are server-echoed straight from
-the controller source — every `cmp.Transformer("...", someFunc)` registration
-it finds, resolving `someFunc`'s parameter type and the field it nils out —
-rather than from a hand-maintained list, so it cannot go stale independently
-of the normalizer it describes. It matches a struct in the manifest's nested
-object tree against that source struct by field-name-set fingerprint (the
-generated struct must declare at least every field the hand-written one
-does), since the two are named independently by the generator and the
-controller author. A controller package with no such registration leaves this
-check inert — no findings, no error.
+This check is a BACKSTOP, not the primary method, for a question no amount
+of types-file analysis can answer: which `omitempty` Observation members a
+live backend echoes back anyway is a property of the backend, not of the
+generated Go, and a silent `SERVER-ECHOED` run is not proof an expectation is
+complete — only that this static check found nothing. Where the backend
+supports a cheap create/delete, one live probe answers the question exactly;
+this check exists for the providers where it does not (an SDK or CLI backend
+with no inexpensive way to stand up and tear down a probe resource).
+Measured on a live tenant, `provider-f5xc`'s `service_policy_rules`
+`path` field: `INCOMPLETE-EXPECT` names four non-omitempty keys
+(`prefix_values`, `regex_values`, `suffix_values`, `transformers`), but the
+backend actually echoes six — `invert_matcher` and `encoded_path_matcher`
+carry `omitempty` in the generated Go and so are silently absent from that
+static prediction, yet the server sets both regardless of what the caller
+sent. This check derives which struct/field pairs are server-echoed straight
+from the controller source — every `cmp.Transformer("...", someFunc)`
+registration it finds, resolving `someFunc`'s parameter type and the field it
+nils out — rather than from a hand-maintained list, so it cannot go stale
+independently of the normalizer it describes. It matches a struct in the
+manifest's nested object tree against that source struct by field-name-set
+fingerprint (the generated struct must declare at least every field the
+hand-written one does), since the two are named independently by the
+generator and the controller author. A controller package with no such
+registration leaves this check inert — no findings, no error.
 
 ### `check-external-name-prefix` — identity guard (opt-in)
 

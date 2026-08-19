@@ -717,6 +717,16 @@ func (r *Runner) RunTests(m *manifest.Manifest) ([]TestResult, []UnchangedAssert
 
 	var results []TestResult
 	var attemptsSinceReset int
+	// eventBaseline is the real, measured event count as of the last reset
+	// (or the run's start, if no reset has happened yet) — see the mid-loop
+	// block below for why a real delta against this baseline, not the
+	// 1-per-attempt attemptsSinceReset estimate alone, is what decides
+	// whether a field test starts with a spent burst. haveEventBaseline is
+	// false only when the count could not be measured at all (e.g. RBAC
+	// denies listing events), in which case the mid-loop check degrades to
+	// attemptsSinceReset exactly as it did before this baseline existed.
+	var eventBaseline int
+	var haveEventBaseline bool
 	// resetFailed goes true the first time resetEventBurst fails and stays
 	// true for the rest of the run. A failed reset leaves the controller's
 	// in-process event-spam-filter burst unrefreshed, so every evidence
@@ -759,10 +769,21 @@ func (r *Runner) RunTests(m *manifest.Manifest) ([]TestResult, []UnchangedAssert
 	// count failure in this package — proceed without resetting rather
 	// than block the run on a count this method was never guaranteed to
 	// get.
-	if preExisting, preErr := r.countUpdateEvents(m.Kind, m.Name, m.Namespace, m.APIVersion); preErr == nil && preExisting >= eventBurstCeiling {
-		if err := r.resetEventBurst(); err != nil {
-			fmt.Fprintf(os.Stderr, "    warning: resetting controller event burst (pre-run, %d pre-existing events): %v\n", preExisting, err)
-			resetFailed = true
+	if preExisting, preErr := r.countUpdateEvents(m.Kind, m.Name, m.Namespace, m.APIVersion); preErr == nil {
+		eventBaseline = preExisting
+		haveEventBaseline = true
+		if preExisting >= eventBurstCeiling {
+			if err := r.resetEventBurst(); err != nil {
+				fmt.Fprintf(os.Stderr, "    warning: resetting controller event burst (pre-run, %d pre-existing events): %v\n", preExisting, err)
+				resetFailed = true
+			}
+			// A restart discards the controller's in-process burst
+			// state, not the Event objects already recorded against
+			// this resource — countUpdateEvents keeps summing every
+			// one of them, old and new, for the rest of the run (see
+			// its doc comment). preExisting therefore remains the
+			// correct baseline to measure NEW growth against
+			// regardless of whether the reset itself succeeded.
 		}
 	}
 
@@ -780,18 +801,45 @@ func (r *Runner) RunTests(m *manifest.Manifest) ([]TestResult, []UnchangedAssert
 		// would be exhausted, rather than reacting after the fact — once a
 		// burst is spent, the dropped events are gone for good (see
 		// eventBurstCeiling), so there is nothing to "catch up" on the next
-		// field. A failed reset does not abort the run: attemptsSinceReset
+		// field. attemptsSinceReset alone assumes exactly one event per
+		// field-test attempt; measured live (ServicePolicyRule, several
+		// attempts producing 3 events each) that assumption undercounts,
+		// so the real burst can already be spent while attemptsSinceReset
+		// is still well short of eventBurstCeiling — the four fields
+		// tested right after that point come back NOT-EVIDENCED with no
+		// EvidenceUntrusted flag, because resetEventBurst is never even
+		// attempted for them. Re-measuring the actual count here and
+		// comparing its growth since the last reset (eventBaseline) to
+		// the same ceiling closes that gap; attemptsSinceReset remains
+		// the fallback trigger for the one case a real measurement can't
+		// cover — countUpdateEvents itself failing (e.g. RBAC denies
+		// listing events).
+		//
+		// A failed reset does not abort the run: attemptsSinceReset
 		// still clears so the runner does not retry the restart before
 		// every remaining field, and later fields simply lose the
 		// burst-avoidance benefit rather than the whole run. The run's
 		// reported verdict is degraded instead — see resetFailed and
 		// EvidenceUntrusted.
-		if attemptsSinceReset >= eventBurstCeiling {
+		shouldReset := attemptsSinceReset >= eventBurstCeiling
+		current, curErr := r.countUpdateEvents(m.Kind, m.Name, m.Namespace, m.APIVersion)
+		if curErr == nil && haveEventBaseline && current-eventBaseline >= eventBurstCeiling {
+			shouldReset = true
+		}
+		if shouldReset {
 			if err := r.resetEventBurst(); err != nil {
 				fmt.Fprintf(os.Stderr, "    warning: resetting controller event burst: %v\n", err)
 				resetFailed = true
 			}
 			attemptsSinceReset = 0
+			// Re-baseline against the measurement taken above — the
+			// restart does not change the already-recorded event
+			// total (see the pre-loop comment above), so this stays
+			// accurate whether or not the reset itself succeeded.
+			if curErr == nil {
+				eventBaseline = current
+				haveEventBaseline = true
+			}
 		}
 
 		var result TestResult

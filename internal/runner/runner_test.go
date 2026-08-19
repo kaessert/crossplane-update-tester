@@ -139,6 +139,15 @@ type fakeCluster struct {
 	// and atProvider still converges, but no event is ever recorded — the
 	// "update not evidenced" scenario.
 	recordUpdateEvent bool
+	// eventsPerPatch, when non-zero, is how many update events a single
+	// field-test patch produces — standing in for a controller whose
+	// Update() path emits more than one UpdatedExternalResource/
+	// CannotUpdateExternalResource event per logical field-test attempt
+	// (retry/backoff cycles, late-init settling), the exact shape measured
+	// live on ServicePolicyRule (3 events for several attempts). Left at
+	// the default 0, handlePatch treats it as 1 — one event per patch,
+	// which is every pre-existing test's assumption.
+	eventsPerPatch int32
 	// eventBudget caps how many events a single controller "process" (the
 	// stretch between restart() calls) accumulates before further
 	// increments are silently dropped — simulating client-go's in-process
@@ -470,8 +479,18 @@ func (f *fakeCluster) handlePatch(args []string) (string, error) {
 			f.generations = append(f.generations, 0)
 		}
 		idx := len(f.generations) - 1
-		if f.eventBudget <= 0 || f.generations[idx] < f.eventBudget {
-			f.generations[idx]++
+		perPatch := f.eventsPerPatch
+		if perPatch <= 0 {
+			perPatch = 1
+		}
+		// Each of the perPatch events is subject to the same per-generation
+		// budget individually — mirroring a real spam filter, which drops
+		// events past its burst ceiling one at a time rather than refusing
+		// an entire multi-event write in one shot.
+		for i := int32(0); i < perPatch; i++ {
+			if f.eventBudget <= 0 || f.generations[idx] < f.eventBudget {
+				f.generations[idx]++
+			}
 		}
 	}
 	return "", nil
@@ -1477,6 +1496,64 @@ func TestRunTestsResetsEventBurstBeforeCeiling(t *testing.T) {
 	// that restart() was called with no effect on the outcome.
 	if len(f.generations) < 2 {
 		t.Errorf("expected events to span at least 2 controller generations, got %d: %v", len(f.generations), f.generations)
+	}
+}
+
+// TestRunTestsMidLoopResetAccountsForMultiEventAttempts is the regression
+// covering a mid-run undercount that the ceiling-crossing test above does
+// not exercise: attemptsSinceReset assumes exactly one update event per
+// field-test attempt, incrementing by 1 regardless of how many events the
+// patch actually produced. Measured live on ServicePolicyRule, several
+// attempts produced 3 events each (the aggregated count climbed
+// 12 → 15 → 18 → 21 → 24), so the real burst was already exhausted while
+// attemptsSinceReset was still only at 17 — short of eventBurstCeiling —
+// and the mid-loop reset never fired for the fields run in between. Those
+// fields came back NOT-EVIDENCED with no EvidenceUntrusted flag: the false
+// failure was silent, not merely degraded.
+//
+// eventsPerPatch: 3 with only numFields: 10 reproduces the same shape at a
+// much smaller scale: three events per attempt crosses eventBurstCeiling
+// (20) by the 8th field, while attemptsSinceReset (incrementing by 1 per
+// attempt) would not reach the ceiling until the 21st — so a run this
+// short can only pass if RunTests resets on the REAL measured count, not
+// on attemptsSinceReset alone.
+func TestRunTestsMidLoopResetAccountsForMultiEventAttempts(t *testing.T) {
+	const numFields = 10
+	f := &fakeCluster{
+		forProvider:       map[string]interface{}{testFieldNotifyDelay: float64(0)},
+		atProvider:        map[string]interface{}{testFieldNotifyDelay: float64(0)},
+		generation:        1,
+		kind:              testKindExample,
+		name:              testNameExample,
+		recordUpdateEvent: true,
+		eventsPerPatch:    3,
+		eventBudget:       eventBurstCeiling,
+	}
+	r := newFakeRunner(f)
+
+	m := manifestWithSequentialFieldTests(numFields)
+	results, _, err := r.RunTests(m)
+	if err != nil {
+		t.Fatalf("RunTests: unexpected error: %v", err)
+	}
+	if len(results) != numFields {
+		t.Fatalf("got %d results, want %d", len(results), numFields)
+	}
+
+	for i, res := range results {
+		if res.NotEvidenced {
+			t.Errorf("field %d (%s): got NotEvidenced=true, want evidenced — a mid-loop reset driven by the real event count, not attemptsSinceReset alone, should have earned a fresh burst before the real ceiling was crossed (err: %v)", i, res.Field, res.Error)
+		}
+		if !res.Passed {
+			t.Errorf("field %d (%s): got Passed=false, want true (err: %v)", i, res.Field, res.Error)
+		}
+	}
+
+	// attemptsSinceReset alone never reaches eventBurstCeiling across only
+	// 10 fields, so any restart recorded here is proof the trigger came
+	// from the real measured count, not the 1-per-attempt estimate.
+	if f.restartCalls == 0 {
+		t.Error("expected a mid-run controller restart driven by the real event count crossing the ceiling before attemptsSinceReset ever would")
 	}
 }
 

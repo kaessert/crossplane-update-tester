@@ -416,7 +416,7 @@ func cmdValidate(args []string) error {
 	result := validator.ValidateManifest(m, fields)
 	validator.PrintValidation(result)
 
-	findings := validator.CheckObservability(opts.typesFile, fields, m.Tests)
+	findings := validator.CheckObservability(opts.typesFile, m.Kind, fields, m.Tests)
 	validator.PrintObservability(findings)
 
 	siblingFindings := validator.CheckMergePatchSiblings(m)

@@ -50,8 +50,10 @@ type IncompleteExpectationFinding struct {
 //     scalars, a map, or a cross-package type) — RFC 7386 replaces a
 //     scalar or a list wholesale, so there is no per-member omission hazard
 //     to detect for either
-//   - a nested type whose "<Type>Observation" companion struct cannot be
-//     resolved (see resolveObservationFields)
+//   - a nested type whose Observation-side shape cannot be resolved at all
+//     — neither its "<Type>Observation" companion struct, nor a field of
+//     the same name declared on "<kind>Observation" itself (see
+//     resolveObservationFieldsForKindField)
 //   - a member key that CheckMergePatchSiblings' own survivingSiblingKeys
 //     would independently flag for the SAME entry — that finding already
 //     names the identical remedy (an expect: block, or an explicit null)
@@ -86,7 +88,7 @@ func CheckIncompleteExpectations(typesPath string, paramFields []FieldInfo, m *m
 			continue
 		}
 
-		obsFields := resolveObservationFields(typesPath, elemType, obsCache)
+		obsFields := resolveObservationFieldsForKindField(typesPath, m.Kind, t.Field, elemType, obsCache)
 		if obsFields == nil {
 			continue
 		}
@@ -143,8 +145,11 @@ func mergePatchSiblingKeySet(forProvider map[string]interface{}, t manifest.Upda
 }
 
 // incompleteExpectationKeys returns the sorted, deduplicated set of
-// non-omitempty Observation member names absent from every object in
-// effObjs, excluding any key already present in alreadyReported.
+// non-omitempty Observation member names absent from ANY object in
+// effObjs (a member missing from even one list element is unsatisfiable for
+// that element's own read-back, since every non-omitempty member marshals
+// on every element independently), excluding any key already present in
+// alreadyReported.
 func incompleteExpectationKeys(obsFields []FieldInfo, effObjs []map[string]interface{}, alreadyReported map[string]bool) []string {
 	bad := make(map[string]bool)
 	for _, f := range obsFields {

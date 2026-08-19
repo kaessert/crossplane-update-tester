@@ -41,14 +41,15 @@ type ObservabilityFinding struct {
 //   - a scalar expectation, or one whose declared Go type is not a locally
 //     resolvable struct (a builtin, a map, or a cross-package type such as
 //     "xpv2.NamespacedReference" this checker cannot inspect the shape of)
-//   - a nested type whose "<Type>Observation" companion struct cannot be
-//     found in typesPath or any of its "zz_*_types.go" siblings (see
-//     resolveObservationFields)
+//   - a nested type whose Observation-side shape cannot be resolved at all
+//     — neither its "<Type>Observation" companion struct, nor a field of
+//     the same name declared on "<kind>Observation" itself (see
+//     resolveObservationFieldsForKindField)
 //
 // A false positive here would push implementers toward blanket "skip:"
 // entries, which is the outcome the coverage campaign this check supports
 // exists to prevent.
-func CheckObservability(typesPath string, paramFields []FieldInfo, tests []manifest.UpdateTest) []ObservabilityFinding {
+func CheckObservability(typesPath, kind string, paramFields []FieldInfo, tests []manifest.UpdateTest) []ObservabilityFinding {
 	byJSON := make(map[string]FieldInfo, len(paramFields))
 	for _, f := range paramFields {
 		byJSON[f.JSONName] = f
@@ -75,9 +76,13 @@ func CheckObservability(typesPath string, paramFields []FieldInfo, tests []manif
 			continue
 		}
 
-		obsKeys := resolveObservationKeys(typesPath, elemType, obsCache)
-		if obsKeys == nil {
+		obsFields := resolveObservationFieldsForKindField(typesPath, kind, t.Field, elemType, obsCache)
+		if obsFields == nil {
 			continue
+		}
+		obsKeys := make(map[string]bool, len(obsFields))
+		for _, f := range obsFields {
+			obsKeys[f.JSONName] = true
 		}
 
 		effective := t.Expect
@@ -106,20 +111,100 @@ func CheckObservability(typesPath string, paramFields []FieldInfo, tests []manif
 // "tried and unresolvable" so a repeated miss doesn't re-search either.
 type observationFieldCache map[string][]FieldInfo
 
-// resolveObservationKeys returns the set of top-level JSON field names
-// declared on "<elemType>Observation", via resolveObservationFields. A nil
-// return means the struct could not be resolved.
-func resolveObservationKeys(typesPath, elemType string, cache observationFieldCache) map[string]bool {
-	fields := resolveObservationFields(typesPath, elemType, cache)
-	if fields == nil {
+// resolveObservationFieldsForKindField resolves the Observation-side struct
+// fields for a TOP-LEVEL Parameters field of kind, named jsonName, whose
+// Parameters-side element type is elemType. It tries the name-mangled
+// "<elemType>Observation" fast path first, via resolveObservationFields —
+// correct and unchanged for a generator layout that emits a distinct
+// Observation companion struct (e.g. ViewsOriginPoolWithWeightObservation).
+//
+// When that fails, it falls back to reading the ACTUAL declared Go type of
+// the field named jsonName on "<kind>Observation" itself, and resolves
+// THAT type's own fields directly — handling a generator layout that
+// reuses the identical struct on both sides of a field with no separate
+// Observation companion at all (provider-f5xc's PolicyMatcherTypeBasic,
+// referenced unchanged from both ServicePolicyRuleParameters.DomainMatcher
+// and ServicePolicyRuleObservation.DomainMatcher).
+//
+// Resolving via the field "<kind>Observation" ACTUALLY declares — rather
+// than a blind "fall back to elemType when <elemType>Observation is
+// missing" — is what lets a field genuinely ABSENT from "<kind>Observation"
+// (never observed at all) stay unresolved instead of incorrectly matching a
+// same-named Parameters-only struct that happens to still parse: a plain
+// bare-name fallback cannot tell "reused" apart from "not observed at all",
+// since both leave "<elemType>Observation" unresolvable.
+func resolveObservationFieldsForKindField(typesPath, kind, jsonName, elemType string, cache observationFieldCache) []FieldInfo {
+	if fields := resolveObservationFields(typesPath, elemType, cache); fields != nil {
+		return fields
+	}
+
+	cacheKey := "field-reuse:" + kind + "." + jsonName
+	if fields, cached := cache[cacheKey]; cached {
+		return fields
+	}
+
+	declaredType, ok := resolveKindObservationFieldType(typesPath, kind, jsonName, cache)
+	if !ok {
+		cache[cacheKey] = nil
 		return nil
 	}
 
-	keys := make(map[string]bool, len(fields))
-	for _, f := range fields {
-		keys[f.JSONName] = true
+	fields, err := ParseStructFields(typesPath, declaredType)
+	if err != nil {
+		fields, err = resolveInSiblingTypesFiles(typesPath, declaredType)
 	}
-	return keys
+	if err != nil {
+		cache[cacheKey] = nil
+		return nil
+	}
+
+	cache[cacheKey] = fields
+	return fields
+}
+
+// resolveKindObservationFieldType returns the raw declared struct type name
+// (already unwrapped of its "[]"/"*" prefixes via structElemType, e.g.
+// "PolicyMatcherTypeBasic") of the field named jsonName on
+// "<kind>Observation", via resolveKindObservationFields. A false return
+// means either "<kind>Observation" could not be resolved anywhere searched,
+// it declares no field named jsonName, or that field's declared type is not
+// a locally-resolvable struct — all three report as "cannot determine", the
+// same conservative outcome the rest of this package holds to.
+func resolveKindObservationFieldType(typesPath, kind, jsonName string, cache observationFieldCache) (string, bool) {
+	for _, f := range resolveKindObservationFields(typesPath, kind, cache) {
+		if f.JSONName == jsonName {
+			return structElemType(f.GoType)
+		}
+	}
+	return "", false
+}
+
+// resolveKindObservationFields returns the fields declared on
+// "<kind>Observation" — the resource's own top-level Observation struct,
+// not a nested one — resolved first in typesPath and, failing that, in
+// every "zz_*_types.go" sibling file in the same directory, the same
+// sibling-file fallback resolveObservationFields applies to a nested
+// struct. Cached under a "kindobs:" key namespace that cannot collide with
+// a plain elemType cache entry, since a locally-resolvable struct name
+// never starts with a lowercase letter (see stripToStructName).
+func resolveKindObservationFields(typesPath, kind string, cache observationFieldCache) []FieldInfo {
+	cacheKey := "kindobs:" + kind
+	if fields, cached := cache[cacheKey]; cached {
+		return fields
+	}
+
+	structName := kind + "Observation"
+	fields, err := ParseStructFields(typesPath, structName)
+	if err != nil {
+		fields, err = resolveInSiblingTypesFiles(typesPath, structName)
+	}
+	if err != nil {
+		cache[cacheKey] = nil
+		return nil
+	}
+
+	cache[cacheKey] = fields
+	return fields
 }
 
 // resolveObservationFields returns the fields declared on

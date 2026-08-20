@@ -509,6 +509,9 @@ func parseConvergeArgs(args []string) (convergeOptions, error) {
 	if *ignoreFields != "" {
 		ignore = strings.Split(*ignoreFields, ",")
 	}
+	if err := manifest.ValidateIgnoreFields(ignore); err != nil {
+		return convergeOptions{}, err
+	}
 	return convergeOptions{
 		manifestPath:     fs.Arg(0),
 		pollInterval:     *pollInterval,
@@ -651,6 +654,9 @@ func parseConvergeAllArgs(args []string) (convergeAllOptions, error) {
 		if f = strings.TrimSpace(f); f != "" {
 			ignore = append(ignore, f)
 		}
+	}
+	if err := manifest.ValidateIgnoreFields(ignore); err != nil {
+		return convergeAllOptions{}, err
 	}
 	return convergeAllOptions{
 		manifestPaths:    paths,

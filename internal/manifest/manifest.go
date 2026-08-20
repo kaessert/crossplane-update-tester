@@ -247,13 +247,13 @@ func manifestFromDoc(doc manifestDoc) (*Manifest, error) {
 // status.atProvider field names rather than dot-separated paths — see
 // Manifest.IgnoreFields for what a convergence check does with it. A dotted
 // entry is rejected here, at parse time, rather than silently excluding
-// nothing: see validateIgnoreFields.
+// nothing: see ValidateIgnoreFields.
 func ParseAnnotation(annotation string) ([]UpdateTest, string, []string, []string, error) {
 	rest, convergeSkip, assertUnchanged, ignoreFields, err := extractDirectives(annotation)
 	if err != nil {
 		return nil, "", nil, nil, fmt.Errorf("parsing directives: %w", err)
 	}
-	if err := validateIgnoreFields(ignoreFields); err != nil {
+	if err := ValidateIgnoreFields(ignoreFields); err != nil {
 		return nil, "", nil, nil, err
 	}
 
@@ -326,9 +326,9 @@ func extractDirectives(annotation string) (rest string, convergeSkip string, ass
 	return strings.Join(kept, "\n"), convergeSkip, assertUnchanged, ignoreFields, nil
 }
 
-// validateIgnoreFields rejects a dot-separated entry in the "ignore-fields:"
-// directive at parse time, before any cluster is touched. The convergence
-// diff (differ.DiffSnapshotsExcluding) matches an exclusion only against a
+// ValidateIgnoreFields rejects a dot-separated entry in an ignore-fields set
+// at parse time, before any cluster is touched. The convergence diff
+// (differ.DiffSnapshotsExcluding) matches an exclusion only against a
 // TOP-LEVEL status.atProvider key, so a dotted entry like
 // "ruleChoice.legacyRuleList" would otherwise parse cleanly, reach
 // ConvergeOptions.IgnoreFields, match nothing, and let the check fail on
@@ -336,7 +336,14 @@ func extractDirectives(annotation string) (rest string, convergeSkip string, ass
 // pointing at why. Mirrors the shape of the assert-unchanged baseline
 // rejection: name the offending path and say what is wrong with it, rather
 // than let it read as a silent no-op.
-func validateIgnoreFields(fields []string) error {
+//
+// Exported so every source of an ignore-fields set shares this one check —
+// the "ignore-fields:" manifest directive (via ParseAnnotation above), and
+// the --ignore-fields flag on both `converge` and `converge-all` (main.go),
+// which is also how the UPDATE_TESTER_IGNORE_FIELDS hook environment
+// variable reaches validation, since the hook forwards it into `converge`'s
+// own flag rather than parsing it separately.
+func ValidateIgnoreFields(fields []string) error {
 	for _, f := range fields {
 		if strings.Contains(f, ".") {
 			return fmt.Errorf(

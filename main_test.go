@@ -843,6 +843,130 @@ func TestFlagAfterPositionalTakesEffect(t *testing.T) {
 	})
 }
 
+// TestParseConvergeArgsRejectsDottedIgnoreField pins the flag-sourced half of
+// the ignore-fields validation fix: manifest.ValidateIgnoreFields already
+// rejected a dotted entry in the manifest's own "ignore-fields:" directive,
+// but before this the --ignore-fields FLAG on `converge` — the path every
+// provider in the fleet actually uses today — let the identical entry
+// through silently, reached runner.ConvergeOptions.IgnoreFields, matched no
+// top-level status.atProvider key in the diff, and produced the same
+// "converge fails on drift you believed you excluded" outcome with no
+// diagnostic. This is also the path UPDATE_TESTER_IGNORE_FIELDS reaches via
+// hookStepArgs (see TestHookConvergeIgnoreFieldsRejectsDottedEntry below),
+// so fixing parseConvergeArgs fixes both entry points at once.
+func TestParseConvergeArgsRejectsDottedIgnoreField(t *testing.T) {
+	const path = "/repo/examples/example-resource/example-resource.yaml"
+
+	cases := map[string]struct {
+		reason        string
+		args          []string
+		wantErrSubstr string
+	}{
+		"SingleDottedEntry": {
+			reason:        "a nested path passed via --ignore-fields is rejected, naming the offending entry",
+			args:          []string{"--ignore-fields", "ruleChoice.legacyRuleList", path},
+			wantErrSubstr: `ignore-fields entry "ruleChoice.legacyRuleList"`,
+		},
+		"DottedEntryAmongValidOnes": {
+			reason:        "one bad entry in a comma-separated --ignore-fields list is still caught, even alongside otherwise-valid top-level names",
+			args:          []string{"--ignore-fields", "latestBackup,ruleChoice.legacyRuleList,kvm", path},
+			wantErrSubstr: `ignore-fields entry "ruleChoice.legacyRuleList"`,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := parseConvergeArgs(tc.args)
+			if err == nil {
+				t.Fatalf("%s: parseConvergeArgs(%q) error = nil, want an error rejecting the dotted ignore-fields entry", tc.reason, tc.args)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrSubstr) {
+				t.Errorf("%s: parseConvergeArgs(%q) error = %q, want it to contain %q", tc.reason, tc.args, err.Error(), tc.wantErrSubstr)
+			}
+		})
+	}
+
+	// A valid, non-dotted --ignore-fields still parses cleanly — the fix
+	// must not reject the flag entirely.
+	got, err := parseConvergeArgs([]string{"--ignore-fields", "latestBackup", path})
+	if err != nil {
+		t.Fatalf("parseConvergeArgs with a valid top-level field: %v", err)
+	}
+	if !reflect.DeepEqual(got.ignoreFields, []string{"latestBackup"}) {
+		t.Errorf("parseConvergeArgs valid --ignore-fields = %#v, want [latestBackup]", got.ignoreFields)
+	}
+}
+
+// TestParseConvergeAllArgsRejectsDottedIgnoreField is the same fix, pinned
+// against converge-all's own --ignore-fields flag (the fleet-wide default
+// unioned onto each target's manifest — see convergeAllOptions).
+func TestParseConvergeAllArgsRejectsDottedIgnoreField(t *testing.T) {
+	const path = "/repo/examples/example-resource/example-resource.yaml"
+
+	cases := map[string]struct {
+		reason        string
+		args          []string
+		wantErrSubstr string
+	}{
+		"SingleDottedEntry": {
+			reason:        "a nested path passed via converge-all's --ignore-fields is rejected, naming the offending entry",
+			args:          []string{"--ignore-fields", "ruleChoice.legacyRuleList", path},
+			wantErrSubstr: `ignore-fields entry "ruleChoice.legacyRuleList"`,
+		},
+		"DottedEntryAmongValidOnes": {
+			reason:        "one bad entry in a comma-separated list is still caught, even alongside otherwise-valid top-level names",
+			args:          []string{"--ignore-fields", "status,ruleChoice.legacyRuleList", path},
+			wantErrSubstr: `ignore-fields entry "ruleChoice.legacyRuleList"`,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := parseConvergeAllArgs(tc.args)
+			if err == nil {
+				t.Fatalf("%s: parseConvergeAllArgs(%q) error = nil, want an error rejecting the dotted ignore-fields entry", tc.reason, tc.args)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrSubstr) {
+				t.Errorf("%s: parseConvergeAllArgs(%q) error = %q, want it to contain %q", tc.reason, tc.args, err.Error(), tc.wantErrSubstr)
+			}
+		})
+	}
+
+	got, err := parseConvergeAllArgs([]string{"--ignore-fields", "status", path})
+	if err != nil {
+		t.Fatalf("parseConvergeAllArgs with a valid top-level field: %v", err)
+	}
+	if !reflect.DeepEqual(got.ignoreFields, []string{"status"}) {
+		t.Errorf("parseConvergeAllArgs valid --ignore-fields = %#v, want [status]", got.ignoreFields)
+	}
+}
+
+// TestHookConvergeIgnoreFieldsRejectsDottedEntry proves the third entry
+// point named in the fix's acceptance criteria: UPDATE_TESTER_IGNORE_FIELDS
+// reaches validation too, because the hook never parses the env var itself —
+// it forwards it into `converge`'s own --ignore-fields flag via
+// hookStepArgs, and runCommand("converge", ...) dispatches straight into
+// cmdConverge -> parseConvergeArgs. Round-tripping hookStepArgs' own output
+// back through parseConvergeArgs is therefore a faithful reproduction of
+// what cmdHook actually does at runtime, without needing a live cluster.
+func TestHookConvergeIgnoreFieldsRejectsDottedEntry(t *testing.T) {
+	const path = "/repo/examples/example-resource/example-resource.yaml"
+
+	env := hookEnv{ignoreFields: []string{"latestBackup", "ruleChoice.legacyRuleList"}}
+	step := hookStep{banner: "post-update converge", command: "converge"}
+
+	args := hookStepArgs(step, path, env)
+
+	_, err := parseConvergeArgs(args)
+	if err == nil {
+		t.Fatalf("parseConvergeArgs(%q) (from hookStepArgs with a dotted UPDATE_TESTER_IGNORE_FIELDS entry) error = nil, want an error", args)
+	}
+	wantErrSubstr := `ignore-fields entry "ruleChoice.legacyRuleList"`
+	if !strings.Contains(err.Error(), wantErrSubstr) {
+		t.Errorf("parseConvergeArgs(%q) error = %q, want it to contain %q", args, err.Error(), wantErrSubstr)
+	}
+}
+
 func TestParseArgsRequiresItsPositional(t *testing.T) {
 	tests := []struct {
 		name  string

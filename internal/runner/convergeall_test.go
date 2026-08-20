@@ -1,0 +1,205 @@
+package runner
+
+import (
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/kaessert/crossplane-update-tester/internal/manifest"
+)
+
+// TestConvergeAllDeadlineAnchorsOnLastBaseline pins the correctness property
+// the whole barrier rests on.
+//
+// Arming is not instantaneous and not uniform: each target waits for its own
+// generation to settle and for its own Ready condition, so baselines land at
+// different times. If the shared window were anchored on the FIRST baseline
+// (or on the moment the barrier started), every target armed later than that
+// would observe LESS than pollInterval*1.5 — silently weakening the check
+// into one that can miss a reconcile cycle entirely, while still reporting a
+// confident pass. Anchoring on the LAST baseline is what makes the shared
+// window at least as strong as a private one for every participant.
+func TestConvergeAllDeadlineAnchorsOnLastBaseline(t *testing.T) {
+	base := time.Now()
+	opts := ConvergeOptions{PollInterval: 10 * time.Second} // window = 15s
+
+	baselines := []*convergeBaseline{
+		{ArmedAt: base},                       // armed first
+		{ArmedAt: base.Add(30 * time.Second)}, // armed 30s later
+		{ArmedAt: base.Add(5 * time.Second)},
+	}
+	targets := []ConvergeTarget{{Opts: opts}, {Opts: opts}, {Opts: opts}}
+
+	deadline, armed := convergeAllDeadline(targets, baselines)
+
+	if armed != 3 {
+		t.Fatalf("armed = %d, want 3", armed)
+	}
+	want := base.Add(30 * time.Second).Add(15 * time.Second)
+	if !deadline.Equal(want) {
+		t.Errorf("deadline = %v, want %v (last baseline + one window)", deadline, want)
+	}
+	// The property restated as the guarantee each participant actually
+	// needs, which is what a future edit must not break.
+	for i, b := range baselines {
+		if observed := deadline.Sub(b.ArmedAt); observed < convergeWait(opts) {
+			t.Errorf("target %d observed %s, want >= %s", i, observed, convergeWait(opts))
+		}
+	}
+}
+
+// TestConvergeAllDeadlineUsesLongestWindow proves the anchor also respects
+// the LONGEST per-target window, not the first one it encounters. Targets
+// may declare different poll intervals (a provider raising
+// UPDATE_TESTER_POLL_INTERVAL for one slow resource), and a window sized off
+// the wrong target short-changes the slow one.
+func TestConvergeAllDeadlineUsesLongestWindow(t *testing.T) {
+	base := time.Now()
+	targets := []ConvergeTarget{
+		{Opts: ConvergeOptions{PollInterval: 10 * time.Second}}, // 15s
+		{Opts: ConvergeOptions{PollInterval: 60 * time.Second}}, // 90s
+	}
+	baselines := []*convergeBaseline{{ArmedAt: base}, {ArmedAt: base}}
+
+	deadline, _ := convergeAllDeadline(targets, baselines)
+
+	if want := base.Add(90 * time.Second); !deadline.Equal(want) {
+		t.Errorf("deadline = %v, want %v (longest window wins)", deadline, want)
+	}
+}
+
+// TestConvergeAllSkippedTargetDoesNotOpenAWindow proves a fleet consisting
+// only of converge-skip resources costs no wait at all — the barrier must
+// not sleep for resources that are not being observed.
+func TestConvergeAllSkippedTargetDoesNotOpenAWindow(t *testing.T) {
+	f := &fakeCluster{generation: 1, readyAfterCalls: 1, atProvider: map[string]interface{}{"zone": "a"}}
+	r := newFakeRunner(f)
+	r.sleepFunc = func(time.Duration) {}
+
+	targets := []ConvergeTarget{{
+		Label:    "Skipped/one",
+		Runner:   r,
+		Manifest: &manifest.Manifest{Kind: testKindExample, Name: testNameExample, ConvergeSkip: "structurally cannot converge"},
+		Opts:     ConvergeOptions{PollInterval: 30 * time.Second},
+	}}
+
+	start := time.Now()
+	results := RunConvergeAll(targets, 4)
+	elapsed := time.Since(start)
+
+	if elapsed > time.Second {
+		t.Errorf("barrier slept %s for an all-skipped fleet; want no window at all", elapsed)
+	}
+	if len(results) != 1 || results[0].Result == nil || !results[0].Result.Skipped {
+		t.Fatalf("expected a single skipped result, got %+v", results)
+	}
+}
+
+// TestConvergeAllSharesOneWindow is the claim the change exists to make: N
+// resources cost ONE window, not N. It also proves each target still gets a
+// real verdict rather than a shortcut.
+func TestConvergeAllSharesOneWindow(t *testing.T) {
+	const (
+		n      = 6
+		poll   = 120 * time.Millisecond // window = 180ms
+		window = time.Duration(float64(poll) * 1.5)
+	)
+
+	targets := make([]ConvergeTarget, 0, n)
+	for range n {
+		f := &fakeCluster{
+			generation:      1,
+			readyAfterCalls: 1,
+			atProvider:      map[string]interface{}{"zone": "a"},
+		}
+		r := newFakeRunner(f)
+		r.sleepFunc = func(time.Duration) {}
+		targets = append(targets, ConvergeTarget{
+			Label:    "ExampleResource/x",
+			Runner:   r,
+			Manifest: &manifest.Manifest{Kind: testKindExample, Name: testNameExample},
+			Opts:     ConvergeOptions{PollInterval: poll, Timeout: time.Second, ReadinessTimeout: time.Second},
+		})
+	}
+
+	start := time.Now()
+	results := RunConvergeAll(targets, 4)
+	elapsed := time.Since(start)
+
+	// The serial form would cost n*window. Allow generous headroom for the
+	// arm/assert kubectl round trips; the point is the ORDER of magnitude,
+	// not a tight bound that would make this test flaky under load.
+	if serial := n * window; elapsed >= serial {
+		t.Errorf("barrier took %s, which is not better than the serial cost %s", elapsed, serial)
+	}
+	if elapsed < window {
+		t.Errorf("barrier took %s, less than one full window %s — the window was not actually observed", elapsed, window)
+	}
+
+	for i, res := range results {
+		if res.Err != nil {
+			t.Fatalf("target %d: unexpected error %v", i, res.Err)
+		}
+		if !res.Result.Passed {
+			t.Errorf("target %d: expected Passed, got %q %v", i, res.Result.Message, res.Result.Diagnostics)
+		}
+	}
+}
+
+// TestConvergeAllReportsPerTargetVerdicts proves one drifting resource is
+// reported as itself and does not contaminate the verdict of the others
+// sharing its window — the barrier aggregates results, it does not merge
+// them.
+func TestConvergeAllReportsPerTargetVerdicts(t *testing.T) {
+	newTarget := func(label string, drifting bool) ConvergeTarget {
+		f := &fakeCluster{
+			generation:      1,
+			readyAfterCalls: 1,
+			atProvider:      map[string]interface{}{"zone": "a"},
+		}
+		if drifting {
+			// An update-event count for THIS resource that grows between
+			// the baseline and outcome reads: the controller is issuing
+			// Update() calls, which is the genuine loop signal.
+			f.siblingKind = testKindExample
+			f.siblingName = testNameExample
+			f.siblingEventBase = 1
+			f.siblingEventGrowthPerCall = 5
+		}
+		r := newFakeRunner(f)
+		r.sleepFunc = func(time.Duration) {}
+		return ConvergeTarget{
+			Label:    label,
+			Runner:   r,
+			Manifest: &manifest.Manifest{Kind: testKindExample, Name: testNameExample},
+			Opts:     ConvergeOptions{PollInterval: time.Millisecond, Timeout: time.Second, ReadinessTimeout: time.Second},
+		}
+	}
+
+	results := RunConvergeAll([]ConvergeTarget{
+		newTarget("stable/one", false),
+		newTarget("drifting/two", true),
+		newTarget("stable/three", false),
+	}, 4)
+
+	if results[0].Result == nil || !results[0].Result.Passed {
+		t.Errorf("stable/one should pass, got %+v", results[0].Result)
+	}
+	if results[1].Result == nil || results[1].Result.Passed {
+		t.Errorf("drifting/two should fail, got %+v", results[1].Result)
+	}
+	if results[2].Result == nil || !results[2].Result.Passed {
+		t.Errorf("stable/three should pass, got %+v", results[2].Result)
+	}
+
+	summary, ok := FormatConvergeAllSummary(results)
+	if ok {
+		t.Error("summary reported ok despite a failing target")
+	}
+	if !strings.Contains(summary, "drifting/two") {
+		t.Errorf("summary does not name the failing target:\n%s", summary)
+	}
+	if !strings.Contains(summary, "2 passed, 1 failed") {
+		t.Errorf("summary tally wrong:\n%s", summary)
+	}
+}

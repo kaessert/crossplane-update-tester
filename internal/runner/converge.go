@@ -119,12 +119,61 @@ type ConvergeResult struct {
 //     unchanged, and Ready is still "True" (a readiness flap is reported as
 //     its own diagnostic, not folded into the atProvider diff).
 func (r *Runner) RunConverge(m *manifest.Manifest, opts ConvergeOptions) (*ConvergeResult, error) {
+	baseline, early, err := r.convergeArm(m, opts)
+	if err != nil {
+		return nil, err
+	}
+	if early != nil {
+		return early, nil
+	}
+
+	waitDur := convergeWait(opts)
+	time.Sleep(waitDur)
+
+	return r.convergeAssert(m, opts, baseline, waitDur)
+}
+
+// convergeWait is the observation window: long enough to guarantee at least
+// one full reconcile cycle has elapsed since the baseline was taken.
+func convergeWait(opts ConvergeOptions) time.Duration {
+	pollInterval := opts.PollInterval
+	if pollInterval <= 0 {
+		pollInterval = 60 * time.Second
+	}
+	return time.Duration(float64(pollInterval) * 1.5)
+}
+
+// convergeBaseline is everything convergeAssert needs to evaluate a
+// resource once the observation window has elapsed. ArmedAt is when the
+// baseline snapshot was actually taken, which is what a shared window must
+// be measured from — see RunConvergeAll.
+type convergeBaseline struct {
+	Snapshot []byte
+	Events   int
+	Gen      int64
+	Notes    []string
+	ArmedAt  time.Time
+}
+
+// convergeArm runs every step that must complete BEFORE the observation
+// window opens: the skip check, resource resolution, the generation-settle
+// and readiness gates, and the baseline snapshot.
+//
+// It returns either a baseline (window may open) or an early ConvergeResult
+// that is already the final verdict (converge-skip, or a generation that
+// never settled). Exactly one of the two is non-nil.
+//
+// This is split out of RunConverge so that the single-resource path and the
+// barrier path in RunConvergeAll share one implementation. The steps are
+// all reads: nothing here mutates the cluster or the backend, which is what
+// makes it safe to arm many resources concurrently.
+func (r *Runner) convergeArm(m *manifest.Manifest, opts ConvergeOptions) (*convergeBaseline, *ConvergeResult, error) {
 	if m.ConvergeSkip != "" {
-		return &ConvergeResult{Skipped: true, SkipMsg: m.ConvergeSkip}, nil
+		return nil, &ConvergeResult{Skipped: true, SkipMsg: m.ConvergeSkip}, nil
 	}
 
 	if err := r.ResolveResource(m); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	timeout := opts.Timeout
@@ -134,14 +183,14 @@ func (r *Runner) RunConverge(m *manifest.Manifest, opts ConvergeOptions) (*Conve
 
 	settled, gen, obsGen, err := r.waitGenerationSettled(timeout)
 	if err != nil {
-		return nil, fmt.Errorf("pre-check: %w", err)
+		return nil, nil, fmt.Errorf("pre-check: %w", err)
 	}
 	if !settled {
 		// Not a reconciliation loop: nothing has been observed to change
 		// repeatedly, the resource has simply never reached a settled
 		// generation within the timeout. See buildConvergeResult for the
 		// equivalent distinction on the post-wait path.
-		return &ConvergeResult{
+		return nil, &ConvergeResult{
 			Passed:  false,
 			Message: "RESOURCE NOT IN STEADY STATE",
 			Diagnostics: []string{
@@ -160,10 +209,10 @@ func (r *Runner) RunConverge(m *manifest.Manifest, opts ConvergeOptions) (*Conve
 	// gap here that reconcileOnce closes for the per-field update path.
 	synced, syncedStatus, syncedGen, syncedObsGen, err := r.waitSynced(timeout)
 	if err != nil {
-		return nil, fmt.Errorf("pre-check: %w", err)
+		return nil, nil, fmt.Errorf("pre-check: %w", err)
 	}
 	if !synced {
-		return &ConvergeResult{
+		return nil, &ConvergeResult{
 			Passed:  false,
 			Message: "RESOURCE NOT IN STEADY STATE",
 			Diagnostics: []string{
@@ -189,7 +238,7 @@ func (r *Runner) RunConverge(m *manifest.Manifest, opts ConvergeOptions) (*Conve
 	var notes []string
 	baselineReady, err := r.waitReady(readinessTimeout)
 	if err != nil {
-		return nil, fmt.Errorf("readiness pre-check: %w", err)
+		return nil, nil, fmt.Errorf("readiness pre-check: %w", err)
 	}
 	if !baselineReady {
 		// Proceed anyway: the field-level diagnostic below is never
@@ -201,16 +250,21 @@ func (r *Runner) RunConverge(m *manifest.Manifest, opts ConvergeOptions) (*Conve
 
 	before, beforeEvents, err := r.recordConvergeBaseline(m)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	pollInterval := opts.PollInterval
-	if pollInterval <= 0 {
-		pollInterval = 60 * time.Second
-	}
-	waitDur := time.Duration(float64(pollInterval) * 1.5)
-	time.Sleep(waitDur)
+	return &convergeBaseline{
+		Snapshot: before,
+		Events:   beforeEvents,
+		Gen:      gen,
+		Notes:    notes,
+		ArmedAt:  time.Now(),
+	}, nil, nil
+}
 
+// convergeAssert runs every step that must happen AFTER the observation
+// window has elapsed: the post-wait snapshot, the diff, and the verdict.
+func (r *Runner) convergeAssert(m *manifest.Manifest, opts ConvergeOptions, b *convergeBaseline, waitDur time.Duration) (*ConvergeResult, error) {
 	after, afterEvents, afterGen, afterReady, err := r.recordConvergeOutcome(m)
 	if err != nil {
 		return nil, err
@@ -223,12 +277,12 @@ func (r *Runner) RunConverge(m *manifest.Manifest, opts ConvergeOptions) (*Conve
 	logCalls, logLines, logErr := r.countUpdateLogCalls(m, waitDur)
 	logObs := updateLogObservation{Calls: logCalls, Lines: logLines, Err: logErr, Window: waitDur}
 
-	diff, err := differ.DiffSnapshotsExcluding(before, after, opts.IgnoreFields)
+	diff, err := differ.DiffSnapshotsExcluding(b.Snapshot, after, opts.IgnoreFields)
 	if err != nil {
 		return nil, fmt.Errorf("diff: %w", err)
 	}
 
-	return buildConvergeResult(diff, gen, afterGen, beforeEvents, afterEvents, afterReady, logObs, notes), nil
+	return buildConvergeResult(diff, b.Gen, afterGen, b.Events, afterEvents, afterReady, logObs, b.Notes), nil
 }
 
 // recordConvergeBaseline snapshots atProvider and the update-event count

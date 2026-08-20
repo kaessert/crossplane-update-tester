@@ -111,6 +111,8 @@ func runCommand(name string, args []string) error {
 		return cmdValidate(args)
 	case "converge":
 		return cmdConverge(args)
+	case "converge-all":
+		return cmdConvergeAll(args)
 	case "check-external-name-prefix":
 		return cmdCheckExternalNamePrefix(args)
 	case "resolve-recover":
@@ -130,6 +132,7 @@ func printUsage() {
 Usage:
   update-tester run <manifest.yaml> [--timeout 120] [--poll-interval 60s]
   update-tester converge <manifest.yaml> [--poll-interval 60s] [--ignore-fields a,b] [--timeout 120s] [--readiness-timeout 120s]
+  update-tester converge-all <m1.yaml,m2.yaml,...> [--poll-interval 60s] [--concurrency 8] [--timeout 120s] [--readiness-timeout 120s]
   update-tester validate <manifest.yaml> --types-file <types.go> [--controller-dir <dir>]
   update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
   update-tester resolve-recover <manifest.yaml> [--timeout 120]
@@ -143,6 +146,12 @@ Commands:
   validate   Check annotation coverage against Go type definitions
   converge   Assert the resource reaches steady state after creation
              with zero spurious Update calls
+  converge-all
+             The same assertion for many resources against ONE shared
+             observation window instead of one window each. Convergence
+             performs reads only, so the windows can be shared; the
+             result is both faster and strictly stronger, since every
+             resource is observed over the same stretch of wall clock.
   check-external-name-prefix
              Assert the live resource's crossplane.io/external-name
              annotation has the prefix declared by the manifest's
@@ -543,6 +552,117 @@ func printConvergeResult(w io.Writer, m *manifest.Manifest, r *runner.ConvergeRe
 	for _, d := range r.Diagnostics {
 		printfTo(w, "    - %s\n", d)
 	}
+}
+
+// ─── converge-all ─────────────────────────────────────────────────────────
+
+// convergeAllOptions holds the parsed command line of `converge-all`.
+//
+// There is deliberately no --ignore-fields here. That option is per-resource
+// (a Loadbalancer's forwardRules is meaningless to a Network), and a single
+// flag applied across a whole fleet would silently widen every resource's
+// exclusion set to the union of all of them — turning a targeted exclusion
+// into fleet-wide blindness, which is the exact failure convention 0033
+// warns about for converge-skip. A real implementation reads each manifest's
+// own exclusions; this POC carries none.
+type convergeAllOptions struct {
+	manifestPaths    []string
+	pollInterval     time.Duration
+	timeout          time.Duration
+	readinessTimeout time.Duration
+	concurrency      int
+	ignoreFields     []string
+}
+
+func parseConvergeAllArgs(args []string) (convergeAllOptions, error) {
+	fs := flag.NewFlagSet("converge-all", flag.ContinueOnError)
+	pollInterval := fs.Duration("poll-interval", 60*time.Second, "Provider poll interval; determines the shared window duration")
+	timeout := fs.Duration("timeout", 120*time.Second, "Max time for each pre-check to settle")
+	readinessTimeout := fs.Duration("readiness-timeout", 120*time.Second,
+		"Max time to wait for the Ready condition before each baseline snapshot")
+	concurrency := fs.Int("concurrency", 8, "Max resources armed or asserted at once")
+	// POC (converge-barrier): a FLEET-WIDE ignore set. This is lossless only
+	// where every resource in the case shares one set — true on f5xc, where
+	// UPDATE_TESTER_IGNORE_FIELDS is uniformly "status". On a provider with
+	// divergent per-target sets (vultr: latestBackup / ruleCount,dateModified
+	// / kvm,powerStatus,serverStatus) a single flag would union them into
+	// fleet-wide blindness, which is the open design fork.
+	ignoreFields := fs.String("ignore-fields", "", "Comma-separated atProvider fields excluded from the diff (fleet-wide)")
+	if err := fs.Parse(cli.ReorderArgs(fs, args)); err != nil {
+		return convergeAllOptions{}, err
+	}
+	if fs.NArg() < 1 {
+		return convergeAllOptions{}, errors.New(
+			"usage: update-tester converge-all <m1.yaml,m2.yaml,...> [--poll-interval 60s] [--concurrency 8]")
+	}
+
+	// Accept both a comma-separated list (matching the uptest CLI's
+	// UPTEST_INPUT_MANIFESTS convention the providers already use) and
+	// repeated positional arguments.
+	var paths []string
+	for _, arg := range fs.Args() {
+		for _, p := range strings.Split(arg, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				paths = append(paths, p)
+			}
+		}
+	}
+	var ignore []string
+	for _, f := range strings.Split(*ignoreFields, ",") {
+		if f = strings.TrimSpace(f); f != "" {
+			ignore = append(ignore, f)
+		}
+	}
+	return convergeAllOptions{
+		manifestPaths:    paths,
+		pollInterval:     *pollInterval,
+		timeout:          *timeout,
+		readinessTimeout: *readinessTimeout,
+		concurrency:      *concurrency,
+		ignoreFields:     ignore,
+	}, nil
+}
+
+func cmdConvergeAll(args []string) error {
+	opts, err := parseConvergeAllArgs(args)
+	if err != nil {
+		return err
+	}
+
+	targets := make([]runner.ConvergeTarget, 0, len(opts.manifestPaths))
+	for _, p := range opts.manifestPaths {
+		m, err := manifest.Parse(p)
+		if err != nil {
+			return fmt.Errorf("%s: %w", p, err)
+		}
+		targets = append(targets, runner.ConvergeTarget{
+			Label:    fmt.Sprintf("%s/%s", m.Kind, m.Name),
+			Runner:   runner.NewRunner(p, int(opts.timeout.Seconds())),
+			Manifest: m,
+			Opts: runner.ConvergeOptions{
+				PollInterval:     opts.pollInterval,
+				Timeout:          opts.timeout,
+				ReadinessTimeout: opts.readinessTimeout,
+				IgnoreFields:     opts.ignoreFields,
+			},
+		})
+	}
+
+	printfTo(os.Stdout, "Converge barrier: %d resource(s), one shared %s window\n",
+		len(targets), time.Duration(float64(opts.pollInterval)*1.5))
+
+	start := time.Now()
+	results := runner.RunConvergeAll(targets, opts.concurrency)
+	elapsed := time.Since(start)
+
+	summary, ok := runner.FormatConvergeAllSummary(results)
+	printfTo(os.Stdout, "%s", summary)
+	printfTo(os.Stdout, "barrier wall clock: %s\n", elapsed.Round(time.Millisecond))
+
+	if !ok {
+		return errors.New("one or more resources did not converge")
+	}
+	return nil
 }
 
 // ─── check-external-name-prefix ───────────────────────────────────────────

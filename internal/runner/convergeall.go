@@ -1,0 +1,194 @@
+package runner
+
+import (
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/kaessert/crossplane-update-tester/internal/manifest"
+)
+
+// ConvergeTarget is one resource participating in a shared convergence
+// window: the Runner that will observe it, its parsed manifest, the
+// per-resource options (IgnoreFields differ per resource), and a Label used
+// only for reporting.
+type ConvergeTarget struct {
+	Label    string
+	Runner   *Runner
+	Manifest *manifest.Manifest
+	Opts     ConvergeOptions
+}
+
+// ConvergeAllResult is one target's verdict. Exactly one of Result and Err
+// is non-nil: Err carries a failure to *evaluate* the resource (kubectl
+// error, unresolvable manifest), which is distinct from a ConvergeResult
+// whose Passed is false — a verdict the check reached successfully.
+type ConvergeAllResult struct {
+	Label  string
+	Result *ConvergeResult
+	Err    error
+}
+
+// defaultConvergeAllConcurrency bounds how many resources are armed or
+// asserted at once. Each step shells out to kubectl, so this is a cap on
+// concurrent processes rather than on anything the cluster experiences; the
+// API server handles far more, but an unbounded fan-out over a 65-resource
+// provider would spawn 65 processes per phase on a 5-vCPU nest.
+const defaultConvergeAllConcurrency = 8
+
+// RunConvergeAll evaluates every target against a SINGLE shared observation
+// window instead of giving each one its own.
+//
+// # Why this is not just an optimisation
+//
+// The serial form runs N independent windows back to back, so a provider
+// with N resources spends N * pollInterval * 1.5 asleep — for provider-vultr
+// (54 annotated manifests, two converge steps per post-assert hook) that is
+// 108 sequential waits. Every one of those waits is observing a DIFFERENT
+// stretch of wall-clock time, which is strictly weaker than observing one
+// common stretch: drift that only manifests when several controllers are
+// reconciling at once falls between the windows and is never seen.
+//
+// # Why it is safe
+//
+// convergeArm and convergeAssert perform reads only — kubectl get on the
+// resource and on its events. Neither mutates the cluster or the backend,
+// so no target can perturb another's observation, and the checks may be
+// interleaved freely. This is what distinguishes convergence from the
+// per-field update tests in RunTests, which patch the resource under test
+// and restart the provider Deployment, and therefore cannot share a window.
+//
+// # Why the window is measured from the LAST baseline
+//
+// Arming is not instantaneous: each target waits for its generation to
+// settle and for Ready, so baselines land at different times. The window
+// must satisfy every target's own guarantee of "at least one full reconcile
+// cycle since MY baseline", so it closes at
+//
+//	max(ArmedAt) + max(convergeWait(opts))
+//
+// Every target therefore observes at least its own required duration, and
+// all but the last observe strictly more. Taking the max of the per-target
+// waits (rather than assuming a single interval) keeps that guarantee when
+// targets declare different poll intervals.
+func RunConvergeAll(targets []ConvergeTarget, concurrency int) []ConvergeAllResult {
+	if concurrency <= 0 {
+		concurrency = defaultConvergeAllConcurrency
+	}
+
+	results := make([]ConvergeAllResult, len(targets))
+	baselines := make([]*convergeBaseline, len(targets))
+
+	// PHASE 1 — arm every target. A target that returns an early verdict
+	// (converge-skip, unsettled generation) or an error is recorded now and
+	// takes no part in the shared window.
+	forEachConcurrently(len(targets), concurrency, func(i int) {
+		t := targets[i]
+		results[i].Label = t.Label
+		b, early, err := t.Runner.convergeArm(t.Manifest, t.Opts)
+		switch {
+		case err != nil:
+			results[i].Err = err
+		case early != nil:
+			results[i].Result = early
+		default:
+			baselines[i] = b
+		}
+	})
+
+	// PHASE 2 — the barrier. One wait for the whole fleet.
+	deadline, armed := convergeAllDeadline(targets, baselines)
+	if armed == 0 {
+		return results
+	}
+	if d := time.Until(deadline); d > 0 {
+		time.Sleep(d)
+	}
+
+	// PHASE 3 — assert every armed target against the closed window.
+	forEachConcurrently(len(targets), concurrency, func(i int) {
+		if baselines[i] == nil {
+			return
+		}
+		t := targets[i]
+		// The observed window is this target's OWN elapsed time, not
+		// convergeWait: the barrier closes at max(ArmedAt)+maxWait, so a
+		// resource armed early was under observation for longer. Counting
+		// Update() log calls over a shorter window than was actually
+		// observed would under-report a loop on exactly those resources.
+		res, err := t.Runner.convergeAssert(t.Manifest, t.Opts, baselines[i], time.Since(baselines[i].ArmedAt))
+		if err != nil {
+			results[i].Err = err
+			return
+		}
+		results[i].Result = res
+	})
+
+	return results
+}
+
+// convergeAllDeadline returns the instant at which the shared window closes,
+// and how many targets are armed. See RunConvergeAll for why the deadline is
+// anchored on the latest baseline and the longest per-target wait.
+func convergeAllDeadline(targets []ConvergeTarget, baselines []*convergeBaseline) (deadline time.Time, armed int) {
+	var maxWait time.Duration
+	for i, b := range baselines {
+		if b == nil {
+			continue
+		}
+		armed++
+		if b.ArmedAt.After(deadline) {
+			deadline = b.ArmedAt
+		}
+		if w := convergeWait(targets[i].Opts); w > maxWait {
+			maxWait = w
+		}
+	}
+	return deadline.Add(maxWait), armed
+}
+
+// forEachConcurrently runs fn(0..n-1) with at most `limit` in flight. Each
+// fn writes only to its own index of the shared slices, so no further
+// synchronisation is needed.
+func forEachConcurrently(n, limit int, fn func(i int)) {
+	sem := make(chan struct{}, limit)
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			fn(i)
+		}(i)
+	}
+	wg.Wait()
+}
+
+// FormatConvergeAllSummary renders a one-line-per-target summary plus a
+// tally. Returns the text and whether every target passed.
+func FormatConvergeAllSummary(results []ConvergeAllResult) (text string, ok bool) {
+	var b []byte
+	pass, fail, skip, errs := 0, 0, 0, 0
+	for _, r := range results {
+		switch {
+		case r.Err != nil:
+			errs++
+			b = append(b, fmt.Sprintf("  ✗ %-40s ERROR: %v\n", r.Label, r.Err)...)
+		case r.Result.Skipped:
+			skip++
+			b = append(b, fmt.Sprintf("  ⊘ %-40s CONVERGE-SKIP: %s\n", r.Label, r.Result.SkipMsg)...)
+		case r.Result.Passed:
+			pass++
+			b = append(b, fmt.Sprintf("  ✓ %-40s %s\n", r.Label, r.Result.Message)...)
+		default:
+			fail++
+			b = append(b, fmt.Sprintf("  ✗ %-40s %s\n", r.Label, r.Result.Message)...)
+			for _, d := range r.Result.Diagnostics {
+				b = append(b, fmt.Sprintf("      %s\n", d)...)
+			}
+		}
+	}
+	b = append(b, fmt.Sprintf("\n%d passed, %d failed, %d skipped, %d errored\n", pass, fail, skip, errs)...)
+	return string(b), fail == 0 && errs == 0
+}

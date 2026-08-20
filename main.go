@@ -472,7 +472,7 @@ type convergeOptions struct {
 func parseConvergeArgs(args []string) (convergeOptions, error) {
 	fs := flag.NewFlagSet("converge", flag.ContinueOnError)
 	pollInterval := fs.Duration("poll-interval", 60*time.Second, "Provider poll interval; determines wait duration")
-	ignoreFields := fs.String("ignore-fields", "", "Comma-separated atProvider fields excluded from snapshot diff")
+	ignoreFields := fs.String("ignore-fields", "", "Comma-separated atProvider fields excluded from the snapshot diff (unioned with the manifest's own ignore-fields: directive)")
 	timeout := fs.Duration("timeout", 120*time.Second, "Max time for the pre-check to settle")
 	readinessTimeout := fs.Duration("readiness-timeout", 120*time.Second,
 		"Max time to wait for the Ready condition before the baseline snapshot; on timeout the check proceeds anyway")
@@ -497,6 +497,26 @@ func parseConvergeArgs(args []string) (convergeOptions, error) {
 	}, nil
 }
 
+// convergeOptionsFor builds the runner.ConvergeOptions for a single-resource
+// `converge` invocation, sourcing IgnoreFields from
+// mergeIgnoreFields(opts.ignoreFields, m.IgnoreFields) so the manifest's own
+// "ignore-fields:" directive is honoured on the hook path (hookSteps runs
+// `converge`, never `converge-all`, so before this the directive was read by
+// no code any provider's E2E run actually executes). opts.ignoreFields keeps
+// working exactly as before — the CLI flag (and, via hookStepArgs, the
+// UPDATE_TESTER_IGNORE_FIELDS environment variable) is still honoured, now
+// unioned with the manifest's own set instead of being the only source.
+// Split out from cmdConverge so it is testable without a live cluster —
+// nothing here executes a Runner, it only configures one.
+func convergeOptionsFor(opts convergeOptions, m *manifest.Manifest) runner.ConvergeOptions {
+	return runner.ConvergeOptions{
+		PollInterval:     opts.pollInterval,
+		IgnoreFields:     mergeIgnoreFields(opts.ignoreFields, m.IgnoreFields),
+		Timeout:          opts.timeout,
+		ReadinessTimeout: opts.readinessTimeout,
+	}
+}
+
 func cmdConverge(args []string) error {
 	opts, err := parseConvergeArgs(args)
 	if err != nil {
@@ -509,12 +529,7 @@ func cmdConverge(args []string) error {
 	}
 
 	r := runner.NewRunner(opts.manifestPath, int(opts.timeout.Seconds()))
-	result, err := r.RunConverge(m, runner.ConvergeOptions{
-		PollInterval:     opts.pollInterval,
-		IgnoreFields:     opts.ignoreFields,
-		Timeout:          opts.timeout,
-		ReadinessTimeout: opts.readinessTimeout,
-	})
+	result, err := r.RunConverge(m, convergeOptionsFor(opts, m))
 	if err != nil {
 		return err
 	}

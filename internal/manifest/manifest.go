@@ -73,7 +73,9 @@ type Manifest struct {
 	// Unlike AssertUnchanged, a dot-separated path is NOT supported here:
 	// differ.DiffSnapshotsExcluding matches the exclusion set against the
 	// top-level keys of the status.atProvider snapshot only, so a nested
-	// path excludes nothing.
+	// path would exclude nothing. Rather than accept that silently,
+	// ParseAnnotation rejects a dotted entry outright — every entry that
+	// reaches this slice is guaranteed to be a single top-level key.
 	//
 	// This exists because the fleet-wide `converge-all --ignore-fields` flag
 	// is lossy the moment two resources in the same run need different
@@ -243,11 +245,16 @@ func manifestFromDoc(doc manifestDoc) (*Manifest, error) {
 //
 // "ignore-fields" takes a comma-separated list too, but of TOP-LEVEL
 // status.atProvider field names rather than dot-separated paths — see
-// Manifest.IgnoreFields for what a convergence check does with it.
+// Manifest.IgnoreFields for what a convergence check does with it. A dotted
+// entry is rejected here, at parse time, rather than silently excluding
+// nothing: see validateIgnoreFields.
 func ParseAnnotation(annotation string) ([]UpdateTest, string, []string, []string, error) {
 	rest, convergeSkip, assertUnchanged, ignoreFields, err := extractDirectives(annotation)
 	if err != nil {
 		return nil, "", nil, nil, fmt.Errorf("parsing directives: %w", err)
+	}
+	if err := validateIgnoreFields(ignoreFields); err != nil {
+		return nil, "", nil, nil, err
 	}
 
 	rest = strings.TrimSpace(rest)
@@ -317,6 +324,28 @@ func extractDirectives(annotation string) (rest string, convergeSkip string, ass
 		}
 	}
 	return strings.Join(kept, "\n"), convergeSkip, assertUnchanged, ignoreFields, nil
+}
+
+// validateIgnoreFields rejects a dot-separated entry in the "ignore-fields:"
+// directive at parse time, before any cluster is touched. The convergence
+// diff (differ.DiffSnapshotsExcluding) matches an exclusion only against a
+// TOP-LEVEL status.atProvider key, so a dotted entry like
+// "ruleChoice.legacyRuleList" would otherwise parse cleanly, reach
+// ConvergeOptions.IgnoreFields, match nothing, and let the check fail on
+// drift the operator believed they had excluded — with no diagnostic
+// pointing at why. Mirrors the shape of the assert-unchanged baseline
+// rejection: name the offending path and say what is wrong with it, rather
+// than let it read as a silent no-op.
+func validateIgnoreFields(fields []string) error {
+	for _, f := range fields {
+		if strings.Contains(f, ".") {
+			return fmt.Errorf(
+				"ignore-fields entry %q: dot-separated paths are not supported — the convergence diff "+
+					"matches only a top-level status.atProvider field name, so a nested path would silently "+
+					"exclude nothing; declare the top-level field name instead", f)
+		}
+	}
+	return nil
 }
 
 // splitFieldList splits a comma-separated field-path list, trimming

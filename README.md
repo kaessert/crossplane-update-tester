@@ -561,8 +561,11 @@ particular resource, API, or backend.
 
 #### `ignore-fields:` — per-resource convergence exclusions
 
-A comma-separated list of `status.atProvider` field names excluded from a
-convergence check's snapshot diff, for THIS resource only:
+A comma-separated list of TOP-LEVEL `status.atProvider` field names excluded
+from a convergence check's snapshot diff, for THIS resource only. A
+dot-separated path is rejected at parse time rather than silently excluding
+nothing — the diff matches only a top-level key, so a nested path like
+`ruleChoice.legacyRuleList` would never match anything it excludes:
 
 ```yaml
 crossplane.io/update-test: |
@@ -583,9 +586,11 @@ exclusion here keeps it attached to the resource it describes:
 `converge-all` unions the flag's set onto each manifest's own directive
 rather than replacing it, so a field excluded here for one resource is never
 silently excluded for another sharing the same invocation. The single-resource
-`converge` command has no equivalent need — each invocation already covers
-exactly one manifest, so its own `--ignore-fields` flag is never shared across
-resources — and does not read this directive.
+`converge` command reads this directive too, unioning it with its own
+`--ignore-fields` flag the same way — this is the only path any provider's
+E2E hook actually runs (`hook` -> `converge`, never `converge-all`), so a
+directive that reached only `converge-all` would never take effect for a
+provider's real test run.
 
 Worked example:
 

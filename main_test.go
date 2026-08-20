@@ -1053,6 +1053,81 @@ func TestBuildConvergeTargetsUnionsFleetWideFlagOntoEachManifest(t *testing.T) {
 	}
 }
 
+// TestConvergeOptionsForSourcesManifestIgnoreFields pins the single-resource
+// counterpart to TestBuildConvergeTargetsSourcesIgnoreFieldsPerResource: the
+// hook path runs `hook` -> `converge` (cmdConverge), never `converge-all`, so
+// before this fix a manifest's own "ignore-fields:" directive was read by no
+// code any provider's E2E run actually executes — only the --ignore-fields
+// flag (and the UPDATE_TESTER_IGNORE_FIELDS environment variable forwarded
+// through it) took effect. convergeOptionsFor must now union both sources,
+// exactly as buildConvergeTargets already does for converge-all.
+func TestConvergeOptionsForSourcesManifestIgnoreFields(t *testing.T) {
+	dir := t.TempDir()
+	writeManifest := func(fileName, directiveLine string) string {
+		path := filepath.Join(dir, fileName)
+		yamlDoc := "apiVersion: network.example.crossplane.io/v1alpha1\n" +
+			"kind: Network\n" +
+			"metadata:\n" +
+			"  name: example-network\n"
+		if directiveLine != "" {
+			yamlDoc += "  annotations:\n" +
+				"    crossplane.io/update-test: |\n" +
+				"      " + directiveLine + "\n" +
+				"      - field: comment\n" +
+				"        value: \"updated\"\n"
+		}
+		if err := os.WriteFile(path, []byte(yamlDoc), 0o600); err != nil {
+			t.Fatalf("writing fixture manifest %s: %v", fileName, err)
+		}
+		return path
+	}
+
+	cases := map[string]struct {
+		reason        string
+		directiveLine string
+		flagIgnore    []string
+		want          []string
+	}{
+		"ManifestDirectiveOnlyNoFlag": {
+			reason:        "the common case: no --ignore-fields flag at all, only the manifest's own directive — this is the exact shape the hook path runs, and it used to configure IgnoreFields as nil",
+			directiveLine: "ignore-fields: latestBackup",
+			flagIgnore:    nil,
+			want:          []string{"latestBackup"},
+		},
+		"FlagOnlyNoManifestDirective": {
+			reason:     "a manifest that predates the directive still gets the flag's set — the pre-fix behaviour must not regress",
+			flagIgnore: []string{"status"},
+			want:       []string{"status"},
+		},
+		"BothPresentUnioned": {
+			reason:        "the flag and the manifest's own directive both apply — neither replaces the other",
+			directiveLine: "ignore-fields: latestBackup",
+			flagIgnore:    []string{"status"},
+			want:          []string{"status", "latestBackup"},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := writeManifest(name+".yaml", tc.directiveLine)
+			m, err := manifest.Parse(path)
+			if err != nil {
+				t.Fatalf("%s: manifest.Parse() error = %v", tc.reason, err)
+			}
+			opts := convergeOptions{
+				manifestPath: path,
+				pollInterval: 60 * time.Second,
+				ignoreFields: tc.flagIgnore,
+				timeout:      120 * time.Second,
+			}
+			got := convergeOptionsFor(opts, m)
+			if !reflect.DeepEqual(got.IgnoreFields, tc.want) {
+				t.Errorf("%s: convergeOptionsFor().IgnoreFields = %#v, want %#v", tc.reason, got.IgnoreFields, tc.want)
+			}
+		})
+	}
+}
+
 func TestRunCommandRejectsUnknownCommand(t *testing.T) {
 	err := runCommand("converg", nil)
 	if err == nil {

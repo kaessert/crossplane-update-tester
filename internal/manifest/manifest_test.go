@@ -500,6 +500,64 @@ metadata:
 	}
 }
 
+// TestParseBytesIgnoreFieldsRejectsDottedEntry pins the fix for the silent
+// no-op: before this, "ignore-fields: ruleChoice.legacyRuleList" parsed
+// cleanly, reached ConvergeOptions.IgnoreFields, matched no top-level key in
+// differ.DiffSnapshotsExcluding, and let the convergence check fail on drift
+// the operator believed they had excluded — with no diagnostic anywhere.
+// Rejecting the dotted entry at parse time turns that into a loud,
+// immediate, actionable error instead.
+func TestParseBytesIgnoreFieldsRejectsDottedEntry(t *testing.T) {
+	cases := map[string]struct {
+		reason        string
+		yaml          string
+		wantErrSubstr string
+	}{
+		"SingleDottedEntry": {
+			reason: "a nested path in ignore-fields is rejected, naming the offending entry",
+			yaml: `
+apiVersion: network.example.crossplane.io/v1alpha1
+kind: Network
+metadata:
+  name: example-network
+  annotations:
+    crossplane.io/update-test: |
+      ignore-fields: ruleChoice.legacyRuleList
+      - field: comment
+        value: "updated"
+`,
+			wantErrSubstr: `ignore-fields entry "ruleChoice.legacyRuleList"`,
+		},
+		"DottedEntryAmongValidOnes": {
+			reason: "one bad entry in a comma-separated list is still caught, even alongside otherwise-valid top-level names",
+			yaml: `
+apiVersion: network.example.crossplane.io/v1alpha1
+kind: Network
+metadata:
+  name: example-network
+  annotations:
+    crossplane.io/update-test: |
+      ignore-fields: latestBackup,ruleChoice.legacyRuleList,kvm
+      - field: comment
+        value: "updated"
+`,
+			wantErrSubstr: `ignore-fields entry "ruleChoice.legacyRuleList"`,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := ParseBytes([]byte(tc.yaml))
+			if err == nil {
+				t.Fatalf("%s: ParseBytes() error = nil, want an error rejecting the dotted ignore-fields entry", tc.reason)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrSubstr) {
+				t.Errorf("%s: ParseBytes() error = %q, want it to contain %q", tc.reason, err.Error(), tc.wantErrSubstr)
+			}
+		})
+	}
+}
+
 // TestParseAnnotationAssertUnchangedRejectsOverlapWithTestedField pins the
 // parse-time guard: a field cannot be both an update-test entry's own field
 // (patched) and an assert-unchanged field (asserted to never move) in the

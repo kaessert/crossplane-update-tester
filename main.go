@@ -42,6 +42,7 @@
 //
 //	update-tester run <manifest.yaml> [--timeout 120] [--poll-interval 60s]
 //	update-tester converge <manifest.yaml> [--poll-interval 60s] [--ignore-fields a,b] [--timeout 120s] [--readiness-timeout 120s]
+//	update-tester converge-all <m1.yaml,m2.yaml,...> [--poll-interval 60s] [--concurrency 8] [--timeout 120s] [--readiness-timeout 120s]
 //	update-tester validate <manifest.yaml> --types-file <types.go> [--controller-dir <dir>]
 //	update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
 //	update-tester resolve-recover <manifest.yaml> [--timeout 120]
@@ -126,18 +127,38 @@ func runCommand(name string, args []string) error {
 	}
 }
 
+// usageSynopsis lists every subcommand's invocation line, one per line, with
+// no leading indentation. printUsage indents and prints it below; the
+// package doc comment above main's declaration, and README.md's "## Commands"
+// fence, each carry a plain-text mirror of the same lines — a Go doc comment
+// cannot reference a constant, so those two stay in sync only because
+// TestUsageSynopsisSourcesAgree (main_test.go) fails the moment any of the
+// three drifts from this one, the next time a subcommand or flag changes.
+const usageSynopsis = `update-tester run <manifest.yaml> [--timeout 120] [--poll-interval 60s]
+update-tester converge <manifest.yaml> [--poll-interval 60s] [--ignore-fields a,b] [--timeout 120s] [--readiness-timeout 120s]
+update-tester converge-all <m1.yaml,m2.yaml,...> [--poll-interval 60s] [--concurrency 8] [--timeout 120s] [--readiness-timeout 120s]
+update-tester validate <manifest.yaml> --types-file <types.go> [--controller-dir <dir>]
+update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
+update-tester resolve-recover <manifest.yaml> [--timeout 120]
+update-tester hook <invocation-name> [--root <dir>] [--manifest <path>] [--skip-converge]
+update-tester version`
+
+// indentLines prefixes every line of s with prefix. usageSynopsis is kept
+// unindented so it is directly comparable against the other two synopsis
+// surfaces in a test; printUsage re-indents it here for display.
+func indentLines(s, prefix string) string {
+	lines := strings.Split(s, "\n")
+	for i, l := range lines {
+		lines[i] = prefix + l
+	}
+	return strings.Join(lines, "\n")
+}
+
 func printUsage() {
 	fmt.Fprintln(os.Stderr, `update-tester — Crossplane per-field update E2E tester
 
 Usage:
-  update-tester run <manifest.yaml> [--timeout 120] [--poll-interval 60s]
-  update-tester converge <manifest.yaml> [--poll-interval 60s] [--ignore-fields a,b] [--timeout 120s] [--readiness-timeout 120s]
-  update-tester converge-all <m1.yaml,m2.yaml,...> [--poll-interval 60s] [--concurrency 8] [--timeout 120s] [--readiness-timeout 120s]
-  update-tester validate <manifest.yaml> --types-file <types.go> [--controller-dir <dir>]
-  update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
-  update-tester resolve-recover <manifest.yaml> [--timeout 120]
-  update-tester hook <invocation-name> [--root <dir>] [--manifest <path>] [--skip-converge]
-  update-tester version
+`+indentLines(usageSynopsis, "  ")+`
 
 Flags may appear before or after the manifest path.
 

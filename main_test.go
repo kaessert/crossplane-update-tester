@@ -1233,3 +1233,108 @@ func TestVerdict(t *testing.T) {
 		t.Errorf("verdict(false) = %q, want FAIL", got)
 	}
 }
+
+// readmeCommandsFenceLines extracts the update-tester invocation lines from
+// README.md's "## Commands" fenced code block, trimming each line's leading
+// indentation so it is directly comparable to usageSynopsis. The test runs
+// with the repo root as its working directory, so "README.md" resolves
+// without needing to locate the module root.
+func readmeCommandsFenceLines(t *testing.T) []string {
+	t.Helper()
+
+	data, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatalf("reading README.md: %v", err)
+	}
+
+	var lines []string
+	inSection, inFence := false, false
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(trimmed, "## Commands"):
+			inSection = true
+		case inSection && !inFence && trimmed == "```":
+			inFence = true
+		case inFence && trimmed == "```":
+			return lines
+		case inFence && trimmed != "":
+			lines = append(lines, trimmed)
+		}
+	}
+
+	t.Fatalf(`README.md: no closed fence found under "## Commands"`)
+	return nil
+}
+
+// mainDocCommentUsageLines extracts the Usage: block from main.go's package
+// doc comment (the comment immediately above "package main"), stripping the
+// "//" comment marker and one leading tab so the result is directly
+// comparable to usageSynopsis.
+func mainDocCommentUsageLines(t *testing.T) []string {
+	t.Helper()
+
+	data, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("reading main.go: %v", err)
+	}
+
+	var lines []string
+	inUsage := false
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.HasPrefix(line, "//") {
+			if inUsage {
+				break // "package main" ends the doc comment
+			}
+			continue
+		}
+		content := strings.TrimPrefix(line, "//")
+		if strings.TrimSpace(content) == "Usage:" {
+			inUsage = true
+			continue
+		}
+		if !inUsage {
+			continue
+		}
+		if trimmed := strings.TrimSpace(content); trimmed != "" {
+			lines = append(lines, trimmed)
+		}
+	}
+
+	if len(lines) == 0 {
+		t.Fatalf("main.go: no Usage: block found in the package doc comment")
+	}
+	return lines
+}
+
+// TestUsageSynopsisSourcesAgree guards the three surfaces that document the
+// CLI's subcommand list against drifting apart: usageSynopsis (the literal
+// printUsage prints, referenced directly here — no shelling out to `go run`),
+// main.go's package doc comment Usage: block, and README.md's "## Commands"
+// fence. This has been hand-repaired twice already (once for converge-all,
+// once for hook's --skip-converge); the next flag or subcommand added must
+// fail this test instead of drifting a third surface silently.
+//
+// Normalisation is limited to each line's leading indentation: flag
+// spelling, brackets and argument placeholders are compared byte-for-byte
+// via reflect.DeepEqual on the full ordered line slices.
+func TestUsageSynopsisSourcesAgree(t *testing.T) {
+	var want []string
+	for _, line := range strings.Split(usageSynopsis, "\n") {
+		want = append(want, strings.TrimSpace(line))
+	}
+
+	t.Run("PackageDocComment", func(t *testing.T) {
+		got := mainDocCommentUsageLines(t)
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("main.go's package doc comment Usage: block diverges from usageSynopsis:\ngot:  %#v\nwant: %#v", got, want)
+		}
+	})
+
+	t.Run("ReadmeCommandsFence", func(t *testing.T) {
+		got := readmeCommandsFenceLines(t)
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("README.md's ## Commands fence diverges from usageSynopsis:\ngot:  %#v\nwant: %#v", got, want)
+		}
+	})
+}

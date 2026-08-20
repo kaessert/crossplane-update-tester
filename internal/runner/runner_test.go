@@ -260,6 +260,22 @@ type fakeCluster struct {
 	// member on every write regardless of which field the request touched.
 	silentWipeField string
 	silentWipeValue interface{}
+
+	// driftField and driftValue, when driftField is non-empty, set an
+	// atProvider field to a new value starting from the driftAfterGetCalls'th
+	// read of the resource under test (1-based, counted the same way
+	// readyAfterCalls is) — simulating a field that has genuinely changed by
+	// the time the post-window snapshot is taken. Unlike silentWipeField,
+	// this fires on a plain read, not on a patch: it exists to give converge
+	// checks (which only ever read) a deterministic, call-count-driven way to
+	// observe drift between the baseline and outcome snapshots, so a test can
+	// prove that a target excluding driftField from its diff still passes
+	// while a sibling target that does NOT exclude it fails on the SAME
+	// underlying drift. driftAfterGetCalls == 0 (the default) disables this
+	// entirely, matching every pre-existing test.
+	driftField         string
+	driftValue         interface{}
+	driftAfterGetCalls int
 }
 
 // readyCondition reports the status.conditions entry handleGet should embed
@@ -390,6 +406,9 @@ func (f *fakeCluster) handleGet(args []string) (string, error) {
 		metadata["annotations"] = map[string]interface{}{
 			externalNameAnnotation: f.externalName,
 		}
+	}
+	if f.driftField != "" && f.driftAfterGetCalls > 0 && f.getObjectCalls >= f.driftAfterGetCalls {
+		f.atProvider[f.driftField] = f.driftValue
 	}
 	status := map[string]interface{}{jsonKeyAtProvider: f.atProvider}
 	if len(conds) > 0 {

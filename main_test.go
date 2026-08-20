@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"runtime/debug"
 	"strings"
@@ -865,6 +867,189 @@ func TestParseArgsRequiresItsPositional(t *testing.T) {
 func TestParseValidateRequiresTypesFile(t *testing.T) {
 	if _, err := parseValidateArgs([]string{"manifest.yaml"}); err == nil {
 		t.Error("validate without --types-file accepted, want an error")
+	}
+}
+
+// TestMergeIgnoreFields covers the union/dedup/ordering contract
+// buildConvergeTargets relies on: the fleet-wide default and a target's own
+// per-manifest exclusion list combine without either silently discarding the
+// other, without duplicating a field named in both, and with a stable order
+// (fleet-wide first, then the manifest's own entries) so command output is
+// deterministic.
+func TestMergeIgnoreFields(t *testing.T) {
+	cases := map[string]struct {
+		reason      string
+		fleetWide   []string
+		perResource []string
+		want        []string
+	}{
+		"BothEmpty": {
+			reason:      "no exclusions at all is a valid, common case — nil, not an empty non-nil slice",
+			fleetWide:   nil,
+			perResource: nil,
+			want:        nil,
+		},
+		"FleetWideOnlyNoManifestDirective": {
+			reason:      "a manifest that predates the ignore-fields: directive still gets the flag's set (f5xc's uniform case)",
+			fleetWide:   []string{"status"},
+			perResource: nil,
+			want:        []string{"status"},
+		},
+		"PerResourceOnlyNoFlag": {
+			reason:      "the common vultr case: no fleet-wide flag at all, only each manifest's own directive",
+			fleetWide:   nil,
+			perResource: []string{"latestBackup"},
+			want:        []string{"latestBackup"},
+		},
+		"BothPresentDisjoint": {
+			reason:      "the flag's set and the manifest's own set both apply — neither replaces the other",
+			fleetWide:   []string{"status"},
+			perResource: []string{"latestBackup"},
+			want:        []string{"status", "latestBackup"},
+		},
+		"OverlappingFieldIsNotDuplicated": {
+			reason:      "a field named in both sets appears exactly once in the merged result",
+			fleetWide:   []string{"status", "lastSyncTime"},
+			perResource: []string{"lastSyncTime", "kvm"},
+			want:        []string{"status", "lastSyncTime", "kvm"},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := mergeIgnoreFields(tc.fleetWide, tc.perResource)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("%s: mergeIgnoreFields(%v, %v) = %#v, want %#v", tc.reason, tc.fleetWide, tc.perResource, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBuildConvergeTargetsSourcesIgnoreFieldsPerResource pins the actual
+// defect: a converge-all invocation covering several manifests with
+// DIFFERENT "ignore-fields:" directives must configure each target's own
+// ConvergeOptions.IgnoreFields from that target's own manifest, not from one
+// shared list — the vultr shape (database / firewall-rule / instance, three
+// disjoint exclusion sets) that a single fleet-wide flag cannot represent
+// without unioning all three onto every resource.
+func TestBuildConvergeTargetsSourcesIgnoreFieldsPerResource(t *testing.T) {
+	dir := t.TempDir()
+
+	writeManifest := func(fileName, kind, name, ignoreFieldsDirective string) string {
+		path := filepath.Join(dir, fileName)
+		yamlDoc := "apiVersion: vultr.example.crossplane.io/v1alpha1\n" +
+			"kind: " + kind + "\n" +
+			"metadata:\n" +
+			"  name: " + name + "\n" +
+			"  annotations:\n" +
+			"    crossplane.io/update-test: |\n" +
+			"      ignore-fields: " + ignoreFieldsDirective + "\n" +
+			"      - field: label\n" +
+			"        value: \"updated\"\n"
+		if err := os.WriteFile(path, []byte(yamlDoc), 0o600); err != nil {
+			t.Fatalf("writing fixture manifest %s: %v", fileName, err)
+		}
+		return path
+	}
+
+	databasePath := writeManifest("database.yaml", "Database", "example-database", "latestBackup")
+	firewallPath := writeManifest("firewall-rule.yaml", "FirewallRule", "example-firewall-rule", "ruleCount,dateModified")
+	instancePath := writeManifest("instance.yaml", "Instance", "example-instance", "kvm,powerStatus,serverStatus")
+
+	targets, err := buildConvergeTargets(convergeAllOptions{
+		manifestPaths: []string{databasePath, firewallPath, instancePath},
+		pollInterval:  60 * time.Second,
+		timeout:       120 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("buildConvergeTargets() error = %v", err)
+	}
+	if len(targets) != 3 {
+		t.Fatalf("len(targets) = %d, want 3", len(targets))
+	}
+
+	want := map[string][]string{
+		"Database/example-database":          {"latestBackup"},
+		"FirewallRule/example-firewall-rule": {"ruleCount", "dateModified"},
+		"Instance/example-instance":          {"kvm", "powerStatus", "serverStatus"},
+	}
+	seen := make(map[string]bool, len(targets))
+	for _, tgt := range targets {
+		seen[tgt.Label] = true
+		wantFields, ok := want[tgt.Label]
+		if !ok {
+			t.Errorf("unexpected target label %q", tgt.Label)
+			continue
+		}
+		if !reflect.DeepEqual(tgt.Opts.IgnoreFields, wantFields) {
+			t.Errorf("target %s: IgnoreFields = %#v, want %#v — a resource's exclusion set must not leak onto a sibling target",
+				tgt.Label, tgt.Opts.IgnoreFields, wantFields)
+		}
+	}
+	for label := range want {
+		if !seen[label] {
+			t.Errorf("expected target %q was not built", label)
+		}
+	}
+}
+
+// TestBuildConvergeTargetsUnionsFleetWideFlagOntoEachManifest confirms the
+// fleet-wide --ignore-fields flag still applies — as an ADDITIONAL default
+// unioned onto each target, not as the only mechanism (see
+// convergeAllOptions). A manifest with no directive of its own gets exactly
+// the flag's set; a manifest that also declares its own gets the union of
+// both.
+func TestBuildConvergeTargetsUnionsFleetWideFlagOntoEachManifest(t *testing.T) {
+	dir := t.TempDir()
+
+	writeManifest := func(fileName, name string, directiveLine string) string {
+		path := filepath.Join(dir, fileName)
+		yamlDoc := "apiVersion: f5xc.example.crossplane.io/v1alpha1\n" +
+			"kind: LoadBalancer\n" +
+			"metadata:\n" +
+			"  name: " + name + "\n"
+		if directiveLine != "" {
+			yamlDoc += "  annotations:\n" +
+				"    crossplane.io/update-test: |\n" +
+				"      " + directiveLine + "\n" +
+				"      - field: label\n" +
+				"        value: \"updated\"\n"
+		}
+		if err := os.WriteFile(path, []byte(yamlDoc), 0o600); err != nil {
+			t.Fatalf("writing fixture manifest %s: %v", fileName, err)
+		}
+		return path
+	}
+
+	noDirectivePath := writeManifest("no-directive.yaml", "example-no-directive", "")
+	ownDirectivePath := writeManifest("own-directive.yaml", "example-own-directive", "ignore-fields: forwardRules")
+
+	targets, err := buildConvergeTargets(convergeAllOptions{
+		manifestPaths: []string{noDirectivePath, ownDirectivePath},
+		pollInterval:  60 * time.Second,
+		timeout:       120 * time.Second,
+		ignoreFields:  []string{"status"},
+	})
+	if err != nil {
+		t.Fatalf("buildConvergeTargets() error = %v", err)
+	}
+	if len(targets) != 2 {
+		t.Fatalf("len(targets) = %d, want 2", len(targets))
+	}
+
+	for _, tgt := range targets {
+		switch tgt.Label {
+		case "LoadBalancer/example-no-directive":
+			if want := []string{"status"}; !reflect.DeepEqual(tgt.Opts.IgnoreFields, want) {
+				t.Errorf("target %s: IgnoreFields = %#v, want %#v (fleet-wide default only)", tgt.Label, tgt.Opts.IgnoreFields, want)
+			}
+		case "LoadBalancer/example-own-directive":
+			if want := []string{"status", "forwardRules"}; !reflect.DeepEqual(tgt.Opts.IgnoreFields, want) {
+				t.Errorf("target %s: IgnoreFields = %#v, want %#v (fleet-wide default unioned with the manifest's own directive)", tgt.Label, tgt.Opts.IgnoreFields, want)
+			}
+		default:
+			t.Errorf("unexpected target label %q", tgt.Label)
+		}
 	}
 }
 

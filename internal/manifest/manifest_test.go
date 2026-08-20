@@ -414,6 +414,92 @@ metadata:
 	}
 }
 
+// TestParseBytesIgnoreFields covers the "ignore-fields:" directive: absent
+// (the default for every manifest that predates it), a single field, several
+// comma-separated fields with incidental whitespace, and alongside the other
+// two top-level directives and the field-entry list in the same annotation.
+func TestParseBytesIgnoreFields(t *testing.T) {
+	cases := map[string]struct {
+		reason string
+		yaml   string
+		want   []string
+	}{
+		"Absent": {
+			reason: "a manifest without the directive parses with a nil IgnoreFields, not an error",
+			yaml: `
+apiVersion: network.example.crossplane.io/v1alpha1
+kind: Network
+metadata:
+  name: example-network
+  annotations:
+    crossplane.io/update-test: |
+      - field: comment
+        value: "updated"
+`,
+			want: nil,
+		},
+		"SingleField": {
+			reason: "a single field name is extracted verbatim",
+			yaml: `
+apiVersion: network.example.crossplane.io/v1alpha1
+kind: Network
+metadata:
+  name: example-network
+  annotations:
+    crossplane.io/update-test: |
+      ignore-fields: latestBackup
+      - field: comment
+        value: "updated"
+`,
+			want: []string{"latestBackup"},
+		},
+		"MultipleFieldsWithWhitespace": {
+			reason: "a comma-separated list is split, and surrounding whitespace on each entry is trimmed",
+			yaml: `
+apiVersion: network.example.crossplane.io/v1alpha1
+kind: Network
+metadata:
+  name: example-network
+  annotations:
+    crossplane.io/update-test: |
+      ignore-fields: ruleCount,  dateModified
+      - field: comment
+        value: "updated"
+`,
+			want: []string{"ruleCount", "dateModified"},
+		},
+		"AlongsideConvergeSkipAssertUnchangedAndFieldEntries": {
+			reason: "all three top-level directives extract independently and the field-entry list still parses",
+			yaml: `
+apiVersion: network.example.crossplane.io/v1alpha1
+kind: Network
+metadata:
+  name: example-network
+  annotations:
+    crossplane.io/update-test: |
+      converge-skip: "status field churns every observe cycle"
+      assert-unchanged: ruleChoice.legacyRuleList
+      ignore-fields: kvm,powerStatus,serverStatus
+      - field: comment
+        value: "updated"
+`,
+			want: []string{"kvm", "powerStatus", "serverStatus"},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			m, err := ParseBytes([]byte(tc.yaml))
+			if err != nil {
+				t.Fatalf("%s: ParseBytes() error = %v", tc.reason, err)
+			}
+			if !stringSlicesEqual(m.IgnoreFields, tc.want) {
+				t.Errorf("%s: IgnoreFields = %#v, want %#v", tc.reason, m.IgnoreFields, tc.want)
+			}
+		})
+	}
+}
+
 // TestParseAnnotationAssertUnchangedRejectsOverlapWithTestedField pins the
 // parse-time guard: a field cannot be both an update-test entry's own field
 // (patched) and an assert-unchanged field (asserted to never move) in the
@@ -426,7 +512,7 @@ assert-unchanged: comment
 - field: comment
   value: "updated"
 `
-	_, _, _, err := ParseAnnotation(annotation)
+	_, _, _, _, err := ParseAnnotation(annotation)
 	if err == nil {
 		t.Fatal("ParseAnnotation() error = nil, want an error rejecting the overlapping field")
 	}

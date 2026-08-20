@@ -436,7 +436,8 @@ this tool runs such a replacement and no longer needs the per-resource
 ### `crossplane.io/update-test`
 
 A YAML block scalar holding a list of per-field entries, optionally preceded by
-two top-level directive lines: `converge-skip:` and `assert-unchanged:`.
+three top-level directive lines: `converge-skip:`, `assert-unchanged:` and
+`ignore-fields:`.
 
 | Key | Meaning |
 |---|---|
@@ -445,9 +446,10 @@ two top-level directive lines: `converge-skip:` and `assert-unchanged:`.
 | `expect` | Optional. The value expected in `status.atProvider` when the backend normalises what it stores. Defaults to `value`. |
 | `skip` | Optional. A reason for not testing this field. The entry is reported as `SKIPPED` and still counts as coverage for `validate`. |
 
-Neither `converge-skip: <reason>` nor `assert-unchanged: <fields>` is valid
-YAML as a sibling of top-level sequence items, so both lines are extracted
-before the rest of the block is parsed as a sequence. Each must be unindented.
+None of `converge-skip: <reason>`, `assert-unchanged: <fields>` or
+`ignore-fields: <fields>` is valid YAML as a sibling of top-level sequence
+items, so all three lines are extracted before the rest of the block is
+parsed as a sequence. Each must be unindented.
 
 #### `assert-unchanged:` — silent-wipe guard
 
@@ -491,6 +493,34 @@ green without ever having measured anything.
 The mechanism is generic: it reads whatever field paths the manifest declares
 and compares live values against a baseline, with no knowledge of any
 particular resource, API, or backend.
+
+#### `ignore-fields:` — per-resource convergence exclusions
+
+A comma-separated list of `status.atProvider` field names excluded from a
+convergence check's snapshot diff, for THIS resource only:
+
+```yaml
+crossplane.io/update-test: |
+  ignore-fields: latestBackup
+  - field: comment
+    value: "updated"
+```
+
+This is the per-resource counterpart to `converge-all`'s fleet-wide
+`--ignore-fields` flag. `converge-all` covers several manifests — potentially
+several different resource *kinds* — in one invocation, and the flag applies
+its set to every one of them, which is lossless only when every resource in
+that invocation shares one exclusion set (true for a provider where the
+excluded field is uniformly a status field, false the moment two resources
+need different exclusions — a database's `latestBackup` timestamp has nothing
+to do with an instance's `kvm`/`powerStatus`/`serverStatus`). Declaring the
+exclusion here keeps it attached to the resource it describes:
+`converge-all` unions the flag's set onto each manifest's own directive
+rather than replacing it, so a field excluded here for one resource is never
+silently excluded for another sharing the same invocation. The single-resource
+`converge` command has no equivalent need — each invocation already covers
+exactly one manifest, so its own `--ignore-fields` flag is never shared across
+resources — and does not read this directive.
 
 Worked example:
 

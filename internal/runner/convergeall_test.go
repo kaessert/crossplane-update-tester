@@ -203,3 +203,65 @@ func TestConvergeAllReportsPerTargetVerdicts(t *testing.T) {
 		t.Errorf("summary tally wrong:\n%s", summary)
 	}
 }
+
+// TestConvergeAllAppliesPerTargetIgnoreFieldsIndependently proves the
+// per-target IgnoreFields plumbing shares one barrier without letting one
+// target's exclusion set leak onto another's — the vultr shape, where three
+// resources need three DIFFERENT exclusion sets in the same run.
+//
+// All three targets drift in "kvm" between the baseline and outcome
+// snapshots. Only the target that names "kvm" in its OWN IgnoreFields may
+// pass; a sibling target sharing the same window but excluding a DIFFERENT
+// field must still report the kvm drift as a failure. A single fleet-wide
+// exclusion set (the pre-fix behaviour) could not produce this split: it
+// would apply the same set to every target and either hide the drift
+// everywhere or catch it everywhere.
+func TestConvergeAllAppliesPerTargetIgnoreFieldsIndependently(t *testing.T) {
+	newDriftingTarget := func(label string, ignoreFields []string) ConvergeTarget {
+		f := &fakeCluster{
+			generation:      1,
+			readyAfterCalls: 1,
+			atProvider:      map[string]interface{}{"kvm": "off", "zone": "a"},
+			driftField:      "kvm",
+			driftValue:      "on",
+			// convergeArm reads the resource 4 times before the baseline
+			// snapshot is captured (waitGenerationSettled, waitSynced,
+			// waitReady, then the baseline Snapshot() itself) — call 5 is
+			// convergeAssert's post-window Snapshot(), the first read that
+			// must see the drift. Firing any earlier would bake the drift
+			// into the baseline itself and the diff would see no change at
+			// all, which is exactly the failure mode this threshold exists
+			// to avoid.
+			driftAfterGetCalls: 5,
+		}
+		r := newFakeRunner(f)
+		r.sleepFunc = func(time.Duration) {}
+		return ConvergeTarget{
+			Label:    label,
+			Runner:   r,
+			Manifest: &manifest.Manifest{Kind: testKindExample, Name: testNameExample},
+			Opts: ConvergeOptions{
+				PollInterval:     time.Millisecond,
+				Timeout:          time.Second,
+				ReadinessTimeout: time.Second,
+				IgnoreFields:     ignoreFields,
+			},
+		}
+	}
+
+	results := RunConvergeAll([]ConvergeTarget{
+		newDriftingTarget("database/one", []string{"latestBackup"}),                         // does NOT ignore kvm
+		newDriftingTarget("firewall-rule/two", []string{"ruleCount", "dateModified"}),       // does NOT ignore kvm
+		newDriftingTarget("instance/three", []string{"kvm", "powerStatus", "serverStatus"}), // DOES ignore kvm
+	}, 4)
+
+	if results[0].Result == nil || results[0].Result.Passed {
+		t.Errorf("database/one excludes latestBackup, not kvm — the kvm drift must still fail it, got %+v", results[0].Result)
+	}
+	if results[1].Result == nil || results[1].Result.Passed {
+		t.Errorf("firewall-rule/two excludes ruleCount/dateModified, not kvm — the kvm drift must still fail it, got %+v", results[1].Result)
+	}
+	if results[2].Result == nil || !results[2].Result.Passed {
+		t.Errorf("instance/three excludes kvm itself — the same drift must not fail it, got %+v", results[2].Result)
+	}
+}

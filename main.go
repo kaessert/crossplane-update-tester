@@ -558,13 +558,16 @@ func printConvergeResult(w io.Writer, m *manifest.Manifest, r *runner.ConvergeRe
 
 // convergeAllOptions holds the parsed command line of `converge-all`.
 //
-// --ignore-fields here is FLEET-WIDE: one set applied to every target. That
-// option is really per-resource (a Loadbalancer's forwardRules is meaningless
-// to a Network), and a single flag applied across a whole fleet does silently
-// widen every resource's exclusion set to the union of all of them — turning
-// a targeted exclusion into fleet-wide blindness, which is the exact failure
-// convention 0033 warns about for converge-skip. A real implementation reads
-// each manifest's own exclusions; that is the open design fork.
+// --ignore-fields here is a FLEET-WIDE DEFAULT, not the only mechanism: each
+// target's real exclusion set is its OWN manifest's "ignore-fields:"
+// annotation directive (manifest.Manifest.IgnoreFields), and the flag's set
+// is unioned onto every target on top of that — see buildConvergeTargets.
+// Using the flag alone across a fleet with divergent per-resource exclusions
+// (a Loadbalancer's forwardRules is meaningless to a Network) would silently
+// widen every resource's exclusion set to the union of all of them, the same
+// fleet-wide-blindness failure documented for converge-skip. The flag stays
+// useful for a set every resource genuinely shares (f5xc's uniform "status");
+// ticket dcbdabdb is where the per-resource mechanism was added.
 type convergeAllOptions struct {
 	manifestPaths    []string
 	pollInterval     time.Duration
@@ -581,13 +584,13 @@ func parseConvergeAllArgs(args []string) (convergeAllOptions, error) {
 	readinessTimeout := fs.Duration("readiness-timeout", 120*time.Second,
 		"Max time to wait for the Ready condition before each baseline snapshot")
 	concurrency := fs.Int("concurrency", 8, "Max resources armed or asserted at once")
-	// POC (converge-barrier): a FLEET-WIDE ignore set. This is lossless only
-	// where every resource in the case shares one set — true on f5xc, where
-	// UPDATE_TESTER_IGNORE_FIELDS is uniformly "status". On a provider with
-	// divergent per-target sets (vultr: latestBackup / ruleCount,dateModified
-	// / kvm,powerStatus,serverStatus) a single flag would union them into
-	// fleet-wide blindness, which is the open design fork.
-	ignoreFields := fs.String("ignore-fields", "", "Comma-separated atProvider fields excluded from the diff (fleet-wide)")
+	// A FLEET-WIDE DEFAULT, unioned onto each target's own per-manifest
+	// "ignore-fields:" directive rather than replacing it — see
+	// convergeAllOptions and buildConvergeTargets. Lossless alone only where
+	// every resource in the case shares one set (f5xc: uniformly "status");
+	// a divergent fleet (vultr: latestBackup / ruleCount,dateModified /
+	// kvm,powerStatus,serverStatus) needs the per-manifest directive too.
+	ignoreFields := fs.String("ignore-fields", "", "Comma-separated atProvider fields excluded from the diff for every target (unioned with each manifest's own ignore-fields: directive)")
 	if err := fs.Parse(cli.ReorderArgs(fs, args)); err != nil {
 		return convergeAllOptions{}, err
 	}
@@ -623,17 +626,18 @@ func parseConvergeAllArgs(args []string) (convergeAllOptions, error) {
 	}, nil
 }
 
-func cmdConvergeAll(args []string) error {
-	opts, err := parseConvergeAllArgs(args)
-	if err != nil {
-		return err
-	}
-
+// buildConvergeTargets parses each manifest path and constructs its
+// ConvergeTarget, sourcing IgnoreFields per-resource: the manifest's own
+// "ignore-fields:" annotation directive, plus the fleet-wide --ignore-fields
+// flag unioned on top (see convergeAllOptions). Split out from cmdConvergeAll
+// so the per-resource sourcing can be tested without a live cluster — nothing
+// here executes a Runner, it only configures one.
+func buildConvergeTargets(opts convergeAllOptions) ([]runner.ConvergeTarget, error) {
 	targets := make([]runner.ConvergeTarget, 0, len(opts.manifestPaths))
 	for _, p := range opts.manifestPaths {
 		m, err := manifest.Parse(p)
 		if err != nil {
-			return fmt.Errorf("%s: %w", p, err)
+			return nil, fmt.Errorf("%s: %w", p, err)
 		}
 		targets = append(targets, runner.ConvergeTarget{
 			Label:    fmt.Sprintf("%s/%s", m.Kind, m.Name),
@@ -643,9 +647,50 @@ func cmdConvergeAll(args []string) error {
 				PollInterval:     opts.pollInterval,
 				Timeout:          opts.timeout,
 				ReadinessTimeout: opts.readinessTimeout,
-				IgnoreFields:     opts.ignoreFields,
+				IgnoreFields:     mergeIgnoreFields(opts.ignoreFields, m.IgnoreFields),
 			},
 		})
+	}
+	return targets, nil
+}
+
+// mergeIgnoreFields unions the fleet-wide default with a single target's own
+// per-manifest exclusion list, deduplicating and keeping a stable order
+// (fleet-wide entries first, in flag order; then the manifest's own entries,
+// in annotation order) so command output and tests are deterministic.
+func mergeIgnoreFields(fleetWide, perResource []string) []string {
+	if len(fleetWide) == 0 {
+		return perResource
+	}
+	if len(perResource) == 0 {
+		return fleetWide
+	}
+	seen := make(map[string]bool, len(fleetWide)+len(perResource))
+	merged := make([]string, 0, len(fleetWide)+len(perResource))
+	for _, f := range fleetWide {
+		if !seen[f] {
+			seen[f] = true
+			merged = append(merged, f)
+		}
+	}
+	for _, f := range perResource {
+		if !seen[f] {
+			seen[f] = true
+			merged = append(merged, f)
+		}
+	}
+	return merged
+}
+
+func cmdConvergeAll(args []string) error {
+	opts, err := parseConvergeAllArgs(args)
+	if err != nil {
+		return err
+	}
+
+	targets, err := buildConvergeTargets(opts)
+	if err != nil {
+		return err
 	}
 
 	printfTo(os.Stdout, "Converge barrier: %d resource(s), one shared %s window\n",

@@ -28,6 +28,10 @@ const (
 	statusRefPlumbing = "reference-plumbing"
 	statusMissing     = "MISSING"
 
+	fieldArmA = "botProtectionSetting"
+	fieldArmB = "defaultBotSetting"
+	fieldArmC = "thirdArmSetting"
+
 	kindWidget = "Widget"
 )
 
@@ -215,6 +219,161 @@ func TestValidateManifestMissingField(t *testing.T) {
 	}
 }
 
+// TestValidateManifestClearCreditsSwitchSiblings proves (AC a): a
+// non-skipped entry's clear: list credits every named sibling, in addition
+// to its own field, under a status distinct from "tested" — never folded
+// into it, per the ruling this ticket implements.
+func TestValidateManifestClearCreditsSwitchSiblings(t *testing.T) {
+	fields := []FieldInfo{
+		{GoName: "BotProtectionSetting", JSONName: fieldArmA},
+		{GoName: "DefaultBotSetting", JSONName: fieldArmB},
+		{GoName: "ThirdArmSetting", JSONName: fieldArmC},
+	}
+
+	m := &manifest.Manifest{
+		Kind: kindWidget,
+		Tests: []manifest.UpdateTest{
+			{
+				Field: fieldArmA,
+				Value: map[string]interface{}{},
+				Clear: []string{fieldArmB, fieldArmC},
+			},
+		},
+	}
+
+	result := ValidateManifest(m, fields)
+
+	if !result.AllGood {
+		t.Fatalf("expected AllGood=true (all three arms covered — one direct, two via clear:); got fields: %+v", result.Fields)
+	}
+
+	statusByName := statusMap(result)
+	if got := statusByName[fieldArmA]; got != statusTested {
+		t.Errorf("field %q (the entry's own field): status = %q, want %q", fieldArmA, got, statusTested)
+	}
+	for _, sibling := range []string{fieldArmB, fieldArmC} {
+		if got := statusByName[sibling]; got != clearCreditStatus {
+			t.Errorf("field %q (named only in clear:): status = %q, want %q (distinct from %q)", sibling, got, clearCreditStatus, statusTested)
+		}
+	}
+	if clearCreditStatus == statusTested {
+		t.Fatalf("clearCreditStatus must be distinct from %q", statusTested)
+	}
+}
+
+// TestValidateManifestClearNeverDowngradesDirectEntry proves that a sibling
+// named in one entry's clear: list, but ALSO independently covered by its
+// own direct "field:" entry elsewhere in the same manifest, keeps its own
+// (stronger) status — clear: credit only fills a gap, it never downgrades
+// real direct coverage. Checked in both Tests-slice orderings, since
+// ValidateManifest must not depend on which entry appears first.
+func TestValidateManifestClearNeverDowngradesDirectEntry(t *testing.T) {
+	fields := []FieldInfo{
+		{GoName: "BotProtectionSetting", JSONName: fieldArmA},
+		{GoName: "DefaultBotSetting", JSONName: fieldArmB},
+	}
+
+	directEntry := manifest.UpdateTest{Field: fieldArmB, Value: "direct-value"}
+	switchEntry := manifest.UpdateTest{
+		Field: fieldArmA,
+		Value: map[string]interface{}{},
+		Clear: []string{fieldArmB},
+	}
+
+	orderings := map[string][]manifest.UpdateTest{
+		"DirectFirst": {directEntry, switchEntry},
+		"SwitchFirst": {switchEntry, directEntry},
+	}
+
+	for name, tests := range orderings {
+		t.Run(name, func(t *testing.T) {
+			m := &manifest.Manifest{Kind: kindWidget, Tests: tests}
+			result := ValidateManifest(m, fields)
+
+			if !result.AllGood {
+				t.Fatalf("expected AllGood=true; got fields: %+v", result.Fields)
+			}
+			statusByName := statusMap(result)
+			if got := statusByName[fieldArmB]; got != statusTested {
+				t.Errorf("field %q: status = %q, want %q (its own direct entry must win regardless of ordering)", fieldArmB, got, statusTested)
+			}
+		})
+	}
+}
+
+// TestValidateManifestClearSkippedEntryGrantsNoCredit confirms the credit
+// pass mirrors the direct-entry pass's own skip handling: a "skip:" entry's
+// clear: list must not silently grant coverage credit to fields nobody
+// actually exercised.
+func TestValidateManifestClearSkippedEntryGrantsNoCredit(t *testing.T) {
+	fields := []FieldInfo{
+		{GoName: "BotProtectionSetting", JSONName: fieldArmA},
+		{GoName: "DefaultBotSetting", JSONName: fieldArmB},
+	}
+
+	m := &manifest.Manifest{
+		Kind: kindWidget,
+		Tests: []manifest.UpdateTest{
+			{Field: fieldArmA, Skip: "not switchable in this backend", Clear: []string{fieldArmB}},
+		},
+	}
+
+	result := ValidateManifest(m, fields)
+
+	statusByName := statusMap(result)
+	if got := statusByName[fieldArmA]; got != statusSkipped {
+		t.Errorf("field %q: status = %q, want %q", fieldArmA, got, statusSkipped)
+	}
+	if got := statusByName[fieldArmB]; got != statusMissing {
+		t.Errorf("field %q: status = %q, want %q — a skip: entry's clear: list must grant no credit", fieldArmB, got, statusMissing)
+	}
+	if result.AllGood {
+		t.Fatal("expected AllGood=false — fieldArmB is genuinely uncovered")
+	}
+}
+
+// TestValidateManifestClearTargetUnknownField proves (AC b): a clear: entry
+// naming a field that is NOT itself a declared struct field on the target
+// type does not silently pass. The chosen failure mode is explicit and
+// mechanical: it is reported as a distinct FieldValidation entry under
+// clearTargetUnknownStatus and flips AllGood to false — the same reporting
+// channel a MISSING field already uses — rather than a hard error return,
+// so a single validation run still surfaces every problem in the manifest
+// at once instead of stopping at the first one.
+func TestValidateManifestClearTargetUnknownField(t *testing.T) {
+	fields := []FieldInfo{
+		{GoName: "BotProtectionSetting", JSONName: fieldArmA},
+	}
+
+	m := &manifest.Manifest{
+		Kind: kindWidget,
+		Tests: []manifest.UpdateTest{
+			{
+				Field: fieldArmA,
+				Value: map[string]interface{}{},
+				Clear: []string{"noSuchField"},
+			},
+		},
+	}
+
+	result := ValidateManifest(m, fields)
+
+	if result.AllGood {
+		t.Fatal("expected AllGood=false — clear: names a field absent from the struct entirely")
+	}
+
+	statusByName := statusMap(result)
+	if got := statusByName["noSuchField"]; got != clearTargetUnknownStatus {
+		t.Errorf(`status["noSuchField"] = %q, want %q`, got, clearTargetUnknownStatus)
+	}
+	// The entry's own field must still be credited independently — an
+	// invalid sibling in someone else's clear: list must not poison an
+	// otherwise-valid direct entry.
+	if got := statusByName[fieldArmA]; got != statusTested {
+		t.Errorf("field %q: status = %q, want %q", fieldArmA, got, statusTested)
+	}
+}
+
 // widgetTypesSrc is a synthetic generated-types fixture containing the
 // three-field reference pattern (owner/ownerRef/ownerSelector), an immutable
 // field, and a sibling *Parameters struct that must be skipped.
@@ -368,7 +527,8 @@ spec:
 }
 
 // TestPrintValidationDoesNotPanic is a smoke test for the output formatter
-// across every known status value, including the reference-plumbing status.
+// across every known status value, including the reference-plumbing status
+// and the two clear:-related statuses.
 func TestPrintValidationDoesNotPanic(t *testing.T) {
 	r := &ValidationResult{
 		Kind: kindWidget,
@@ -378,6 +538,8 @@ func TestPrintValidationDoesNotPanic(t *testing.T) {
 			{JSONName: statusImmutable, Status: statusImmutable},
 			{JSONName: "refField", Status: statusRefPlumbing},
 			{JSONName: "missing", Status: statusMissing},
+			{JSONName: fieldArmB, Status: clearCreditStatus},
+			{JSONName: "noSuchField", Status: clearTargetUnknownStatus},
 		},
 		AllGood: false,
 	}

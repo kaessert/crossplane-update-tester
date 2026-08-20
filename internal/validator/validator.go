@@ -43,8 +43,27 @@ type ValidationResult struct {
 // FieldValidation holds the status of a single field in validation.
 type FieldValidation struct {
 	JSONName string
-	Status   string // "tested", "skipped", "immutable", "reference-plumbing", "MISSING"
+	Status   string // "tested", "skipped", "immutable", "reference-plumbing", "MISSING", "tested-via-switch", "clear-target-unknown"
 }
+
+// clearCreditStatus is the status a field is credited under when the ONLY
+// coverage it has is being named in another entry's "clear:" list — nulled
+// as a side effect of a sibling union arm being switched in, never
+// independently set or asserted itself. Deliberately distinct from
+// "tested": a cleared arm is proven clearable, never proven settable, and
+// folding the two together would let a single switch test that clears six
+// sibling arms report all six as having had their own value tested. See
+// ValidateManifest.
+const clearCreditStatus = "tested-via-switch"
+
+// clearTargetUnknownStatus flags a "clear:" entry naming a field that does
+// not exist in the target type's declared struct fields — a typo, or a
+// stale reference to a field that was renamed or removed after the entry
+// was written. Crediting a name nothing resolves to would let the coverage
+// arithmetic drift from the declared struct with no signal at all, so this
+// status feeds into the same AllGood/Fields reporting a MISSING field uses
+// rather than passing silently. See ValidateManifest.
+const clearTargetUnknownStatus = "clear-target-unknown"
 
 // Regexes for parsing Go struct fields.
 var (
@@ -272,7 +291,11 @@ func ParseStructFields(path, structName string) ([]FieldInfo, error) {
 // ValidateManifest checks that the manifest's update-test annotation covers
 // all mutable fields from the Go types.
 func ValidateManifest(m *manifest.Manifest, fields []FieldInfo) *ValidationResult {
-	// Build a set of tested/skipped fields from the annotation.
+	// Build a set of tested/skipped fields from the annotation. This pass
+	// records only each entry's own "field:" — a second pass below layers
+	// clear: credit on top, so that a field's OWN direct entry (whichever
+	// order the two appear in m.Tests) always wins over a weaker credit
+	// picked up only because some other entry's clear: happened to name it.
 	tested := make(map[string]string) // jsonName → "tested" or "skipped"
 	for _, t := range m.Tests {
 		if t.Skip != "" {
@@ -283,7 +306,9 @@ func ValidateManifest(m *manifest.Manifest, fields []FieldInfo) *ValidationResul
 	}
 
 	// Build the set of all field JSON names in this struct so reference-
-	// plumbing detection can confirm a matching base value field exists.
+	// plumbing detection can confirm a matching base value field exists,
+	// and so a clear: entry can be checked against the type it claims to
+	// describe.
 	fieldSet := make(map[string]bool, len(fields))
 	for _, f := range fields {
 		fieldSet[f.JSONName] = true
@@ -292,6 +317,34 @@ func ValidateManifest(m *manifest.Manifest, fields []FieldInfo) *ValidationResul
 	result := &ValidationResult{
 		Kind:    m.Kind,
 		AllGood: true,
+	}
+
+	// Group-aware coverage credit: a non-skipped entry's clear: list names
+	// sibling union-arm fields that this entry's merge patch nulls in the
+	// SAME atomic patch that sets its own field's value. Each named sibling
+	// is real coverage — the null was proven to hold, the same way any
+	// other value's post-patch state is proven — so it is credited here
+	// under clearCreditStatus, not left MISSING. It is credited only when
+	// the sibling has no stronger direct entry of its own (see the ordering
+	// note above), and a sibling name that resolves to no declared struct
+	// field at all is flagged rather than silently ignored.
+	for _, t := range m.Tests {
+		if t.Skip != "" {
+			continue
+		}
+		for _, c := range t.Clear {
+			if !fieldSet[c] {
+				result.Fields = append(result.Fields, FieldValidation{
+					JSONName: c,
+					Status:   clearTargetUnknownStatus,
+				})
+				result.AllGood = false
+				continue
+			}
+			if _, ok := tested[c]; !ok {
+				tested[c] = clearCreditStatus
+			}
+		}
 	}
 
 	for _, f := range fields {
@@ -341,6 +394,12 @@ func PrintValidation(r *ValidationResult) {
 		case "MISSING":
 			icon = "✗"
 			detail = "MISSING — not covered by update-test annotation"
+		case clearCreditStatus:
+			icon = "✓"
+			detail = "covered (nulled by a sibling entry's clear: — proven clearable, not independently value-tested)"
+		case clearTargetUnknownStatus:
+			icon = "✗"
+			detail = "INVALID — named in a clear: list but not a declared field on this type"
 		}
 		fmt.Printf("  %s %s: %s\n", icon, f.JSONName, detail)
 	}

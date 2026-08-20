@@ -417,6 +417,20 @@ manipulation:
 Setting `MANIFEST` overrides derivation entirely, which is useful when debugging
 a manifest that does not follow the convention.
 
+#### `--skip-converge`
+
+Drops both `converge` steps from the sequence above, leaving
+`[check-external-name-prefix, resolve-recover] -> run`. Nothing else changes.
+
+This is **opt-in, per provider, and defaults to false**. It exists for a
+provider that asserts convergence some other way — for example, one shared
+observation window run once for many resources instead of one window per
+resource here — and must never be turned on for a provider that has no such
+replacement: doing so silently deletes that provider's convergence coverage.
+The flag is retired (removed from the CLI) once every provider that consumes
+this tool runs such a replacement and no longer needs the per-resource
+`converge` steps at all.
+
 ## Manifest annotations
 
 ### `crossplane.io/update-test`

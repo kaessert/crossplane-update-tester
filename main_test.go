@@ -318,7 +318,78 @@ func TestPassLineIsNotReadableAsANoOp(t *testing.T) {
 	}
 }
 
-func TestHookStepsGateOnPrefixAnnotation(t *testing.T) {
+// TestHookStepsGateOnPrefixAnnotationAndSkipConverge covers all four
+// combinations of the two independent switches hookSteps reads —
+// ExpectExternalNamePrefix set/unset and skipConverge on/off — and asserts
+// the full ordered command list each time, not just a length or a presence
+// check. The absent-flag arm (skipConverge=false) must equal, byte for byte,
+// what hookSteps produced before the flag existed: that is what keeps the
+// default off for the six providers that never pass it.
+func TestHookStepsGateOnPrefixAnnotationAndSkipConverge(t *testing.T) {
+	tests := []struct {
+		name         string
+		manifest     *manifest.Manifest
+		skipConverge bool
+		want         []hookStep
+	}{
+		{
+			name:         "NoPrefixConvergeOn",
+			manifest:     &manifest.Manifest{Kind: "ExampleResource", Name: "example"},
+			skipConverge: false,
+			want: []hookStep{
+				{banner: "converge", command: "converge"},
+				{banner: "run", command: "run"},
+				{banner: "post-update converge", command: "converge"},
+			},
+		},
+		{
+			name:         "PrefixSetConvergeOn",
+			manifest:     &manifest.Manifest{Kind: "ExampleResource", Name: "example", ExpectExternalNamePrefix: "example/"},
+			skipConverge: false,
+			want: []hookStep{
+				{banner: "converge", command: "converge"},
+				{banner: "check-external-name-prefix", command: "check-external-name-prefix"},
+				{banner: "resolve-recover", command: "resolve-recover"},
+				{banner: "run", command: "run"},
+				{banner: "post-update converge", command: "converge"},
+			},
+		},
+		{
+			name:         "NoPrefixConvergeSkipped",
+			manifest:     &manifest.Manifest{Kind: "ExampleResource", Name: "example"},
+			skipConverge: true,
+			want: []hookStep{
+				{banner: "run", command: "run"},
+			},
+		},
+		{
+			name:         "PrefixSetConvergeSkipped",
+			manifest:     &manifest.Manifest{Kind: "ExampleResource", Name: "example", ExpectExternalNamePrefix: "example/"},
+			skipConverge: true,
+			want: []hookStep{
+				{banner: "check-external-name-prefix", command: "check-external-name-prefix"},
+				{banner: "resolve-recover", command: "resolve-recover"},
+				{banner: "run", command: "run"},
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := hookSteps(tc.manifest, tc.skipConverge)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("hookSteps(skipConverge=%v) = %+v, want %+v", tc.skipConverge, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestHookStepsDefaultIsByteIdenticalToPreFlagBehaviour is the explicit
+// regression the default-off acceptance criterion asks for: with the flag
+// absent (skipConverge's zero value, false), hookSteps must reproduce
+// exactly what it produced before --skip-converge existed, for both the
+// prefix-set and prefix-unset manifest shapes.
+func TestHookStepsDefaultIsByteIdenticalToPreFlagBehaviour(t *testing.T) {
 	tests := []struct {
 		name     string
 		manifest *manifest.Manifest
@@ -348,9 +419,11 @@ func TestHookStepsGateOnPrefixAnnotation(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := hookSteps(tc.manifest)
+			// var hookOptions{} zero value: skipConverge defaults to false.
+			var opts hookOptions
+			got := hookSteps(tc.manifest, opts.skipConverge)
 			if !reflect.DeepEqual(got, tc.want) {
-				t.Errorf("hookSteps() = %+v, want %+v", got, tc.want)
+				t.Errorf("hookSteps() with flag absent = %+v, want %+v", got, tc.want)
 			}
 		})
 	}
@@ -365,9 +438,11 @@ func TestHookStepsAreAllDispatchable(t *testing.T) {
 		"check-external-name-prefix": true, "resolve-recover": true,
 		"hook": true, "version": true,
 	}
-	for _, s := range hookSteps(&manifest.Manifest{ExpectExternalNamePrefix: "example/"}) {
-		if !known[s.command] {
-			t.Errorf("step %q dispatches unknown command %q", s.banner, s.command)
+	for _, skipConverge := range []bool{false, true} {
+		for _, s := range hookSteps(&manifest.Manifest{ExpectExternalNamePrefix: "example/"}, skipConverge) {
+			if !known[s.command] {
+				t.Errorf("step %q dispatches unknown command %q (skipConverge=%v)", s.banner, s.command, skipConverge)
+			}
 		}
 	}
 }
@@ -559,7 +634,7 @@ func TestHookStepArgsPollIntervalIsAcceptedByEveryStepGivenIt(t *testing.T) {
 		"resolve-recover": func(a []string) error { _, err := parseResolveRecoverArgs(a); return err },
 	}
 
-	for _, s := range hookSteps(&manifest.Manifest{ExpectExternalNamePrefix: "example/"}) {
+	for _, s := range hookSteps(&manifest.Manifest{ExpectExternalNamePrefix: "example/"}, false) {
 		t.Run(s.banner, func(t *testing.T) {
 			parse, ok := parsers[s.command]
 			if !ok {
@@ -742,6 +817,25 @@ func TestFlagAfterPositionalTakesEffect(t *testing.T) {
 			}
 			if got.invocation != "post-assert-example.sh" || got.root != "/repo" {
 				t.Errorf("parseHookArgs(%q) = %+v, want invocation post-assert-example.sh and root /repo", args, got)
+			}
+			if got.skipConverge {
+				t.Errorf("parseHookArgs(%q).skipConverge = true, want false (flag absent)", args)
+			}
+		}
+	})
+
+	t.Run("HookSkipConverge", func(t *testing.T) {
+		for _, args := range [][]string{
+			{"--root", "/repo", "--skip-converge", "post-assert-example.sh"},
+			{"post-assert-example.sh", "--root", "/repo", "--skip-converge"},
+			{"--skip-converge", "post-assert-example.sh", "--root", "/repo"},
+		} {
+			got, err := parseHookArgs(args)
+			if err != nil {
+				t.Fatalf("parseHookArgs(%q): %v", args, err)
+			}
+			if got.invocation != "post-assert-example.sh" || got.root != "/repo" || !got.skipConverge {
+				t.Errorf("parseHookArgs(%q) = %+v, want invocation post-assert-example.sh, root /repo, skipConverge true", args, got)
 			}
 		}
 	})

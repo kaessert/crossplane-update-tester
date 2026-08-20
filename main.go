@@ -817,19 +817,21 @@ type hookOptions struct {
 	invocation   string
 	root         string
 	manifestPath string
+	skipConverge bool
 }
 
 func parseHookArgs(args []string) (hookOptions, error) {
 	fs := flag.NewFlagSet("hook", flag.ContinueOnError)
 	root := fs.String("root", "", "Provider repo root the manifest is derived against (default: working directory)")
 	manifestPath := fs.String("manifest", "", "Manifest path, overriding derivation from the invocation name")
+	skipConverge := fs.Bool("skip-converge", false, "Drop both convergence steps from the post-assert sequence. Opt-in, per provider — only meaningful once the provider asserts convergence some other way (e.g. a shared observation window run separately). Defaults to false so an unmodified provider keeps its convergence coverage.")
 	if err := fs.Parse(cli.ReorderArgs(fs, args)); err != nil {
 		return hookOptions{}, err
 	}
 	if fs.NArg() < 1 {
-		return hookOptions{}, errors.New("usage: update-tester hook <invocation-name> [--root <dir>] [--manifest <path>]")
+		return hookOptions{}, errors.New("usage: update-tester hook <invocation-name> [--root <dir>] [--manifest <path>] [--skip-converge]")
 	}
-	return hookOptions{invocation: fs.Arg(0), root: *root, manifestPath: *manifestPath}, nil
+	return hookOptions{invocation: fs.Arg(0), root: *root, manifestPath: *manifestPath, skipConverge: *skipConverge}, nil
 }
 
 // hookStep is one step of the post-assert sequence: a subcommand to run, and
@@ -844,9 +846,9 @@ type hookStep struct {
 }
 
 // hookSteps returns the post-assert sequence for a manifest, in order. It is
-// a pure function of the parsed manifest so the sequence — the one part of
-// the hook that cannot be exercised without a cluster — is unit-testable on
-// its own.
+// a pure function of the parsed manifest (plus the skipConverge switch) so
+// the sequence — the one part of the hook that cannot be exercised without a
+// cluster — is unit-testable on its own.
 //
 // The sequence is:
 //
@@ -864,8 +866,19 @@ type hookStep struct {
 //     reports Ready on every cycle, so a Ready assertion cannot see it —
 //     only a second convergence window, taken after every field transition
 //     in the manifest, catches it.
-func hookSteps(m *manifest.Manifest) []hookStep {
-	steps := []hookStep{{banner: "converge", command: "converge"}}
+//
+// skipConverge drops both converge steps (1 and 4) when true, leaving
+// [check-external-name-prefix, resolve-recover] -> run. It exists for a
+// provider that asserts convergence some other way — e.g. one shared
+// observation window run once for many resources, rather than one window
+// per resource here — and must default to false: most providers have no
+// such replacement, and a default-on flag would silently delete their
+// convergence coverage.
+func hookSteps(m *manifest.Manifest, skipConverge bool) []hookStep {
+	var steps []hookStep
+	if !skipConverge {
+		steps = append(steps, hookStep{banner: "converge", command: "converge"})
+	}
 
 	if m.ExpectExternalNamePrefix != "" {
 		steps = append(steps,
@@ -874,10 +887,13 @@ func hookSteps(m *manifest.Manifest) []hookStep {
 		)
 	}
 
-	return append(steps,
-		hookStep{banner: "run", command: "run"},
-		hookStep{banner: "post-update converge", command: "converge"},
-	)
+	steps = append(steps, hookStep{banner: "run", command: "run"})
+
+	if !skipConverge {
+		steps = append(steps, hookStep{banner: "post-update converge", command: "converge"})
+	}
+
+	return steps
 }
 
 // hookEnv holds the environment-supplied overrides for the checks the hook
@@ -994,7 +1010,7 @@ func cmdHook(args []string) error {
 		return err
 	}
 
-	for _, s := range hookSteps(m) {
+	for _, s := range hookSteps(m, opts.skipConverge) {
 		fmt.Printf("==> update-tester: %s %s\n", s.banner, manifestPath)
 		if err := runCommand(s.command, hookStepArgs(s, manifestPath, env)); err != nil {
 			return fmt.Errorf("%s: %w", s.banner, err)

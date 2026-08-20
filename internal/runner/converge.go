@@ -423,6 +423,20 @@ func (r *Runner) convergeAssertAttempt(m *manifest.Manifest, opts ConvergeOption
 			if early != nil {
 				return early, nil
 			}
+			// Re-armed and re-measuring instead of returning INCONCLUSIVE
+			// (the branch above): note the restart on the fresh baseline so
+			// it survives into the eventual verdict — buildConvergeResult
+			// surfaces notes whether the retry ultimately passes or fails,
+			// which is what lets an operator (or this project's own live
+			// runs) confirm the re-arm actually fired instead of inferring
+			// it from the absence of a false RECONCILIATION LOOP DETECTED.
+			// b.Notes is carried forward first so a SECOND restart within
+			// convergeMaxRestartRetries keeps the first restart's note
+			// rather than the fresh convergeArm call silently replacing it.
+			restartNote := fmt.Sprintf(
+				"provider controller pod restarted during observation (attempt %d: baseline pod %q, now %q) — window discarded and re-measured",
+				restarts+1, b.PodIdentity.Name, current.Name)
+			newBaseline.Notes = append(append(append([]string{}, b.Notes...), newBaseline.Notes...), restartNote)
 			freshWait := convergeWait(opts)
 			time.Sleep(freshWait)
 			return r.convergeAssertAttempt(m, opts, newBaseline, freshWait, restarts+1)

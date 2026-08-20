@@ -1273,6 +1273,19 @@ func TestConvergeAssertRestartDetection(t *testing.T) {
 		if result.Message == "RECONCILIATION LOOP DETECTED" {
 			t.Error("a provider controller Pod restart must never be reported as a reconciliation loop")
 		}
+		// The re-arm's own signal: a passing verdict must still say a
+		// restart happened, naming both Pod identities and the attempt
+		// number, so a live run can confirm the re-arm fired rather than
+		// inferring it from the absence of a false loop verdict.
+		if len(result.Diagnostics) != 1 {
+			t.Fatalf("expected exactly one diagnostic (the restart note) on a passing re-armed result, got %v", result.Diagnostics)
+		}
+		note := result.Diagnostics[0]
+		for _, want := range []string{"attempt 1", "provider-example-old", "provider-example-new"} {
+			if !strings.Contains(note, want) {
+				t.Errorf("restart note %q missing %q", note, want)
+			}
+		}
 	})
 
 	t.Run("RestartOnEveryAttemptReportsInconclusiveNeverASilentPass", func(t *testing.T) {

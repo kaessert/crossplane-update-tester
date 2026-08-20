@@ -427,6 +427,7 @@ you write it.
 ```
 $ update-tester expect-skeleton zz_service_policy_rules_types.go --kind ServicePolicyRule --field domainMatcher
 expect: # skeleton for domainMatcher — keys only, fill in the real value(s)
+  exactValues: TODO
   regexValues: TODO
 ```
 

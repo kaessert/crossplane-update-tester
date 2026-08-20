@@ -34,6 +34,7 @@ Everything it asserts is derived from two sources:
 ```
 update-tester run <manifest.yaml> [--timeout 120] [--poll-interval 60s]
 update-tester converge <manifest.yaml> [--poll-interval 60s] [--ignore-fields a,b] [--timeout 120s] [--readiness-timeout 120s]
+update-tester converge-all <m1.yaml,m2.yaml,...> [--poll-interval 60s] [--concurrency 8] [--timeout 120s] [--readiness-timeout 120s]
 update-tester validate <manifest.yaml> --types-file <types.go> [--controller-dir <dir>]
 update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
 update-tester resolve-recover <manifest.yaml> [--timeout 120]
@@ -175,6 +176,70 @@ Use `--ignore-fields` for genuinely dynamic observed fields (server timestamps,
 rolling counters). If a resource cannot converge for a structural reason, put a
 `converge-skip:` line in its annotation with the reason; the check then reports
 `CONVERGE-SKIP` and exits zero.
+
+### `converge-all` — shared-window fleet convergence
+
+`converge-all` runs the same steady-state assertion as `converge`, but for many
+manifests against a single shared observation window instead of one window per
+resource.
+
+Running the per-resource form against N manifests spends
+`N * (poll-interval * 1.5)` asleep, back to back, and every one of those N
+windows observes a DIFFERENT stretch of wall-clock time — drift that only
+appears while several controllers are reconciling at once falls between the
+windows and is never seen. `converge-all` observes every resource over the
+same stretch instead, which is both faster and a strictly stronger check.
+
+This is safe because convergence performs `kubectl` reads only — no patches,
+no controller restarts. No target can perturb another's observation, so every
+target's arm and assert step can be interleaved freely.
+
+The steps:
+
+1. **Arm** every target concurrently (bounded by `--concurrency`). Arming
+   snapshots a baseline the same way `converge` steps 1-4 do above. A target
+   that resolves early — `CONVERGE-SKIP`, an unsettled generation, an error —
+   is recorded immediately and takes no further part in the shared window.
+2. **One shared wait.** Arming is not instantaneous: each target waits for its
+   own generation to settle and for `Ready`, so baselines land at different
+   times. The window closes at `max(ArmedAt) + max(convergeWait)` across every
+   armed target. Anchoring on the LATEST baseline and the LONGEST per-target
+   wait is what guarantees every target is observed for at least its own
+   required duration, even when targets declare different `--poll-interval`
+   values — every target but the last-armed one is therefore observed for
+   strictly *more* than its own minimum, never less.
+3. **Assert** every armed target concurrently, each against its own elapsed
+   time since it was armed — not the shared wait duration. A target armed
+   earlier was under observation for longer, and counting update Events over a
+   shorter window than was actually observed would under-report a loop on
+   exactly those resources.
+
+`--concurrency` (default `8`) bounds how many targets are armed or asserted at
+once. Each step shells out to `kubectl`, so this caps concurrent processes, not
+anything the API server itself experiences — an unbounded fan-out over a large
+catalog would spawn one process per resource per phase.
+
+`--ignore-fields` here is a FLEET-WIDE default, unioned onto every target's own
+per-manifest `ignore-fields:` directive rather than replacing it. It is
+lossless only when every resource in the run genuinely shares the same
+exclusion set — using it alone across a fleet with divergent per-resource
+exclusions (a load-balancer's `forwardRules` field means nothing to a network
+resource) would silently widen every resource's exclusion set to the union of
+all of them. Prefer the per-manifest directive for anything not shared by the
+whole fleet; see ticket dcbdabdb for the mechanism that added it.
+
+Manifest paths are accepted either as one comma-separated list or as repeated
+positional arguments — both forms are equivalent:
+
+```
+update-tester converge-all a.yaml,b.yaml,c.yaml
+update-tester converge-all a.yaml b.yaml c.yaml
+```
+
+`converge-all` is a separate entry point, not part of the `hook` sequence —
+`hook` (below) still runs its own two per-resource `converge` steps
+unconditionally. It exists for a provider that wants one shared window across
+many resources instead of `hook`'s per-resource ones.
 
 ### `validate` — offline coverage check
 

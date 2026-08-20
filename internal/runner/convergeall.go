@@ -166,8 +166,12 @@ func forEachConcurrently(n, limit int, fn func(i int)) {
 	wg.Wait()
 }
 
-// FormatConvergeAllSummary renders a one-line-per-target summary plus a
-// tally. Returns the text and whether every target passed.
+// FormatConvergeAllSummary renders a one-verdict-line-per-target summary
+// plus a tally, followed by that target's own Diagnostics (if any) —
+// present whether the target passed or failed, since a note such as a
+// controller-pod restart or a readiness-timeout is informational rather
+// than a failure reason, and an operator reading a passing result should
+// still see it. Returns the text and whether every target passed.
 func FormatConvergeAllSummary(results []ConvergeAllResult) (text string, ok bool) {
 	return formatConvergeAllSummary(results, nil)
 }
@@ -209,6 +213,18 @@ func formatConvergeAllSummary(results []ConvergeAllResult, findings map[string]s
 		case r.Result.Passed:
 			pass++
 			b = append(b, fmt.Sprintf("  ✓ %-40s %s\n", r.Label, r.Result.Message)...)
+			// A passing result can still carry Diagnostics — the restart,
+			// readiness-timeout and controller-log-unavailable notes
+			// buildConvergeResult attaches whether or not the check
+			// passed (see ConvergeResult.Diagnostics doc). The
+			// single-target path (printConvergeResult) already surfaces
+			// these on a pass; without this loop converge-all silently
+			// dropped them for every passing target. findings is never
+			// consulted here — it is failure-only, per the doc comment
+			// above.
+			for _, d := range r.Result.Diagnostics {
+				b = append(b, fmt.Sprintf("      %s\n", d)...)
+			}
 		default:
 			fail++
 			b = append(b, fmt.Sprintf("  ✗ %-40s %s\n", r.Label, r.Result.Message)...)

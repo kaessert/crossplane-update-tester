@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -201,6 +202,110 @@ func TestConvergeAllReportsPerTargetVerdicts(t *testing.T) {
 	}
 	if !strings.Contains(summary, "2 passed, 1 failed") {
 		t.Errorf("summary tally wrong:\n%s", summary)
+	}
+}
+
+// TestFormatConvergeAllSummaryPassingTargetWithDiagnosticsPrintsThem pins
+// the fix this ticket exists to make: a PASSING target whose Diagnostics
+// are non-empty (the restart note buildConvergeResult attaches on a
+// re-armed retry, or the pre-existing readiness-timeout / controller-log
+// notes) must have them printed, exactly as printConvergeResult already
+// does for the single-target path — not just the verdict line.
+func TestFormatConvergeAllSummaryPassingTargetWithDiagnosticsPrintsThem(t *testing.T) {
+	results := []ConvergeAllResult{
+		{Label: "HttpLoadbalancer/example-http-loadbalancer", Result: &ConvergeResult{
+			Passed:  true,
+			Message: "resource stable (1 cycle observed, 0 updates)",
+			Diagnostics: []string{
+				"provider controller pod restarted during observation (attempt 1: baseline pod \"provider-f5xc-abc\", now \"provider-f5xc-def\") — window discarded and re-measured",
+			},
+		}},
+	}
+
+	got, ok := formatConvergeAllSummary(results, nil)
+
+	if !ok {
+		t.Fatalf("ok = false, want true — the only target passed")
+	}
+	want := fmt.Sprintf("  ✓ %-40s %s\n", "HttpLoadbalancer/example-http-loadbalancer", "resource stable (1 cycle observed, 0 updates)") +
+		"      provider controller pod restarted during observation (attempt 1: baseline pod \"provider-f5xc-abc\", now \"provider-f5xc-def\") — window discarded and re-measured\n" +
+		"\n1 passed, 0 failed, 0 skipped, 0 errored\n"
+	if got != want {
+		t.Errorf("formatConvergeAllSummary() =\n%q\nwant:\n%q", got, want)
+	}
+}
+
+// TestFormatConvergeAllSummaryPassingTargetWithoutDiagnosticsUnchanged pins
+// the AC that the fix must not alter the verdict or the byte shape of a
+// passing target that carries no Diagnostics — the common case, and the
+// one every existing caller already depends on.
+func TestFormatConvergeAllSummaryPassingTargetWithoutDiagnosticsUnchanged(t *testing.T) {
+	results := []ConvergeAllResult{
+		{Label: "ExampleResource/x", Result: &ConvergeResult{Passed: true, Message: "resource stable (1 cycle observed, 0 updates)"}},
+	}
+
+	got, ok := formatConvergeAllSummary(results, nil)
+
+	if !ok {
+		t.Fatalf("ok = false, want true")
+	}
+	want := fmt.Sprintf("  ✓ %-40s %s\n", "ExampleResource/x", "resource stable (1 cycle observed, 0 updates)") +
+		"\n1 passed, 0 failed, 0 skipped, 0 errored\n"
+	if got != want {
+		t.Errorf("formatConvergeAllSummary() =\n%q\nwant:\n%q", got, want)
+	}
+}
+
+// TestFormatConvergeAllSummaryNotePresenceNeverFlipsOk proves a note on a
+// passing target's Diagnostics can never turn ok false, and — separately —
+// that a note on a FAILING target's Diagnostics (already the pre-existing
+// behaviour) does not change the count-derived ok either way. This is the
+// "verdict is unchanged" acceptance criterion: pass/fail/skip/error counts
+// and ok are derived solely from Result.Passed / Skipped / Err, never from
+// whether Diagnostics happens to be empty.
+func TestFormatConvergeAllSummaryNotePresenceNeverFlipsOk(t *testing.T) {
+	withNote := []ConvergeAllResult{
+		{Label: "a", Result: &ConvergeResult{Passed: true, Message: "stable", Diagnostics: []string{"a note"}}},
+	}
+	withoutNote := []ConvergeAllResult{
+		{Label: "a", Result: &ConvergeResult{Passed: true, Message: "stable"}},
+	}
+
+	_, okWith := formatConvergeAllSummary(withNote, nil)
+	_, okWithout := formatConvergeAllSummary(withoutNote, nil)
+
+	if !okWith || !okWithout || okWith != okWithout {
+		t.Errorf("okWith=%v okWithout=%v, want both true and equal — a note must never flip ok", okWith, okWithout)
+	}
+}
+
+// TestFormatConvergeAllSummaryFailingBranchByteIdentical pins the failing
+// branch's existing output shape — diagnostics then roundtrip findings, in
+// that order — proving this ticket's passing-branch addition left it
+// untouched.
+func TestFormatConvergeAllSummaryFailingBranchByteIdentical(t *testing.T) {
+	results := []ConvergeAllResult{
+		{Label: "ExampleResource/failing", Result: &ConvergeResult{
+			Passed:      false,
+			Message:     "RECONCILIATION LOOP DETECTED",
+			Diagnostics: []string{"atProvider changed: zone: \"a\" -> \"b\""},
+		}},
+	}
+	findings := map[string]string{
+		"ExampleResource/failing": "defaulted-by-server  corsPolicy.disabled  spec=<absent> mirror=false",
+	}
+
+	got, ok := formatConvergeAllSummary(results, findings)
+
+	if ok {
+		t.Fatal("ok = true, want false — one target failed")
+	}
+	want := fmt.Sprintf("  ✗ %-40s %s\n", "ExampleResource/failing", "RECONCILIATION LOOP DETECTED") +
+		"      atProvider changed: zone: \"a\" -> \"b\"\n" +
+		"      defaulted-by-server  corsPolicy.disabled  spec=<absent> mirror=false\n" +
+		"\n0 passed, 1 failed, 0 skipped, 0 errored\n"
+	if got != want {
+		t.Errorf("formatConvergeAllSummary() =\n%q\nwant:\n%q", got, want)
 	}
 }
 

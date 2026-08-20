@@ -161,13 +161,31 @@ controller; set `UPDATE_TESTER_PROVIDER_DEPLOYMENT` to disambiguate.
    outright — it only narrows the window in which that can happen — and adds
    a diagnostic line noting the timeout without dropping anything else the
    check finds.
-4. Snapshot `status.atProvider`, the generation, and the update-Event count.
-5. Wait `--poll-interval * 1.5`, which guarantees at least one full reconcile
+4. Poll until the provider controller Pod is at least 15s old (bounded by a
+   120s timeout, reported as `RESOURCE NOT IN STEADY STATE` on expiry). A
+   just-(re)started controller Pod may still be running its own cold-start
+   reconcile burst against every resource it watches, and a baseline taken
+   mid-burst would read that burst as drift the instant it lands.
+5. Snapshot `status.atProvider`, the generation, and the update-Event count.
+6. Wait `--poll-interval * 1.5`, which guarantees at least one full reconcile
    cycle.
-6. Assert that `status.atProvider` is unchanged (minus `--ignore-fields`),
+7. Assert that `status.atProvider` is unchanged (minus `--ignore-fields`),
    that the generation is unchanged, that **zero** new update Events were
    recorded, and that `Ready` is still `True`. A `Ready` flap at this point is
    reported as its own diagnostic, separate from the `atProvider` diff.
+
+**Controller-Pod-restart awareness.** If the provider controller Pod is
+replaced during the wait — an event-burst reset (see `run` above), an OOM
+kill, an operator action, a package re-install — the Pod that comes back
+re-observes every resource with cold caches and writes to it again, which
+looks identical to a real reconciliation loop from the outside even though it
+is not. `converge` detects this by comparing the controller Pod's identity
+before and after the wait; on a mismatch it discards the spoiled window,
+re-arms against the new Pod, and re-measures rather than blaming the
+controller for its own restart. This can happen at most twice before the
+check gives up and reports `CONVERGENCE INCONCLUSIVE`, naming how many
+restarts it observed — a resource whose window is spoiled on every attempt is
+never silently reported as a pass.
 
 A resource stuck in a perpetual update loop reports `Ready` on every cycle, so
 an assertion on `Ready` — the assertion an E2E harness makes by default — passes
@@ -199,7 +217,7 @@ target's arm and assert step can be interleaved freely.
 The steps:
 
 1. **Arm** every target concurrently (bounded by `--concurrency`). Arming
-   snapshots a baseline the same way `converge` steps 1-4 do above. A target
+   snapshots a baseline the same way `converge` steps 1-5 do above. A target
    that resolves early — `CONVERGE-SKIP`, an unsettled generation, an error —
    is recorded immediately and takes no further part in the shared window.
 2. **One shared wait.** Arming is not instantaneous: each target waits for its
@@ -214,7 +232,10 @@ The steps:
    time since it was armed — not the shared wait duration. A target armed
    earlier was under observation for longer, and counting update Events over a
    shorter window than was actually observed would under-report a loop on
-   exactly those resources.
+   exactly those resources. A target whose own controller Pod restarted
+   during the shared wait re-arms and re-measures independently of every
+   other target, per the controller-Pod-restart awareness described above —
+   it does not reopen or extend the shared window for anyone else.
 
 `--concurrency` (default `8`) bounds how many targets are armed or asserted at
 once. Each step shells out to `kubectl`, so this caps concurrent processes, not

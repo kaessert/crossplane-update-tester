@@ -2425,6 +2425,265 @@ func TestResolveControllerDeploymentName(t *testing.T) {
 	}
 }
 
+// TestParseControllerPodIdentities pins the parser's tolerance contract: a
+// line missing its timestamp component, or carrying one that fails RFC3339
+// parsing, reports a zero CreatedAt rather than an error — read by every
+// caller as "very old". This is what keeps resolveControllerPodIdentity
+// from erroring on a shape it cannot make sense of, and (deliberately) what
+// keeps every pre-existing fakeCluster-backed test — whose "get pods"
+// stand-in has never emitted a creationTimestamp — resolving an
+// already-settled identity without any test-side changes.
+func TestParseControllerPodIdentities(t *testing.T) {
+	fixedTime := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+
+	cases := map[string]struct {
+		reason string
+		in     string
+		want   []controllerPodIdentity
+	}{
+		"Empty": {
+			reason: "no output at all is zero identities, not an error",
+			in:     "",
+			want:   nil,
+		},
+		"BlankLinesIgnored": {
+			reason: "blank lines between entries (kubectl's own trailing newline, or an empty range iteration) contribute nothing",
+			in:     "\n\npod-a\t2026-01-02T03:04:05Z\n\n",
+			want:   []controllerPodIdentity{{Name: "pod-a", CreatedAt: fixedTime}},
+		},
+		"SingleValidEntry": {
+			reason: "a well-formed name+RFC3339 pair parses exactly",
+			in:     "pod-a\t2026-01-02T03:04:05Z\n",
+			want:   []controllerPodIdentity{{Name: "pod-a", CreatedAt: fixedTime}},
+		},
+		"MultipleEntries": {
+			reason: "one entry per Pod, in the order the range emitted them",
+			in:     "pod-a\t2026-01-02T03:04:05Z\npod-b\t2026-01-02T03:05:00Z\n",
+			want: []controllerPodIdentity{
+				{Name: "pod-a", CreatedAt: fixedTime},
+				{Name: "pod-b", CreatedAt: fixedTime.Add(55 * time.Second)},
+			},
+		},
+		"MissingTimestampComponent": {
+			reason: "a name with no tab at all (the shape every pre-existing fakeCluster get-pods stand-in emits) reports a zero CreatedAt rather than erroring",
+			in:     "pod-a\n",
+			want:   []controllerPodIdentity{{Name: "pod-a"}},
+		},
+		"UnparsableTimestamp": {
+			reason: "a timestamp that fails RFC3339 parsing degrades to zero CreatedAt rather than propagating a parse error the caller has no way to act on",
+			in:     "pod-a\tnot-a-timestamp\n",
+			want:   []controllerPodIdentity{{Name: "pod-a"}},
+		},
+		"WhitespacePaddedLines": {
+			reason: "leading/trailing whitespace around a line is trimmed before splitting",
+			in:     "  pod-a\t2026-01-02T03:04:05Z  \n",
+			want:   []controllerPodIdentity{{Name: "pod-a", CreatedAt: fixedTime}},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := parseControllerPodIdentities(tc.in)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("%s: parseControllerPodIdentities(%q) = %+v, want %+v", tc.reason, tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLatestControllerPodIdentity pins the "pick the currently running Pod"
+// contract: among several entries (a rollout can briefly report the old
+// Pod mid-termination alongside the new one), the one with the GREATEST
+// CreatedAt is the one currently running.
+func TestLatestControllerPodIdentity(t *testing.T) {
+	older := controllerPodIdentity{Name: "pod-old", CreatedAt: time.Unix(100, 0)}
+	newer := controllerPodIdentity{Name: "pod-new", CreatedAt: time.Unix(200, 0)}
+
+	cases := map[string]struct {
+		reason string
+		in     []controllerPodIdentity
+		want   controllerPodIdentity
+		wantOK bool
+	}{
+		"Empty": {
+			reason: "no entries at all is a resolution failure, not a zero-value identity",
+			in:     nil,
+			wantOK: false,
+		},
+		"SingleEntry": {
+			reason: "one entry is unambiguously the answer",
+			in:     []controllerPodIdentity{older},
+			want:   older,
+			wantOK: true,
+		},
+		"NewestWinsRegardlessOfOrder": {
+			reason: "a rollout can report the old Pod either before or after the new one — the NEWEST CreatedAt wins either way",
+			in:     []controllerPodIdentity{older, newer},
+			want:   newer,
+			wantOK: true,
+		},
+		"NewestWinsReversedOrder": {
+			reason: "same as above with the list order reversed, proving the result does not depend on input order",
+			in:     []controllerPodIdentity{newer, older},
+			want:   newer,
+			wantOK: true,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got, ok := latestControllerPodIdentity(tc.in)
+			if ok != tc.wantOK {
+				t.Fatalf("%s: found = %v, want %v", tc.reason, ok, tc.wantOK)
+			}
+			if ok && got != tc.want {
+				t.Errorf("%s: latestControllerPodIdentity() = %+v, want %+v", tc.reason, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestResolveControllerPodIdentityLive exercises the real kubectl argv
+// resolveControllerPodIdentityLive issues: it must resolve the Deployment
+// name first (exactly as restartControllerDeployment does), then scope its
+// Pod lookup to THAT Deployment's revision label value specifically —
+// never the bare selector every installed provider's Pods also match — and
+// parse the newest entry out of the result.
+func TestResolveControllerPodIdentityLive(t *testing.T) {
+	t.Setenv(providerDeploymentEnvVar, "")
+
+	var gotPodArgs []string
+	r := &Runner{
+		execFunc: func(args []string) (string, error) {
+			switch {
+			case len(args) >= 2 && args[0] == kubectlGetSubcommand && args[1] == "deploy":
+				return "", fmt.Errorf("array index out of bounds: index 0, length 0")
+			case len(args) >= 2 && args[0] == kubectlGetSubcommand && args[1] == "pods" && containsArg(args, "-o") && strings.Contains(args[len(args)-1], "labels"):
+				// resolveControllerDeploymentName's own lookup.
+				return testProviderDeployment + "\n", nil
+			case len(args) >= 2 && args[0] == kubectlGetSubcommand && args[1] == "pods":
+				gotPodArgs = args
+				return "provider-example-7c9d4f6b7-abcde\t2026-01-02T03:04:05Z\nprovider-example-7c9d4f6b7-fghij\t2026-01-02T03:05:00Z\n", nil
+			default:
+				return "", fmt.Errorf("unexpected kubectl invocation: %v", args)
+			}
+		},
+	}
+
+	got, err := r.resolveControllerPodIdentityLive()
+	if err != nil {
+		t.Fatalf("resolveControllerPodIdentityLive: unexpected error: %v", err)
+	}
+	want := controllerPodIdentity{Name: "provider-example-7c9d4f6b7-fghij", CreatedAt: time.Date(2026, 1, 2, 3, 5, 0, 0, time.UTC)}
+	if got != want {
+		t.Errorf("resolveControllerPodIdentityLive() = %+v, want %+v (the newer of the two Pods)", got, want)
+	}
+	if gotPodArgs == nil {
+		t.Fatal("expected an identity-lookup `kubectl get pods` call")
+	}
+	if !containsArg(gotPodArgs, providerDeploymentSelector+"="+testProviderDeployment) {
+		t.Errorf("identity lookup argv missing selector scoped to the resolved Deployment (%s=%s): %v",
+			providerDeploymentSelector, testProviderDeployment, gotPodArgs)
+	}
+}
+
+// TestResolveControllerPodIdentityLivePropagatesDeploymentResolutionFailure
+// asserts that a Deployment-resolution failure (no matching Pod at all) is
+// surfaced as an error naming that step, rather than silently reporting a
+// zero-value identity.
+func TestResolveControllerPodIdentityLivePropagatesDeploymentResolutionFailure(t *testing.T) {
+	t.Setenv(providerDeploymentEnvVar, "")
+
+	r := &Runner{
+		execFunc: func(args []string) (string, error) {
+			if len(args) >= 2 && args[0] == kubectlGetSubcommand && args[1] == "pods" {
+				return "", fmt.Errorf("array index out of bounds: index 0, length 0")
+			}
+			return "", fmt.Errorf("unexpected kubectl invocation: %v", args)
+		},
+	}
+
+	_, err := r.resolveControllerPodIdentityLive()
+	if err == nil {
+		t.Fatal("expected an error when the Deployment cannot be resolved, got nil")
+	}
+	if !strings.Contains(err.Error(), "resolving provider deployment") {
+		t.Errorf("error %q does not indicate Deployment resolution failed", err.Error())
+	}
+}
+
+// TestWaitControllerPodSettled pins the bounded-poll contract: a Pod
+// already older than the threshold settles on the very first read with no
+// sleep, and a Pod that never ages past the threshold reports settled=false
+// once the timeout elapses rather than blocking forever.
+func TestWaitControllerPodSettled(t *testing.T) {
+	t.Run("AlreadySettledNoSleep", func(t *testing.T) {
+		var slept int
+		r := &Runner{
+			podIdentityFunc: func() (controllerPodIdentity, error) {
+				return controllerPodIdentity{Name: "pod-a", CreatedAt: time.Now().Add(-time.Hour)}, nil
+			},
+			sleepFunc: func(time.Duration) { slept++ },
+		}
+
+		identity, settled, err := r.waitControllerPodSettled(15*time.Second, time.Second)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !settled {
+			t.Fatal("expected settled=true for a Pod already older than the threshold")
+		}
+		if identity.Name != "pod-a" {
+			t.Errorf("identity.Name = %q, want %q", identity.Name, "pod-a")
+		}
+		if slept != 0 {
+			t.Errorf("expected zero sleeps when already settled, got %d", slept)
+		}
+	})
+
+	t.Run("NeverSettlesWithinTimeout", func(t *testing.T) {
+		var calls int
+		r := &Runner{
+			podIdentityFunc: func() (controllerPodIdentity, error) {
+				calls++
+				return controllerPodIdentity{Name: "pod-a", CreatedAt: time.Now()}, nil
+			},
+			sleepFunc: func(time.Duration) {},
+		}
+
+		identity, settled, err := r.waitControllerPodSettled(time.Hour, 10*time.Millisecond)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if settled {
+			t.Fatal("expected settled=false: the Pod's age never reaches a 1-hour threshold within a 10ms timeout")
+		}
+		if identity.Name != "pod-a" {
+			t.Errorf("identity.Name = %q, want %q", identity.Name, "pod-a")
+		}
+		if calls < 2 {
+			t.Errorf("expected the loop to poll more than once before the timeout, got %d call(s)", calls)
+		}
+	})
+
+	t.Run("IdentityErrorPropagates", func(t *testing.T) {
+		wantErr := fmt.Errorf("boom")
+		r := &Runner{
+			podIdentityFunc: func() (controllerPodIdentity, error) {
+				return controllerPodIdentity{}, wantErr
+			},
+		}
+
+		_, settled, err := r.waitControllerPodSettled(15*time.Second, time.Second)
+		if err == nil {
+			t.Fatal("expected the identity error to propagate")
+		}
+		if settled {
+			t.Error("settled must be false when the identity read itself failed")
+		}
+	})
+}
+
 // TestSelectResourceName pins the multi-document resolution contract.
 // `kubectl get -f <manifest> -o name` prints one line PER DOCUMENT, and the
 // manifest parser selects the annotated document — so the runner must

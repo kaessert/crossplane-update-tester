@@ -48,6 +48,13 @@ type Runner struct {
 	// code leaves it nil and resetEventBurst shells out to kubectl for real.
 	restartFunc func() error
 
+	// podIdentityFunc, when set, overrides resolveControllerPodIdentity as
+	// the mechanism convergeArm/convergeAssert use to read the running
+	// provider controller Pod's identity (see controllerPodIdentity). Tests
+	// inject a fake sequence here; production code leaves it nil and
+	// resolveControllerPodIdentity shells out to kubectl for real.
+	podIdentityFunc func() (controllerPodIdentity, error)
+
 	// sleepFunc, when set, overrides the wait between iterations of a
 	// bounded poll loop (waitReady, waitGenerationSettled, evidenceOutcome's
 	// retry). Tests inject a no-op or near-instant stand-in so every poll
@@ -64,6 +71,17 @@ type Runner struct {
 	// each spending evidenceRetryWindow's real 10 seconds; production code
 	// leaves it zero and evidenceOutcome falls back to evidenceRetryWindow.
 	evidenceWindow time.Duration
+
+	// podSettleThreshold and podSettleTimeout, when set (> 0), override
+	// controllerPodSettleThreshold and controllerPodSettleTimeout
+	// respectively — the age a provider controller Pod must reach before
+	// convergeArm takes its baseline, and how long it waits for that.
+	// Tests set small values here so both the already-settled and the
+	// never-settles-within-timeout cases resolve near-instantly instead of
+	// spending the real 120s window; production code leaves both zero and
+	// convergeArm falls back to the package constants.
+	podSettleThreshold time.Duration
+	podSettleTimeout   time.Duration
 }
 
 // sleep waits d, calling sleepFunc instead of time.Sleep when a test has
@@ -1001,6 +1019,101 @@ func uniqueNonEmptyLines(out string) []string {
 		lines = append(lines, line)
 	}
 	return lines
+}
+
+// controllerPodIdentity captures the observable identity of the provider
+// controller Pod actually running at the instant it was read: its own
+// Pod name (NOT the Deployment name resolveControllerDeploymentName
+// returns — a rolling restart replaces the Pod object while the
+// Deployment's name stays fixed) and when that Pod was created.
+//
+// Two reads whose Name differs mean the Pod was replaced between them —
+// by resetEventBurst, an OOM kill, an operator action, a package
+// re-install, or anything else. convergeArm and convergeAssert
+// deliberately never ask which cause it was; the cluster fact that the
+// process changed is all either of them needs.
+type controllerPodIdentity struct {
+	Name      string
+	CreatedAt time.Time
+}
+
+// resolveControllerPodIdentity reports the provider controller Pod's
+// current identity, deferring to podIdentityFunc when a test has set one.
+func (r *Runner) resolveControllerPodIdentity() (controllerPodIdentity, error) {
+	if r.podIdentityFunc != nil {
+		return r.podIdentityFunc()
+	}
+	return r.resolveControllerPodIdentityLive()
+}
+
+// resolveControllerPodIdentityLive resolves the provider controller
+// Deployment exactly as restartControllerDeployment does, then reads the
+// name and creation time of the Pod(s) currently running under it. A
+// rollout can briefly show more than one Pod (the old one mid-termination
+// alongside the new one); the entry with the greatest CreatedAt is the one
+// currently running, so that is the one reported — see
+// latestControllerPodIdentity.
+func (r *Runner) resolveControllerPodIdentityLive() (controllerPodIdentity, error) {
+	name, err := r.resolveControllerDeploymentName()
+	if err != nil {
+		return controllerPodIdentity{}, fmt.Errorf("resolving provider deployment: %w", err)
+	}
+
+	out, err := r.runRaw("get", "pods", "-n", providerDeploymentNamespace,
+		"-l", providerDeploymentSelector+"="+name,
+		"-o", `jsonpath={range .items[*]}{.metadata.name}{"\t"}{.metadata.creationTimestamp}{"\n"}{end}`)
+	if err != nil {
+		return controllerPodIdentity{}, fmt.Errorf("listing controller pods for deployment %s: %w", name, err)
+	}
+
+	identity, found := latestControllerPodIdentity(parseControllerPodIdentities(out))
+	if !found {
+		return controllerPodIdentity{}, fmt.Errorf("no controller pod found for deployment %s in namespace %s", name, providerDeploymentNamespace)
+	}
+	return identity, nil
+}
+
+// parseControllerPodIdentities parses the "<pod-name>\t<creationTimestamp>"
+// lines resolveControllerPodIdentityLive's kubectl query produces, one per
+// Pod. A line whose timestamp component is missing or fails to parse as
+// RFC3339 (the format kubectl's jsonpath always emits for a
+// metav1.Time) reports a zero CreatedAt rather than an error — read by
+// every caller as "very old", the correct conservative default for a
+// shape this parser cannot otherwise make sense of.
+func parseControllerPodIdentities(out string) []controllerPodIdentity {
+	var identities []controllerPodIdentity
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 2)
+		id := controllerPodIdentity{Name: parts[0]}
+		if len(parts) == 2 {
+			if ts, err := time.Parse(time.RFC3339, strings.TrimSpace(parts[1])); err == nil {
+				id.CreatedAt = ts
+			}
+		}
+		identities = append(identities, id)
+	}
+	return identities
+}
+
+// latestControllerPodIdentity returns whichever identity carries the
+// greatest CreatedAt — the Pod currently running, since an older entry can
+// only be one mid-termination during a rollout (see
+// resolveControllerPodIdentityLive). found is false for an empty input.
+func latestControllerPodIdentity(identities []controllerPodIdentity) (identity controllerPodIdentity, found bool) {
+	if len(identities) == 0 {
+		return controllerPodIdentity{}, false
+	}
+	latest := identities[0]
+	for _, id := range identities[1:] {
+		if id.CreatedAt.After(latest.CreatedAt) {
+			latest = id
+		}
+	}
+	return latest, true
 }
 
 // runFieldTest executes a single (non-skipped) update test: it patches the

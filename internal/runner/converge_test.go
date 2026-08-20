@@ -2,6 +2,7 @@ package runner
 
 import (
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1123,4 +1124,215 @@ func TestRunConvergeIgnoresSiblingScopeLogLines(t *testing.T) {
 	if !result.Passed {
 		t.Fatalf("expected Passed=true: the sibling scope's Update() calls must not be attributed to this resource, got %+v", result)
 	}
+}
+
+// sequentialPodIdentity returns a podIdentityFunc stand-in that reports
+// names[0], names[1], ... in order, then keeps repeating the LAST name
+// forever once the list is exhausted — standing for a controller Pod that
+// restarts some number of times and then stays put. Every reported
+// identity carries a CreatedAt far in the past, so it always satisfies
+// convergeArm's settle gate on the very first read regardless of the
+// threshold in effect; these tests are about identity-change detection,
+// not about the settle gate covered by TestConvergeArmPodSettleGate.
+func sequentialPodIdentity(names ...string) func() (controllerPodIdentity, error) {
+	i := 0
+	return func() (controllerPodIdentity, error) {
+		name := names[i]
+		if i < len(names)-1 {
+			i++
+		}
+		return controllerPodIdentity{Name: name, CreatedAt: time.Now().Add(-time.Hour)}, nil
+	}
+}
+
+// TestConvergeArmPodSettleGate pins convergeArm's new pre-check: it must
+// refuse to take a baseline while the provider controller Pod is younger
+// than the settle threshold — reporting the same RESOURCE NOT IN STEADY
+// STATE verdict an unsettled generation reports, and naming the Pod and its
+// age — and must record the settled Pod's identity into the baseline once
+// it does proceed, which is what convergeAssertAttempt later compares
+// against.
+func TestConvergeArmPodSettleGate(t *testing.T) {
+	m := &manifest.Manifest{Kind: testKindExample, Name: testNameExample}
+	opts := ConvergeOptions{
+		PollInterval:     time.Millisecond,
+		ReadinessTimeout: time.Second,
+		Timeout:          time.Second,
+	}
+
+	t.Run("YoungPodRefusesBaseline", func(t *testing.T) {
+		f := &fakeCluster{generation: 1, readyAfterCalls: 1, atProvider: map[string]interface{}{"zone": "a"}}
+		r := newFakeRunner(f)
+		r.sleepFunc = func(time.Duration) {}
+		r.podSettleTimeout = 10 * time.Millisecond
+		r.podIdentityFunc = func() (controllerPodIdentity, error) {
+			return controllerPodIdentity{Name: "provider-example-fresh", CreatedAt: time.Now()}, nil
+		}
+
+		baseline, early, err := r.convergeArm(m, opts)
+		if err != nil {
+			t.Fatalf("convergeArm() error = %v", err)
+		}
+		if baseline != nil {
+			t.Fatalf("expected no baseline when the controller Pod never settles within the timeout, got %+v", baseline)
+		}
+		if early == nil {
+			t.Fatal("expected an early verdict, got nil")
+		}
+		if early.Passed {
+			t.Errorf("expected Passed=false, got %+v", early)
+		}
+		if early.Message != "RESOURCE NOT IN STEADY STATE" {
+			t.Errorf("Message = %q, want %q — an unsettled controller Pod is not evidence of a loop", early.Message, "RESOURCE NOT IN STEADY STATE")
+		}
+		if len(early.Diagnostics) != 1 || !strings.Contains(early.Diagnostics[0], "provider-example-fresh") {
+			t.Errorf("expected exactly one diagnostic naming the young Pod, got %v", early.Diagnostics)
+		}
+	})
+
+	t.Run("SettledPodRecordsIdentityInBaseline", func(t *testing.T) {
+		f := &fakeCluster{generation: 1, readyAfterCalls: 1, atProvider: map[string]interface{}{"zone": "a"}}
+		r := newFakeRunner(f)
+		r.sleepFunc = func(time.Duration) {}
+		r.podIdentityFunc = func() (controllerPodIdentity, error) {
+			return controllerPodIdentity{Name: "provider-example-old", CreatedAt: time.Now().Add(-time.Hour)}, nil
+		}
+
+		baseline, early, err := r.convergeArm(m, opts)
+		if err != nil {
+			t.Fatalf("convergeArm() error = %v", err)
+		}
+		if early != nil {
+			t.Fatalf("expected no early verdict for an already-settled Pod, got %+v", early)
+		}
+		if baseline == nil {
+			t.Fatal("expected a baseline, got nil")
+		}
+		if baseline.PodIdentity.Name != "provider-example-old" {
+			t.Errorf("baseline.PodIdentity.Name = %q, want %q", baseline.PodIdentity.Name, "provider-example-old")
+		}
+	})
+}
+
+// TestConvergeAssertRestartDetection is this ticket's central proof: a
+// provider controller Pod restart during the observation window must never
+// be reported as RECONCILIATION LOOP DETECTED, a resource whose window is
+// spoiled on every attempt must never be silently passed, and — the
+// regression guard — a window with NO restart must behave exactly as it
+// did before this change, in both the happy-path and genuine-loop
+// directions.
+func TestConvergeAssertRestartDetection(t *testing.T) {
+	newManifest := func() *manifest.Manifest {
+		return &manifest.Manifest{Kind: testKindExample, Name: testNameExample}
+	}
+	opts := ConvergeOptions{
+		PollInterval:     time.Millisecond,
+		ReadinessTimeout: time.Second,
+		Timeout:          time.Second,
+	}
+
+	t.Run("NoRestartHappyPathIsByteIdenticalToPreChangeBehavior", func(t *testing.T) {
+		f := &fakeCluster{generation: 1, readyAfterCalls: 1, atProvider: map[string]interface{}{"zone": "a"}}
+		r := newFakeRunner(f)
+		r.sleepFunc = func(time.Duration) {}
+		r.podIdentityFunc = sequentialPodIdentity("provider-example-abc")
+
+		result, err := r.RunConverge(newManifest(), opts)
+		if err != nil {
+			t.Fatalf("RunConverge() error = %v", err)
+		}
+		if !result.Passed {
+			t.Fatalf("expected Passed=true with no restart observed, got %+v", result)
+		}
+		// This is the exact message buildConvergeResult has always produced
+		// for this scenario (see TestBuildConvergeResultHeadline) — pinned
+		// here to prove the new gate cannot fire spuriously on the happy
+		// path.
+		const want = "resource stable (1 cycle observed, 0 updates)"
+		if result.Message != want {
+			t.Errorf("Message = %q, want %q — the pod-restart gate must be a no-op when no restart occurred", result.Message, want)
+		}
+		if len(result.Diagnostics) != 0 {
+			t.Errorf("expected zero diagnostics on the happy path, got %v", result.Diagnostics)
+		}
+	})
+
+	t.Run("OneRestartReArmsAndStillPasses", func(t *testing.T) {
+		f := &fakeCluster{generation: 1, readyAfterCalls: 1, atProvider: map[string]interface{}{"zone": "a"}}
+		r := newFakeRunner(f)
+		r.sleepFunc = func(time.Duration) {}
+		r.podIdentityFunc = sequentialPodIdentity("provider-example-old", "provider-example-new")
+
+		result, err := r.RunConverge(newManifest(), opts)
+		if err != nil {
+			t.Fatalf("RunConverge() error = %v", err)
+		}
+		if !result.Passed {
+			t.Fatalf("expected Passed=true: a restart mid-window is a legitimate re-reconcile, not drift, got %+v", result)
+		}
+		if result.Message == "RECONCILIATION LOOP DETECTED" {
+			t.Error("a provider controller Pod restart must never be reported as a reconciliation loop")
+		}
+	})
+
+	t.Run("RestartOnEveryAttemptReportsInconclusiveNeverASilentPass", func(t *testing.T) {
+		f := &fakeCluster{generation: 1, readyAfterCalls: 1, atProvider: map[string]interface{}{"zone": "a"}}
+		r := newFakeRunner(f)
+		r.sleepFunc = func(time.Duration) {}
+		i := 0
+		r.podIdentityFunc = func() (controllerPodIdentity, error) {
+			i++
+			// A fresh, never-repeating name on every single call: the
+			// controller Pod is (implausibly) restarting continuously,
+			// so every re-arm's own baseline is immediately spoiled too.
+			return controllerPodIdentity{Name: "provider-example-" + strconv.Itoa(i), CreatedAt: time.Now().Add(-time.Hour)}, nil
+		}
+
+		result, err := r.RunConverge(newManifest(), opts)
+		if err != nil {
+			t.Fatalf("RunConverge() error = %v", err)
+		}
+		if result.Passed {
+			t.Fatalf("a resource whose window was spoiled on every attempt must never silently pass, got %+v", result)
+		}
+		if result.Message != "CONVERGENCE INCONCLUSIVE" {
+			t.Errorf("Message = %q, want %q", result.Message, "CONVERGENCE INCONCLUSIVE")
+		}
+		if len(result.Diagnostics) != 1 || !strings.Contains(result.Diagnostics[0], "restarted 3 time(s)") {
+			t.Errorf("expected exactly one diagnostic naming the bounded restart count (convergeMaxRestartRetries=2, so 3 observed restarts before giving up), got %v", result.Diagnostics)
+		}
+	})
+
+	t.Run("GenuineLoopWithNoRestartStillReportsLoopDetected", func(t *testing.T) {
+		f := &fakeCluster{
+			generation:      3,
+			readyAfterCalls: 1,
+			atProvider:      map[string]interface{}{"zone": "a"},
+			kind:            testKindExample,
+			name:            testNameExample,
+			// The event channel never moves — the rate limiter has not
+			// flushed — so only the controller-log instrument catches
+			// this, exactly as in TestRunConvergeDetectsLoopFromControllerLogAlone.
+			generations: []int32{0},
+			logLines: strings.Join([]string{
+				testReconcileLogLine,
+				newTestUpdateLogLine(testNameExample, ""),
+				newTestUpdateLogLine(testNameExample, ""),
+			}, "\n"),
+		}
+		r := newFakeRunner(f)
+		r.sleepFunc = func(time.Duration) {}
+		r.podIdentityFunc = sequentialPodIdentity("provider-example-stable")
+
+		result, err := r.RunConverge(newManifest(), opts)
+		if err != nil {
+			t.Fatalf("RunConverge() error = %v", err)
+		}
+		if result.Passed {
+			t.Fatalf("a genuine Update()-call loop with no restart observed must still fail, got %+v", result)
+		}
+		if result.Message != "RECONCILIATION LOOP DETECTED" {
+			t.Errorf("Message = %q, want %q — the restart-awareness gate must never mask a real loop", result.Message, "RECONCILIATION LOOP DETECTED")
+		}
+	})
 }

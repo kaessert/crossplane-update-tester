@@ -146,13 +146,83 @@ func convergeWait(opts ConvergeOptions) time.Duration {
 // convergeBaseline is everything convergeAssert needs to evaluate a
 // resource once the observation window has elapsed. ArmedAt is when the
 // baseline snapshot was actually taken, which is what a shared window must
-// be measured from — see RunConvergeAll.
+// be measured from — see RunConvergeAll. PodIdentity is the provider
+// controller Pod convergeArm confirmed had already settled before taking
+// this baseline; convergeAssert compares its own read against it to detect
+// a restart spoiling the window (see convergeAssertAttempt).
 type convergeBaseline struct {
-	Snapshot []byte
-	Events   int
-	Gen      int64
-	Notes    []string
-	ArmedAt  time.Time
+	Snapshot    []byte
+	Events      int
+	Gen         int64
+	Notes       []string
+	ArmedAt     time.Time
+	PodIdentity controllerPodIdentity
+}
+
+// controllerPodSettleThreshold is the minimum age a provider controller Pod
+// must have reached before convergeArm may take its baseline snapshot. A
+// Pod fresher than this may still be running its own cold-start reconcile
+// burst against every resource on the cluster — the same "still coming up"
+// fact the readiness gate (see ConvergeOptions.ReadinessTimeout) already
+// accounts for on the managed resource, applied here to the process that
+// reconciles it.
+const controllerPodSettleThreshold = 15 * time.Second
+
+// controllerPodSettleTimeout bounds how long convergeArm waits for the
+// provider controller Pod to age past controllerPodSettleThreshold before
+// giving up and reporting RESOURCE NOT IN STEADY STATE — the same verdict
+// an unsettled generation reports, for the same reason: nothing has been
+// observed to repeat yet, so this is not evidence of a loop.
+const controllerPodSettleTimeout = 120 * time.Second
+
+// controllerPodSettlePollInterval paces convergeArm's wait for the
+// controller Pod to settle. Matches waitGenerationSettled/waitReady's own
+// 2-second cadence rather than inventing a second one.
+const controllerPodSettlePollInterval = 2 * time.Second
+
+// convergeMaxRestartRetries bounds how many times convergeAssertAttempt
+// will re-arm and re-measure a resource whose provider controller Pod
+// identity changed between arm and assert, before giving up and reporting
+// an explicit inconclusive verdict rather than ever silently passing. Two
+// tolerates one burst-reset restart landing right at the edge of the
+// observation window plus one more from an unrelated concurrent cause,
+// without masking a controller that is being restarted continuously by
+// something else entirely.
+const convergeMaxRestartRetries = 2
+
+// waitControllerPodSettled polls resolveControllerPodIdentity until the Pod
+// it reports is at least threshold old, or timeout elapses. It mirrors
+// waitGenerationSettled/waitReady's bounded-poll shape exactly.
+func (r *Runner) waitControllerPodSettled(threshold, timeout time.Duration) (identity controllerPodIdentity, settled bool, err error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		identity, err = r.resolveControllerPodIdentity()
+		if err != nil {
+			return identity, false, err
+		}
+		if time.Since(identity.CreatedAt) >= threshold {
+			return identity, true, nil
+		}
+		if time.Now().After(deadline) {
+			return identity, false, nil
+		}
+		r.sleep(controllerPodSettlePollInterval)
+	}
+}
+
+// podSettleParams resolves the effective settle threshold and timeout,
+// falling back to the package constants when a test has not overridden
+// Runner.podSettleThreshold / podSettleTimeout.
+func (r *Runner) podSettleParams() (threshold, timeout time.Duration) {
+	threshold = r.podSettleThreshold
+	if threshold <= 0 {
+		threshold = controllerPodSettleThreshold
+	}
+	timeout = r.podSettleTimeout
+	if timeout <= 0 {
+		timeout = controllerPodSettleTimeout
+	}
+	return threshold, timeout
 }
 
 // convergeArm runs every step that must complete BEFORE the observation
@@ -248,23 +318,117 @@ func (r *Runner) convergeArm(m *manifest.Manifest, opts ConvergeOptions) (*conve
 			readinessTimeout))
 	}
 
+	// Refuse to take the baseline while the provider controller Pod is
+	// still within its own cold-start window: a Pod that has just been
+	// (re)created may still be running the reconcile burst every
+	// controller performs against its whole watch set on start-up, and a
+	// baseline taken mid-burst would misread that burst as drift the
+	// instant it lands. Unlike the readiness gate above, a timeout here
+	// DOES fail the check — see waitControllerPodSettled's caller below.
+	podSettleThreshold, podSettleTimeout := r.podSettleParams()
+	podIdentity, podSettled, err := r.waitControllerPodSettled(podSettleThreshold, podSettleTimeout)
+	if err != nil {
+		return nil, nil, fmt.Errorf("provider controller pod pre-check: %w", err)
+	}
+	if !podSettled {
+		// Not a reconciliation loop: this is the same distinction
+		// waitGenerationSettled's timeout draws above — nothing has been
+		// observed to repeat, the controller Pod has simply never aged
+		// past the settle threshold within the timeout (most likely a
+		// crash-loop on the controller itself, or a burst reset landing
+		// back to back with another restart).
+		return nil, &ConvergeResult{
+			Passed:  false,
+			Message: "RESOURCE NOT IN STEADY STATE",
+			Diagnostics: []string{
+				fmt.Sprintf("pre-check: provider controller pod %q is %s old, younger than the %s settle threshold, within %s",
+					podIdentity.Name, time.Since(podIdentity.CreatedAt).Round(time.Second), podSettleThreshold, podSettleTimeout),
+			},
+		}, nil
+	}
+
 	before, beforeEvents, err := r.recordConvergeBaseline(m)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	return &convergeBaseline{
-		Snapshot: before,
-		Events:   beforeEvents,
-		Gen:      gen,
-		Notes:    notes,
-		ArmedAt:  time.Now(),
+		Snapshot:    before,
+		Events:      beforeEvents,
+		Gen:         gen,
+		Notes:       notes,
+		ArmedAt:     time.Now(),
+		PodIdentity: podIdentity,
 	}, nil, nil
 }
 
 // convergeAssert runs every step that must happen AFTER the observation
-// window has elapsed: the post-wait snapshot, the diff, and the verdict.
+// window has elapsed: the provider-controller-Pod-identity check, the
+// post-wait snapshot, the diff, and the verdict.
 func (r *Runner) convergeAssert(m *manifest.Manifest, opts ConvergeOptions, b *convergeBaseline, waitDur time.Duration) (*ConvergeResult, error) {
+	return r.convergeAssertAttempt(m, opts, b, waitDur, 0)
+}
+
+// convergeAssertAttempt is convergeAssert's actual body, carrying an
+// attempt counter so it can re-arm and re-measure a resource whose
+// provider controller Pod was replaced during the observation window,
+// bounded by convergeMaxRestartRetries.
+//
+// Detection is a single identity read compared against the one convergeArm
+// recorded in the baseline — both reads go through
+// resolveControllerPodIdentity, which is derived from the cluster
+// (resolveControllerDeploymentName plus a Pod list) rather than from any
+// state carried by this process. That matters because the restart this
+// exists to catch is typically issued by a DIFFERENT process invocation
+// entirely — the "run" subcommand's resetEventBurst, executed well before
+// "converge-all" ever starts — so an in-memory restart timestamp would be
+// structurally unavailable here even if one existed. Reading the cluster's
+// own state also means this check catches a restart from ANY cause —
+// resetEventBurst, an OOM kill, an operator action, a package re-install —
+// rather than only the one this tool itself issues.
+//
+// A restart is a legitimate full re-reconcile, not evidence of drift, so
+// the spoiled window is discarded and re-measured rather than having its
+// restart-caused Update() calls subtracted out: subtraction would require
+// guessing which calls were caused by the restart, and converge is
+// read-only, so re-measuring costs one more short window rather than a
+// live run.
+func (r *Runner) convergeAssertAttempt(m *manifest.Manifest, opts ConvergeOptions, b *convergeBaseline, waitDur time.Duration, restarts int) (*ConvergeResult, error) {
+	if b.PodIdentity.Name != "" {
+		current, err := r.resolveControllerPodIdentity()
+		if err != nil {
+			return nil, fmt.Errorf("provider controller pod identity check: %w", err)
+		}
+		if current.Name != b.PodIdentity.Name {
+			if restarts >= convergeMaxRestartRetries {
+				// Never silently pass: a resource whose window was spoiled
+				// on every attempt is not a resource that converged, and
+				// reporting RECONCILIATION LOOP DETECTED here would blame
+				// the controller for exactly the restarts this check exists
+				// to look past.
+				return &ConvergeResult{
+					Passed:  false,
+					Message: "CONVERGENCE INCONCLUSIVE",
+					Diagnostics: []string{
+						fmt.Sprintf("provider controller pod restarted %d time(s) during observation (last baseline pod %q, now %q) — the observation window was spoiled on every attempt, so no pass/fail verdict can be reported",
+							restarts+1, b.PodIdentity.Name, current.Name),
+					},
+				}, nil
+			}
+
+			newBaseline, early, err := r.convergeArm(m, opts)
+			if err != nil {
+				return nil, err
+			}
+			if early != nil {
+				return early, nil
+			}
+			freshWait := convergeWait(opts)
+			time.Sleep(freshWait)
+			return r.convergeAssertAttempt(m, opts, newBaseline, freshWait, restarts+1)
+		}
+	}
+
 	after, afterEvents, afterGen, afterReady, err := r.recordConvergeOutcome(m)
 	if err != nil {
 		return nil, err

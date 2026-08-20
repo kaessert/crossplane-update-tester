@@ -1194,6 +1194,45 @@ func TestApplyPatchAndReconcileAbsorbsLateInitConflictBeforeReturning(t *testing
 	}
 }
 
+// TestApplyPatchAndReconcileClearNullsSiblingInSamePatch proves the
+// end-to-end wiring of manifest.UpdateTest.Clear: applyPatchAndReconcile
+// passes t.Clear through to Patch/buildMergePatch, so a switch test sets
+// its primary field AND nulls its named sibling(s) in ONE kubectl patch
+// call — never two sequential patches that could each independently
+// succeed while leaving both union arms set on the backend.
+func TestApplyPatchAndReconcileClearNullsSiblingInSamePatch(t *testing.T) {
+	f := &fakeCluster{
+		forProvider: map[string]interface{}{
+			"defaultBotSetting": map[string]interface{}{},
+		},
+		atProvider:      map[string]interface{}{},
+		generation:      1,
+		kind:            testKindExample,
+		name:            testNameExample,
+		readyAfterCalls: 1,
+	}
+	r := newFakeRunner(f)
+
+	test := manifest.UpdateTest{
+		Field: "botProtectionSetting",
+		Value: map[string]interface{}{},
+		Clear: []string{"defaultBotSetting"},
+	}
+	if err := r.applyPatchAndReconcile(test); err != nil {
+		t.Fatalf("applyPatchAndReconcile: %v", err)
+	}
+
+	if f.patchCalls != 1 {
+		t.Errorf("expected exactly 1 real field patch (the switch must be atomic), got %d", f.patchCalls)
+	}
+	if _, stillPresent := f.forProvider["defaultBotSetting"]; stillPresent {
+		t.Errorf("forProvider still carries defaultBotSetting after the clear-bearing patch, want it removed")
+	}
+	if _, ok := f.forProvider["botProtectionSetting"]; !ok {
+		t.Errorf("forProvider is missing botProtectionSetting, want the primary field's value applied")
+	}
+}
+
 // TestRunFieldTestNotEvidencedWhenNoUpdateEvent covers the failure mode this
 // evidence check exists to catch: a field whose observed value ends up
 // matching the target (e.g. because something outside the reconciler wrote
@@ -2545,12 +2584,15 @@ func TestResolveResourceRecordsNamespace(t *testing.T) {
 }
 
 // TestBuildMergePatch covers the dot-path-to-JSON-merge-patch conversion,
-// including the nested case where each segment becomes a wrapping object.
+// including the nested case where each segment becomes a wrapping object,
+// and the "clear" case where OTHER top-level forProvider siblings are
+// nulled in the SAME patch object as the primary field's value.
 func TestBuildMergePatch(t *testing.T) {
 	cases := map[string]struct {
 		reason string
 		field  string
 		value  interface{}
+		clear  []string
 		want   string
 	}{
 		"TopLevelField": {
@@ -2565,16 +2607,71 @@ func TestBuildMergePatch(t *testing.T) {
 			value:  "value",
 			want:   `{"spec":{"forProvider":{"parent":{"child":"value"}}}}`,
 		},
+		"ClearSingleSibling": {
+			reason: "a top-level field with one clear entry nulls that sibling in the SAME patch object",
+			field:  "botProtectionSetting",
+			value:  map[string]interface{}{},
+			clear:  []string{"defaultBotSetting"},
+			want:   `{"spec":{"forProvider":{"botProtectionSetting":{},"defaultBotSetting":null}}}`,
+		},
+		"ClearMultipleSiblings": {
+			reason: "every named sibling is nulled, not just the first",
+			field:  "armA",
+			value:  "x",
+			clear:  []string{"armB", "armC"},
+			want:   `{"spec":{"forProvider":{"armA":"x","armB":null,"armC":null}}}`,
+		},
 	}
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			got, err := buildMergePatch(tc.field, tc.value)
+			got, err := buildMergePatch(tc.field, tc.value, tc.clear)
 			if err != nil {
 				t.Fatalf("%s: unexpected error: %v", tc.reason, err)
 			}
 			if got != tc.want {
 				t.Errorf("%s: buildMergePatch() = %s, want %s", tc.reason, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBuildMergePatchRejectsUnsupportedClearShapes proves the three shapes
+// buildMergePatch cannot honour are rejected outright, at patch-build time,
+// rather than silently producing a merge patch that nulls the wrong object
+// or undoes the very value it just set. Nested (dotted) field paired with a
+// non-empty clear is explicitly OUT OF SCOPE — sibling-clearing at a
+// non-root nesting level is not supported — so it is one of the rejected
+// shapes here rather than a shape that "falls out for free".
+func TestBuildMergePatchRejectsUnsupportedClearShapes(t *testing.T) {
+	cases := map[string]struct {
+		reason string
+		field  string
+		clear  []string
+	}{
+		"NestedFieldWithClear": {
+			reason: "sibling-clearing at a non-root nesting level is not supported: a dotted field's " +
+				"\"sibling\" would land next to the nested field's own parent object, not next to its value",
+			field: "parent.child",
+			clear: []string{"otherTopLevel"},
+		},
+		"DottedClearEntry": {
+			reason: "clear only names a top-level spec.forProvider field, mirroring ignore-fields' own dot rejection",
+			field:  "botProtectionSetting",
+			clear:  []string{"nested.sibling"},
+		},
+		"ClearNamesFieldItself": {
+			reason: "clear must name OTHER siblings; naming field itself would null the value the patch just set",
+			field:  "botProtectionSetting",
+			clear:  []string{"botProtectionSetting"},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := buildMergePatch(tc.field, "value", tc.clear)
+			if err == nil {
+				t.Fatalf("%s: expected an error, got none", tc.reason)
 			}
 		})
 	}

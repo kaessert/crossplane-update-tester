@@ -580,6 +580,130 @@ assert-unchanged: comment
 	}
 }
 
+// TestParseBytesClearField proves a "clear:" key on an update-test entry
+// parses onto UpdateTest.Clear, and that a manifest with no "clear:" key at
+// all parses with a nil Clear — the fleet's 727 pre-existing entries carry
+// no such key, so this is the "additive only" case every one of them must
+// keep matching.
+func TestParseBytesClearField(t *testing.T) {
+	cases := map[string]struct {
+		reason string
+		yaml   string
+		want   []string
+	}{
+		"Absent": {
+			reason: "an entry with no clear key parses with a nil Clear, not an error",
+			yaml: `
+apiVersion: network.example.crossplane.io/v1alpha1
+kind: Network
+metadata:
+  name: example-network
+  annotations:
+    crossplane.io/update-test: |
+      - field: comment
+        value: "updated"
+`,
+			want: nil,
+		},
+		"SingleSibling": {
+			reason: "a single-element clear list is parsed verbatim",
+			yaml: `
+apiVersion: network.example.crossplane.io/v1alpha1
+kind: Network
+metadata:
+  name: example-network
+  annotations:
+    crossplane.io/update-test: |
+      - field: botProtectionSetting
+        value: {}
+        clear: [defaultBotSetting]
+`,
+			want: []string{"defaultBotSetting"},
+		},
+		"MultipleSiblings": {
+			reason: "every member of the union group is preserved, not just the first",
+			yaml: `
+apiVersion: network.example.crossplane.io/v1alpha1
+kind: Network
+metadata:
+  name: example-network
+  annotations:
+    crossplane.io/update-test: |
+      - field: armA
+        value: "x"
+        clear: [armB, armC]
+`,
+			want: []string{"armB", "armC"},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			m, err := ParseBytes([]byte(tc.yaml))
+			if err != nil {
+				t.Fatalf("%s: ParseBytes() error = %v", tc.reason, err)
+			}
+			if len(m.Tests) != 1 {
+				t.Fatalf("%s: len(Tests) = %d, want 1", tc.reason, len(m.Tests))
+			}
+			if !stringSlicesEqual(m.Tests[0].Clear, tc.want) {
+				t.Errorf("%s: Tests[0].Clear = %#v, want %#v", tc.reason, m.Tests[0].Clear, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseAnnotationRejectsUnsupportedClearShapes pins ValidateClear's three
+// rejections at the annotation-parsing entry point — before any cluster is
+// touched — mirroring the ignore-fields dotted-entry rejection shape.
+func TestParseAnnotationRejectsUnsupportedClearShapes(t *testing.T) {
+	cases := map[string]struct {
+		reason        string
+		annotation    string
+		wantErrSubstr string
+	}{
+		"NestedFieldWithClear": {
+			reason: "sibling-clearing at a non-root nesting level is not supported",
+			annotation: `
+- field: parent.child
+  value: "x"
+  clear: [otherTopLevel]
+`,
+			wantErrSubstr: `clear is only supported for a top-level field; "parent.child" is nested`,
+		},
+		"DottedClearEntry": {
+			reason: "a clear entry naming a nested path is rejected the same way ignore-fields rejects one",
+			annotation: `
+- field: botProtectionSetting
+  value: {}
+  clear: [nested.sibling]
+`,
+			wantErrSubstr: `clear entry "nested.sibling": dot-separated paths are not supported`,
+		},
+		"ClearNamesFieldItself": {
+			reason: "clear must name OTHER siblings, not the field being patched",
+			annotation: `
+- field: botProtectionSetting
+  value: {}
+  clear: [botProtectionSetting]
+`,
+			wantErrSubstr: `clear entry "botProtectionSetting": clear must name OTHER sibling fields`,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, _, _, _, err := ParseAnnotation(tc.annotation)
+			if err == nil {
+				t.Fatalf("%s: ParseAnnotation() error = nil, want an error", tc.reason)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrSubstr) {
+				t.Errorf("%s: ParseAnnotation() error = %q, want it to contain %q", tc.reason, err.Error(), tc.wantErrSubstr)
+			}
+		})
+	}
+}
+
 // stringSlicesEqual compares two string slices for equality, treating nil
 // and empty as distinct only when one is nil and the other is non-nil with
 // elements — a plain reflect.DeepEqual would report nil != []string{} as

@@ -35,6 +35,24 @@ type UpdateTest struct {
 	Value  interface{} `yaml:"value"`
 	Expect interface{} `yaml:"expect"`
 	Skip   string      `yaml:"skip"`
+	// Clear names OTHER top-level spec.forProvider fields that must be
+	// nulled in the SAME merge patch that sets Field's own Value.
+	//
+	// It exists for a union modeled as separate top-level *Parameters
+	// fields rather than as alternative values nested inside one field's
+	// own object (the latter shape already works: a JSON merge patch
+	// naturally nulls a sibling KEY WITHIN the field it is patching). Two
+	// sequential single-field patches — one setting the new arm, one
+	// nulling the old — would each independently succeed at the
+	// Kubernetes level while leaving both arms set on the backend between
+	// them, and if the backend enforces mutual exclusivity that races the
+	// test against the backend's own validation. Folding every named
+	// sibling's null into ONE merge-patch object makes the switch atomic.
+	//
+	// Every OTHER member of the union group must be named here, not only
+	// the one arm being switched away from — see ValidateClear and
+	// runner.buildMergePatch for how this list is consumed.
+	Clear []string `yaml:"clear"`
 }
 
 // Manifest holds the parsed Kubernetes manifest metadata needed for testing.
@@ -273,6 +291,9 @@ func ParseAnnotation(annotation string) ([]UpdateTest, string, []string, []strin
 		if t.Value == nil && t.Skip == "" {
 			return nil, "", nil, nil, fmt.Errorf("entry %d (%s): value is required unless skip is set", i, t.Field)
 		}
+		if err := ValidateClear(t.Field, t.Clear); err != nil {
+			return nil, "", nil, nil, fmt.Errorf("entry %d (%s): %w", i, t.Field, err)
+		}
 		testedFields[t.Field] = true
 	}
 	for _, f := range assertUnchanged {
@@ -350,6 +371,54 @@ func ValidateIgnoreFields(fields []string) error {
 				"ignore-fields entry %q: dot-separated paths are not supported — the convergence diff "+
 					"matches only a top-level status.atProvider field name, so a nested path would silently "+
 					"exclude nothing; declare the top-level field name instead", f)
+		}
+	}
+	return nil
+}
+
+// ValidateClear rejects a clear list that the merge-patch builder cannot
+// honour, at parse time, before any cluster is touched.
+//
+// clear only makes sense when field is ITSELF a top-level spec.forProvider
+// key: the null it adds lands as a sibling KEY at the top level of the merge
+// patch, alongside field's own value, and a dotted field patches into a
+// nested object one level down from there — nulling a "sibling" at the top
+// level in that case would not land next to the value being set at all, it
+// would land next to the nested field's own PARENT object, a different (and
+// currently unsupported) shape. Rather than silently building a patch that
+// nulls the wrong object, a dotted field paired with a non-empty clear is
+// rejected outright.
+//
+// Each entry in clear is validated the same way ignore-fields is: a dotted
+// entry there is also rejected, since this tool only ever nulls a top-level
+// sibling. An entry equal to field itself is rejected too — clear names
+// OTHER members of the union, and letting it also equal field would null out
+// the very value the patch is meant to set, silently undoing it (map
+// iteration order is not guaranteed, so the outcome would be indeterminate
+// besides being wrong).
+//
+// Exported so every source of a clear list shares this one check — the
+// "clear:" key on an update-test annotation entry (via ParseAnnotation
+// above) and the merge-patch builder that actually shapes the JSON (see
+// runner.buildMergePatch).
+func ValidateClear(field string, clear []string) error {
+	if len(clear) == 0 {
+		return nil
+	}
+	if strings.Contains(field, ".") {
+		return fmt.Errorf(
+			"clear is only supported for a top-level field; %q is nested — sibling-clearing at a "+
+				"non-root nesting level is not supported", field)
+	}
+	for _, c := range clear {
+		if strings.Contains(c, ".") {
+			return fmt.Errorf(
+				"clear entry %q: dot-separated paths are not supported — clear only names a "+
+					"top-level spec.forProvider field", c)
+		}
+		if c == field {
+			return fmt.Errorf(
+				"clear entry %q: clear must name OTHER sibling fields, not the field being patched itself", c)
 		}
 	}
 	return nil

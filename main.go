@@ -44,6 +44,7 @@
 //	update-tester converge <manifest.yaml> [--poll-interval 60s] [--ignore-fields a,b] [--timeout 120s] [--readiness-timeout 120s]
 //	update-tester converge-all <m1.yaml,m2.yaml,...> [--poll-interval 60s] [--concurrency 8] [--timeout 120s] [--readiness-timeout 120s]
 //	update-tester validate <manifest.yaml> --types-file <types.go> [--controller-dir <dir>]
+//	update-tester expect-skeleton <types.go> --kind <Kind> --field <field>
 //	update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
 //	update-tester resolve-recover <manifest.yaml> [--timeout 120]
 //	update-tester hook <invocation-name> [--root <dir>] [--manifest <path>] [--skip-converge]
@@ -110,6 +111,8 @@ func runCommand(name string, args []string) error {
 		return cmdRun(args)
 	case "validate":
 		return cmdValidate(args)
+	case "expect-skeleton":
+		return cmdExpectSkeleton(args)
 	case "converge":
 		return cmdConverge(args)
 	case "converge-all":
@@ -138,6 +141,7 @@ const usageSynopsis = `update-tester run <manifest.yaml> [--timeout 120] [--poll
 update-tester converge <manifest.yaml> [--poll-interval 60s] [--ignore-fields a,b] [--timeout 120s] [--readiness-timeout 120s]
 update-tester converge-all <m1.yaml,m2.yaml,...> [--poll-interval 60s] [--concurrency 8] [--timeout 120s] [--readiness-timeout 120s]
 update-tester validate <manifest.yaml> --types-file <types.go> [--controller-dir <dir>]
+update-tester expect-skeleton <types.go> --kind <Kind> --field <field>
 update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
 update-tester resolve-recover <manifest.yaml> [--timeout 120]
 update-tester hook <invocation-name> [--root <dir>] [--manifest <path>] [--skip-converge]
@@ -165,6 +169,10 @@ Flags may appear before or after the manifest path.
 Commands:
   run        Execute update tests against a live cluster
   validate   Check annotation coverage against Go type definitions
+  expect-skeleton
+             Print the non-omitempty Observation-struct keys a NEW
+             expect: block for one field would need to name — keys
+             only, a dev aid, not a check
   converge   Assert the resource reaches steady state after creation
              with zero spurious Update calls
   converge-all
@@ -476,6 +484,58 @@ func cmdValidate(args []string) error {
 	if len(echoFindings) > 0 {
 		return errors.New("update-test expectation omits a member the provider's controller declares server-echoed")
 	}
+	return nil
+}
+
+// ─── expect-skeleton ────────────────────────────────────────────────────────
+
+// expectSkeletonOptions holds the parsed command line of the
+// `expect-skeleton` subcommand.
+type expectSkeletonOptions struct {
+	typesFile string
+	kind      string
+	field     string
+}
+
+func parseExpectSkeletonArgs(args []string) (expectSkeletonOptions, error) {
+	fs := flag.NewFlagSet("expect-skeleton", flag.ContinueOnError)
+	kind := fs.String("kind", "", "The resource Kind whose {Kind}Parameters struct declares field")
+	field := fs.String("field", "", "The top-level JSON field name to emit an expect: skeleton for")
+	if err := fs.Parse(cli.ReorderArgs(fs, args)); err != nil {
+		return expectSkeletonOptions{}, err
+	}
+	if fs.NArg() < 1 {
+		return expectSkeletonOptions{}, errors.New("usage: update-tester expect-skeleton <types.go> --kind <Kind> --field <field>")
+	}
+	if *kind == "" {
+		return expectSkeletonOptions{}, errors.New("--kind is required")
+	}
+	if *field == "" {
+		return expectSkeletonOptions{}, errors.New("--field is required")
+	}
+	return expectSkeletonOptions{typesFile: fs.Arg(0), kind: *kind, field: *field}, nil
+}
+
+// cmdExpectSkeleton is a dev aid: given a Kind and a top-level field name, it
+// prints the exact set of non-omitempty Observation-struct keys a NEW
+// update-test expect: block for that field would need to name — keys only,
+// each set to a clearly-labelled placeholder, never a guessed value. It
+// exists for the class of nested-composite field where hand-deriving that
+// key set means reading the generated Observation struct by hand; nothing
+// else in the tool consumes its output, and no provider is required to use
+// it. See cli.BuildExpectSkeleton for the resolution this reuses.
+func cmdExpectSkeleton(args []string) error {
+	opts, err := parseExpectSkeletonArgs(args)
+	if err != nil {
+		return err
+	}
+
+	keys, err := cli.BuildExpectSkeleton(opts.typesFile, opts.kind, opts.field)
+	if err != nil {
+		return err
+	}
+
+	cli.PrintExpectSkeleton(os.Stdout, opts.field, keys)
 	return nil
 }
 

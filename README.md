@@ -36,6 +36,7 @@ update-tester run <manifest.yaml> [--timeout 120] [--poll-interval 60s]
 update-tester converge <manifest.yaml> [--poll-interval 60s] [--ignore-fields a,b] [--timeout 120s] [--readiness-timeout 120s]
 update-tester converge-all <m1.yaml,m2.yaml,...> [--poll-interval 60s] [--concurrency 8] [--timeout 120s] [--readiness-timeout 120s]
 update-tester validate <manifest.yaml> --types-file <types.go> [--controller-dir <dir>]
+update-tester expect-skeleton <types.go> --kind <Kind> --field <field>
 update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
 update-tester resolve-recover <manifest.yaml> [--timeout 120]
 update-tester hook <invocation-name> [--root <dir>] [--manifest <path>] [--skip-converge]
@@ -414,6 +415,34 @@ fingerprint (the generated struct must declare at least every field the
 hand-written one does), since the two are named independently by the
 generator and the controller author. A controller package with no such
 registration leaves this check inert — no findings, no error.
+
+### `expect-skeleton` — expect: key-set generator (dev aid)
+
+`expect-skeleton` needs no cluster and no manifest — only `--kind` and
+`--field`, plus the same `types.go` `validate` reads. It is the write side of
+`INCOMPLETE-EXPECT`: rather than reporting that an existing `expect:` block is
+missing keys, it prints the full key set a brand-new one would need, before
+you write it.
+
+```
+$ update-tester expect-skeleton zz_service_policy_rules_types.go --kind ServicePolicyRule --field domainMatcher
+expect: # skeleton for domainMatcher — keys only, fill in the real value(s)
+  regexValues: TODO
+```
+
+It reuses exactly the same resolution `validate`'s `INCOMPLETE-EXPECT` check
+does — the fast `<ElemType>Observation` path, then the `<Kind>Observation`
+reuse-layout fallback — so its output is only as complete as that check's own
+"silence is not a guarantee" caveat above already states. Every key printed
+is set to the literal placeholder `TODO`, never a guessed value: this command
+cannot know what the backend actually returns, only which keys the generated
+Observation struct requires an `expect:` block to name.
+
+No output keys printed (a comment line instead) means one of two things it
+cannot tell apart: the field genuinely needs no `expect:` block at all (every
+Observation member carries `omitempty`), or its Observation-side shape could
+not be resolved. Run `validate` against a real manifest naming the field to
+tell those two apart.
 
 ### `check-external-name-prefix` — identity guard (opt-in)
 

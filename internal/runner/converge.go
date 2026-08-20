@@ -141,6 +141,37 @@ func (r *Runner) RunConverge(m *manifest.Manifest, opts ConvergeOptions) (*Conve
 		}, nil
 	}
 
+	// waitGenerationSettled alone has a blind spot this closes: a reconcile
+	// that FAILS to persist a write (a late-init 409 conflict, for one)
+	// still stamps observedGeneration == the current generation on the
+	// Synced condition it marks False (ReconcileError) — so "settled"
+	// above can already be true on a pass that never actually succeeded.
+	// waitSynced additionally requires that condition's STATUS to be
+	// True, not merely its observedGeneration to match, closing the same
+	// gap here that reconcileOnce closes for the per-field update path.
+	synced, syncedStatus, syncedGen, syncedObsGen, err := r.waitSynced(timeout)
+	if err != nil {
+		return nil, fmt.Errorf("pre-check: %w", err)
+	}
+	if !synced {
+		return &ConvergeResult{
+			Passed:  false,
+			Message: "RESOURCE NOT IN STEADY STATE",
+			Diagnostics: []string{
+				fmt.Sprintf("pre-check: Synced condition did not reach True at generation %d within %s (last seen %q at observedGeneration %d)",
+					syncedGen, timeout, syncedStatus, syncedObsGen),
+			},
+		}, nil
+	}
+	// waitSynced can itself observe the generation advance past what
+	// waitGenerationSettled saw (a late-init write landing while THIS
+	// call polled) — rebase gen to that fresher value so the final
+	// "generation changed" comparison against afterGen (in
+	// buildConvergeResult) is measured from the generation the baseline
+	// snapshot below is actually about to be taken at, not from a value
+	// this same pre-check has since superseded.
+	gen = syncedGen
+
 	readinessTimeout := opts.ReadinessTimeout
 	if readinessTimeout <= 0 {
 		readinessTimeout = 120 * time.Second
@@ -375,6 +406,114 @@ func (r *Runner) waitReady(timeout time.Duration) (ready bool, err error) {
 		}
 		if time.Now().After(deadline) {
 			return false, nil
+		}
+		r.sleep(2 * time.Second)
+	}
+}
+
+// namedCondition reports one status.conditions entry by type: its status
+// string ("True"/"False"/"Unknown") and observedGeneration. found is false
+// when status.conditions is absent, empty, or carries no entry of condType
+// at all. observedGeneration is -1 when the entry is present but its
+// observedGeneration is missing or unparsable, which can never equal a
+// real generation (generations start at 1), so a caller comparing it
+// against metadata.generation always (correctly) treats that entry as
+// stale rather than accidentally matching on a zero value.
+func namedCondition(obj map[string]interface{}, condType string) (status string, observedGeneration int64, found bool) {
+	statusMap, ok := obj[jsonKeyStatus].(map[string]interface{})
+	if !ok {
+		return "", 0, false
+	}
+	condsRaw, ok := statusMap["conditions"].([]interface{})
+	if !ok {
+		return "", 0, false
+	}
+	for _, cRaw := range condsRaw {
+		c, ok := cRaw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if t, _ := c["type"].(string); t != condType {
+			continue
+		}
+		s, _ := c["status"].(string)
+		og, ogErr := toInt64(c["observedGeneration"])
+		if ogErr != nil {
+			og = -1
+		}
+		return s, og, true
+	}
+	return "", 0, false
+}
+
+// conditionTypeSynced is the crossplane-runtime managed-reconciler
+// condition type that reports whether the MOST RECENT reconcile
+// successfully persisted the desired state (ReconcileSuccess) or failed
+// trying to (ReconcileError). It is a different condition TYPE from
+// Ready — Ready reports external-resource availability, set by Observe()
+// on every successful GET regardless of whether that same pass went on to
+// write anything successfully. A resource can therefore read Ready=True
+// while Synced=False mid a late-init conflict-and-retry: WaitReady alone
+// cannot see that, because it only ever asks about Ready.
+const conditionTypeSynced = "Synced"
+
+// waitSynced polls the resource until its Synced condition reads "True" AT
+// THE RESOURCE'S CURRENT metadata.generation — not merely that a Synced
+// condition is present, and not merely that it is "True" at some
+// generation. Both distinctions matter for the same underlying race: a
+// late-init spec write that conflicts and retries leaves Synced "False"
+// (ReconcileError) at the CURRENT generation on the reconcile that failed
+// to persist it; a late-init write that then succeeds bumps the
+// generation, but the reconcile that persisted it can return before
+// re-marking Synced, leaving a "False" (or even a stale "True") Synced
+// condition whose observedGeneration lags the object's new generation.
+// Only the reconcile the watch auto-triggers off that generation bump
+// finally reaches the point where the reconciler evaluates the desired
+// state against the external resource and marks Synced "True" at the
+// generation that actually matters. Polling here (rather than a second
+// `kubectl wait`) is what makes the generation comparison possible in the
+// first place — kubectl's own condition wait has no way to also pin the
+// generation the condition must have been computed against.
+//
+// A resource that never carries a Synced condition at all is not itself
+// evidence of a problem — this package has no dependency on any specific
+// reconciler's condition set, and every production crossplane-runtime
+// managed reconciler emits one on essentially every completed reconcile
+// (Ready and Synced are written together in one deferred status update).
+// So an ABSENT Synced condition, checked once on the first read, is read
+// as "this reconciler does not emit one": synced returns true immediately
+// rather than blocking out the full timeout for a signal that will never
+// arrive.
+//
+// The (bool, ..., error) shape mirrors waitGenerationSettled and waitReady
+// deliberately: err is reserved for a genuine kubectl/parse failure, and a
+// plain timeout — the resource is still catching up — is reported as
+// synced=false with no error, so each caller decides for itself whether
+// "still catching up" should fail outright (reconcileOnce, mid a field
+// test) or degrade to a diagnostic (RunConverge's pre-check, which never
+// bare-errors on a timeout).
+func (r *Runner) waitSynced(timeout time.Duration) (synced bool, status string, gen, obsGen int64, err error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		obj, gerr := r.GetObject()
+		if gerr != nil {
+			return false, "", 0, 0, gerr
+		}
+		g, gerr := extractGeneration(obj)
+		if gerr != nil {
+			return false, "", 0, 0, gerr
+		}
+		gen = g
+		s, og, found := namedCondition(obj, conditionTypeSynced)
+		if !found {
+			return true, "", gen, 0, nil
+		}
+		status, obsGen = s, og
+		if status == "True" && obsGen == gen {
+			return true, status, gen, obsGen, nil
+		}
+		if time.Now().After(deadline) {
+			return false, status, gen, obsGen, nil
 		}
 		r.sleep(2 * time.Second)
 	}

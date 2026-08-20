@@ -601,6 +601,90 @@ func TestWaitReady(t *testing.T) {
 	})
 }
 
+// TestWaitSynced covers waitSynced's three outcome paths, mirroring
+// TestWaitReady's shape: an absent Synced condition is treated as "not
+// applicable" and never blocks; a conflict-then-settle sequence (a late-init
+// 409 retry, then the bump, then the genuine settle — see
+// syncedConflictReads) is waited through to completion; and a Synced
+// condition that never reaches True times out reporting synced=false with a
+// nil error, exactly like waitReady's own timeout path, so the caller
+// decides what a timeout here means rather than getting a bare error for a
+// resource that is merely still catching up.
+func TestWaitSynced(t *testing.T) {
+	t.Run("AbsentConditionIsNotApplicable", func(t *testing.T) {
+		f := &fakeCluster{generation: 1}
+		r := newFakeRunner(f)
+		var slept int
+		r.sleepFunc = func(time.Duration) { slept++ }
+
+		synced, status, gen, obsGen, err := r.waitSynced(time.Second)
+		if err != nil {
+			t.Fatalf("waitSynced() error = %v", err)
+		}
+		if !synced {
+			t.Fatal("waitSynced() synced = false, want true — a reconciler that never emits Synced must not block")
+		}
+		if status != "" || obsGen != 0 {
+			t.Errorf("status=%q obsGen=%d, want zero values when no Synced condition exists", status, obsGen)
+		}
+		if gen != 1 {
+			t.Errorf("gen = %d, want 1", gen)
+		}
+		if slept != 0 {
+			t.Errorf("waitSynced() slept %d time(s), want 0 — absence is resolved on the first read", slept)
+		}
+		if f.getObjectCalls != 1 {
+			t.Errorf("getObjectCalls = %d, want exactly 1", f.getObjectCalls)
+		}
+	})
+
+	t.Run("SettlesAfterConflictAndLateInitBump", func(t *testing.T) {
+		f := &fakeCluster{generation: 1, syncedConflictReads: 1}
+		r := newFakeRunner(f)
+		r.sleepFunc = func(time.Duration) {}
+
+		synced, status, gen, obsGen, err := r.waitSynced(time.Second)
+		if err != nil {
+			t.Fatalf("waitSynced() error = %v", err)
+		}
+		if !synced {
+			t.Fatalf("waitSynced() synced = false, want true — the resource settles before the timeout")
+		}
+		if status != "True" {
+			t.Errorf("status = %q, want %q", status, "True")
+		}
+		if gen != 2 || obsGen != 2 {
+			t.Errorf("gen=%d obsGen=%d, want both 2 — the late-init bump plus the final settle", gen, obsGen)
+		}
+		if f.getObjectCalls != 3 {
+			t.Errorf("getObjectCalls = %d, want 3 (conflict, stale-bump, settle)", f.getObjectCalls)
+		}
+	})
+
+	t.Run("NeverSyncedTimesOutWithoutError", func(t *testing.T) {
+		f := &fakeCluster{generation: 1, neverSynced: true}
+		r := newFakeRunner(f)
+		r.sleepFunc = func(time.Duration) {}
+
+		synced, status, gen, _, err := r.waitSynced(20 * time.Millisecond)
+		if err != nil {
+			t.Fatalf("waitSynced() error = %v, want nil — a timeout is not itself a failure", err)
+		}
+		if synced {
+			t.Fatal("waitSynced() synced = true, want false — the Synced condition never reports True")
+		}
+		if status != "False" {
+			t.Errorf("status = %q, want %q", status, "False")
+		}
+		if gen != 1 {
+			t.Errorf("gen = %d, want 1", gen)
+		}
+		if f.getObjectCalls == 0 {
+			t.Error("expected at least one poll before the timeout was recognised")
+		}
+	})
+}
+
 // TestRunConvergeReadinessGate exercises the readiness gate through
 // RunConverge itself, end to end against the fake cluster — proving the
 // gate is actually WIRED into RunConverge's baseline and final snapshots,
@@ -711,6 +795,57 @@ func TestRunConvergeGenerationNeverSettlesReportsSteadyStateNotLoop(t *testing.T
 	}
 	if len(result.Diagnostics) != 1 || !strings.Contains(result.Diagnostics[0], "pre-check: generation") {
 		t.Errorf("expected exactly one pre-check diagnostic naming the unsettled generation, got %v", result.Diagnostics)
+	}
+}
+
+// TestRunConvergePreCheckWaitsThroughLateInitConflictBeforeBaseline proves
+// waitGenerationSettled ALONE has the exact blind spot this ticket is
+// about: a reconcile that FAILS to persist a write (a late-init 409
+// conflict) still stamps the Synced condition it marks False
+// (ReconcileError) with observedGeneration == the CURRENT generation, so
+// waitGenerationSettled reports "settled" after the very FIRST read here —
+// before the late-init write that eventually succeeds has even happened,
+// let alone the genuine settle afterward. Without the additional waitSynced
+// call in RunConverge's pre-check, the baseline snapshot below would be
+// taken at that premature, unsettled instant.
+//
+// syncedConflictReads is set high enough (3) that the premature-settle read
+// (read 1, Synced False at the STARTING generation) is a real, distinct
+// event from the eventual genuine settle a few reads later — proving the
+// pre-check actually waited through the gap rather than the two coinciding
+// by construction.
+func TestRunConvergePreCheckWaitsThroughLateInitConflictBeforeBaseline(t *testing.T) {
+	m := &manifest.Manifest{Kind: testKindExample, Name: testNameExample}
+	f := &fakeCluster{
+		generation:          1,
+		atProvider:          map[string]interface{}{"zone": "a"},
+		readyAfterCalls:     1,
+		syncedConflictReads: 3,
+	}
+	r := newFakeRunner(f)
+	r.sleepFunc = func(time.Duration) {}
+
+	result, err := r.RunConverge(m, ConvergeOptions{
+		PollInterval:     time.Millisecond,
+		ReadinessTimeout: time.Second,
+		Timeout:          time.Second,
+	})
+	if err != nil {
+		t.Fatalf("RunConverge() error = %v", err)
+	}
+	if !result.Passed {
+		t.Fatalf("expected Passed=true once the pre-check has waited through the late-init conflict, bump, and genuine settle, got %+v", result)
+	}
+	if result.Message != "resource stable (1 cycle observed, 0 updates)" {
+		t.Errorf("Message = %q, want the stable-resource message", result.Message)
+	}
+	// The simulated late-init write bumps the generation by one EXTRA step
+	// (1 -> 2). If RunConverge had proceeded straight from
+	// waitGenerationSettled's premature "settled" verdict (read 1), the
+	// bump — and the read that observes it — would never have happened
+	// before the baseline snapshot, and this would still read 1.
+	if f.generation != 2 {
+		t.Errorf("generation = %d, want 2 — the pre-check must wait through the late-init bump before RunConverge takes its baseline snapshot", f.generation)
 	}
 }
 

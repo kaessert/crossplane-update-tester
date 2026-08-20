@@ -208,6 +208,48 @@ type fakeCluster struct {
 	// over readyAfterCalls.
 	neverReady bool
 
+	// syncedConflictReads, when non-zero, makes handleGet embed a Synced
+	// condition and drives it through the exact multi-pass late-init
+	// conflict-then-settle race this bug is about — see
+	// TestReconcileOnceWaitsThroughLateInitConflictBeforeReturning. Reads
+	// are counted from getObjectCalls (see readyCondition — every read
+	// increments it exactly once, so Ready and Synced always describe the
+	// SAME read):
+	//
+	//   reads 1..syncedConflictReads:   Synced="False" (ReconcileError) at
+	//                                    the CURRENT generation — a
+	//                                    late-init 409 conflict retrying.
+	//                                    Ready is unaffected: Observe()
+	//                                    already marked it True on an
+	//                                    earlier pass (see
+	//                                    readyAfterCalls/neverReady).
+	//   read syncedConflictReads+1:      metadata.generation bumps by ONE
+	//                                    EXTRA step — the late-init spec
+	//                                    write that DID succeed — but
+	//                                    THIS read's Synced still reports
+	//                                    "False" at the OLD generation:
+	//                                    the reconcile that persisted the
+	//                                    bump returned before re-marking
+	//                                    Synced.
+	//   any later read:                  Synced="True" at the NEW (bumped)
+	//                                    generation — the pass the watch
+	//                                    auto-triggers off that spec bump,
+	//                                    which is also, on a real
+	//                                    controller, the pass that finally
+	//                                    evaluates and issues the field
+	//                                    test's own genuine external
+	//                                    Update().
+	//
+	// Zero (the default) leaves Synced modelling out of handleGet
+	// entirely — matching every pre-existing test in this file, none of
+	// which embeds a Synced condition at all.
+	syncedConflictReads int
+	// neverSynced, when true, makes handleGet embed a Synced condition
+	// whose status is permanently "False" at the current generation —
+	// used to exercise waitSynced's timeout path in isolation. Takes
+	// priority over syncedConflictReads.
+	neverSynced bool
+
 	// silentWipeField and silentWipeValue, when silentWipeField is
 	// non-empty, simulate a backend that resets an UNRELATED atProvider
 	// field to silentWipeValue on every real field patch — the exact
@@ -249,6 +291,51 @@ func (f *fakeCluster) readyCondition() (cond map[string]interface{}, ok bool) {
 	}, true
 }
 
+// syncedCondition reports the Synced condition entry handleGet should embed
+// for the CURRENT read, per syncedConflictReads' doc comment. It relies on
+// readyCondition() having already run for this same read (so
+// f.getObjectCalls is already the current read's 1-based index) — handleGet
+// calls readyCondition() first, always.
+func (f *fakeCluster) syncedCondition() (cond map[string]interface{}, ok bool) {
+	if f.neverSynced {
+		return map[string]interface{}{
+			"type":               "Synced",
+			"status":             "False",
+			"observedGeneration": f.generation,
+		}, true
+	}
+	if f.syncedConflictReads == 0 {
+		return nil, false
+	}
+	switch {
+	case f.getObjectCalls <= f.syncedConflictReads:
+		return map[string]interface{}{
+			"type":               "Synced",
+			"status":             "False",
+			"observedGeneration": f.generation,
+		}, true
+	case f.getObjectCalls == f.syncedConflictReads+1:
+		// The late-init write that succeeded: bump the generation NOW
+		// (before metadata.generation is captured by the caller), but
+		// report Synced still "False" at the OLD generation — the
+		// reconcile that persisted the bump returned before re-marking
+		// Synced.
+		stale := f.generation
+		f.generation++
+		return map[string]interface{}{
+			"type":               "Synced",
+			"status":             "False",
+			"observedGeneration": stale,
+		}, true
+	default:
+		return map[string]interface{}{
+			"type":               "Synced",
+			"status":             "True",
+			"observedGeneration": f.generation,
+		}, true
+	}
+}
+
 // exec implements the Runner.execFunc signature, dispatching on the kubectl
 // subcommand (first arg).
 func (f *fakeCluster) exec(args []string) (string, error) {
@@ -286,6 +373,18 @@ func (f *fakeCluster) handleGet(args []string) (string, error) {
 	if spec := outputSpecOf(args); spec != "json" {
 		return "", fmt.Errorf("fakeCluster: the resource under test is only ever read with -o json, got -o %q: %v", spec, args)
 	}
+	var conds []interface{}
+	if cond, ok := f.readyCondition(); ok {
+		conds = append(conds, cond)
+	}
+	if cond, ok := f.syncedCondition(); ok {
+		conds = append(conds, cond)
+	}
+
+	// metadata.generation is captured AFTER the condition helpers above run
+	// — syncedCondition can itself bump f.generation mid-read (see its doc
+	// comment), and this read's own metadata must reflect that bump, not
+	// the value from before it.
 	metadata := map[string]interface{}{"generation": f.generation}
 	if f.externalName != "" {
 		metadata["annotations"] = map[string]interface{}{
@@ -293,8 +392,8 @@ func (f *fakeCluster) handleGet(args []string) (string, error) {
 		}
 	}
 	status := map[string]interface{}{jsonKeyAtProvider: f.atProvider}
-	if cond, ok := f.readyCondition(); ok {
-		status["conditions"] = []interface{}{cond}
+	if len(conds) > 0 {
+		status["conditions"] = conds
 	}
 	obj := map[string]interface{}{
 		"metadata":    metadata,
@@ -956,6 +1055,123 @@ func TestReconcileOnceNudgesBeforeWaiting(t *testing.T) {
 	}
 	if f.waitCalls != 1 {
 		t.Errorf("expected exactly 1 wait call, got %d", f.waitCalls)
+	}
+}
+
+// TestReconcileOnceWaitsThroughLateInitConflictBeforeReturning reproduces
+// the race a late-init 409 conflict-and-retry opens: Observe() marks Ready
+// True on every successful GET independent of whether that SAME pass went
+// on to persist a write successfully, so WaitReady alone can return the
+// instant it is called — Ready was already True from before this
+// reconcileOnce call even started. Against the pre-fix body (ClearConditions,
+// NudgeReconcile, WaitReady, nothing else), this test's fakeCluster is
+// NEVER READ at all: WaitReady's kubectl "wait" is faked to succeed
+// unconditionally without calling handleGet, so getObjectCalls stays 0 and
+// the simulated late-init generation bump (see syncedConflictReads) never
+// fires — the "genuine settle" this bug is about is never even observed to
+// have happened, let alone waited for.
+//
+// With the fix, reconcileOnce also polls for the Synced condition to read
+// True AT THE resource's CURRENT generation, which this fakeCluster only
+// reports on the third read (see syncedConflictReads' doc comment) — so a
+// passing run here proves reconcileOnce actually blocked through the
+// conflict (read 1), the late-init generation bump (read 2), and the
+// genuine settle (read 3), rather than returning the instant Ready read
+// True.
+func TestReconcileOnceWaitsThroughLateInitConflictBeforeReturning(t *testing.T) {
+	f := &fakeCluster{
+		forProvider:         map[string]interface{}{testFieldNotifyDelay: float64(5)},
+		atProvider:          map[string]interface{}{testFieldNotifyDelay: float64(5)},
+		generation:          1,
+		kind:                testKindExample,
+		name:                testNameExample,
+		readyAfterCalls:     1, // Ready reads True from the very first read.
+		syncedConflictReads: 1, // one conflicting read, then the bump, then True.
+	}
+	r := newFakeRunner(f)
+
+	if err := r.reconcileOnce(); err != nil {
+		t.Fatalf("reconcileOnce: %v", err)
+	}
+
+	// Exactly 1 nudge / 1 wait: unchanged from TestReconcileOnceNudgesBeforeWaiting
+	// — the fix adds a NEW poll loop, it does not add another nudge or
+	// another `kubectl wait` shell-out.
+	if f.nudgeCalls != 1 {
+		t.Errorf("expected exactly 1 nudge call, got %d", f.nudgeCalls)
+	}
+	if f.waitCalls != 1 {
+		t.Errorf("expected exactly 1 wait call, got %d", f.waitCalls)
+	}
+	// 3 reads: the conflicting read, the read that observes the late-init
+	// bump (still stale), and the read that finally observes Synced=True
+	// at the bumped generation. Against the pre-fix body this is 0 — proof
+	// that reconcileOnce genuinely blocked on the sequence rather than
+	// returning as soon as the already-True Ready condition was checked.
+	if f.getObjectCalls != 3 {
+		t.Fatalf("getObjectCalls = %d, want 3 — reconcileOnce must poll through the conflict, the late-init bump, and the eventual settle, not return early", f.getObjectCalls)
+	}
+	// The simulated late-init write bumped the generation by one EXTRA
+	// step beyond the starting generation (1 -> 2). A reconcileOnce that
+	// returned before this bump was ever observed would leave f.generation
+	// at 1.
+	if f.generation != 2 {
+		t.Errorf("generation = %d, want 2 — the late-init bump must have been observed before reconcileOnce returned", f.generation)
+	}
+}
+
+// TestApplyPatchAndReconcileAbsorbsLateInitConflictBeforeReturning is the
+// end-to-end version of TestReconcileOnceWaitsThroughLateInitConflictBeforeReturning,
+// exercising the actual production call path a field test uses:
+// applyPatchAndReconcile's real field Patch() (which itself bumps the
+// generation once), followed by ITS OWN two forced reconciles. It proves
+// the genuine settle — the late-init bump plus the reconcile the watch
+// auto-triggers off it — is fully absorbed before applyPatchAndReconcile
+// returns to its caller (runFieldTest), rather than leaking into whatever
+// runs next (a later poll, or a separate RunConverge call — see
+// TestRunConvergePreCheckWaitsThroughLateInitConflictBeforeBaseline for
+// that half of the story).
+func TestApplyPatchAndReconcileAbsorbsLateInitConflictBeforeReturning(t *testing.T) {
+	f := &fakeCluster{
+		forProvider:         map[string]interface{}{testFieldNotifyDelay: float64(5)},
+		atProvider:          map[string]interface{}{testFieldNotifyDelay: float64(5)},
+		generation:          1,
+		kind:                testKindExample,
+		name:                testNameExample,
+		readyAfterCalls:     1,
+		syncedConflictReads: 1,
+	}
+	r := newFakeRunner(f)
+
+	test := manifest.UpdateTest{Field: testFieldNotifyDelay, Value: 10}
+	if err := r.applyPatchAndReconcile(test); err != nil {
+		t.Fatalf("applyPatchAndReconcile: %v", err)
+	}
+
+	if f.patchCalls != 1 {
+		t.Errorf("expected exactly 1 real field patch, got %d", f.patchCalls)
+	}
+	// 2 nudges / 2 waits: unchanged from TestRunFieldTestExecutesWhenValueDiffers
+	// — applyPatchAndReconcile's own two forced reconciles, undisturbed by
+	// the fix.
+	if f.nudgeCalls != 2 {
+		t.Errorf("expected exactly 2 nudge calls, got %d", f.nudgeCalls)
+	}
+	if f.waitCalls != 2 {
+		t.Errorf("expected exactly 2 wait calls, got %d", f.waitCalls)
+	}
+	// 4 reads: reconcileOnce's first call absorbs the conflict, the bump,
+	// and the settle (3 reads, as in TestReconcileOnceWaitsThroughLateInitConflictBeforeReturning);
+	// its second call (nudgeAndReconcile) confirms Synced is STILL True at
+	// the now-unchanged generation in a single read. Against the pre-fix
+	// body this is 0 — the whole sequence would have gone unobserved.
+	if f.getObjectCalls != 4 {
+		t.Fatalf("getObjectCalls = %d, want 4", f.getObjectCalls)
+	}
+	// generation 1 -> 2 from the real field patch, then -> 3 from the
+	// simulated late-init write — both absorbed before this call returns.
+	if f.generation != 3 {
+		t.Errorf("generation = %d, want 3 — the field patch's own bump plus the late-init bump must both be observed before applyPatchAndReconcile returns", f.generation)
 	}
 }
 

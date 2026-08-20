@@ -1132,9 +1132,9 @@ func (r *Runner) applyPatchAndReconcile(t manifest.UpdateTest) error {
 }
 
 // reconcileOnce clears status conditions, THEN nudges the controller, THEN
-// waits for Ready — in that order, always — so the caller can block on the
-// NEXT reconcile's outcome rather than the stale conditions already
-// present.
+// waits for Ready, THEN waits for Synced — in that order, always — so the
+// caller can block on the NEXT reconcile's OUTCOME rather than the stale
+// conditions already present.
 //
 // Clearing conditions does not by itself trigger that next reconcile: most
 // generated controllers watch with resource.DesiredStateChanged(), which
@@ -1156,6 +1156,19 @@ func (r *Runner) applyPatchAndReconcile(t manifest.UpdateTest) error {
 // exactly the failure mode this whole sequence exists to avoid. Clearing
 // first guarantees the clear has already landed before anything can set a
 // new condition, so nothing after it can re-clear a fresh result.
+//
+// WaitReady alone is not enough to prove the reconcile this call forced has
+// actually finished: Observe() marks Ready True on every successful GET,
+// independent of whether that SAME pass went on to persist a write
+// successfully, so a late-init 409 conflict-and-retry can leave Ready
+// already True (left over from an earlier pass) while the reconciler is
+// still mid-retry — Synced reads False (ReconcileError) the whole time,
+// but WaitReady has no way to see a condition type it never asks about.
+// waitSynced closes that gap by also requiring the Synced condition to
+// read True AT THE RESOURCE'S CURRENT generation, which is what actually
+// proves the pass that ran for THIS generation succeeded rather than one
+// that is still retrying, or one that succeeded for a generation already
+// superseded by a late-init write made in between.
 func (r *Runner) reconcileOnce() error {
 	if err := r.ClearConditions(); err != nil {
 		return err
@@ -1163,7 +1176,22 @@ func (r *Runner) reconcileOnce() error {
 	if err := r.NudgeReconcile(); err != nil {
 		return err
 	}
-	return r.WaitReady()
+	if err := r.WaitReady(); err != nil {
+		return err
+	}
+	timeout, _ := time.ParseDuration(r.timeout)
+	if timeout <= 0 {
+		timeout = 120 * time.Second
+	}
+	synced, status, gen, obsGen, err := r.waitSynced(timeout)
+	if err != nil {
+		return fmt.Errorf("waiting for Synced: %w", err)
+	}
+	if !synced {
+		return fmt.Errorf("waiting for Synced: timed out after %s — Synced=%q at observedGeneration=%d, resource now at generation %d",
+			timeout, status, obsGen, gen)
+	}
+	return nil
 }
 
 // nudgeAndReconcile is reconcileOnce under the name applyPatchAndReconcile

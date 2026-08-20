@@ -541,6 +541,7 @@ three top-level directive lines: `converge-skip:`, `assert-unchanged:` and
 | `value` | The value to patch in. Required unless `skip` is set. |
 | `expect` | Optional. The value expected in `status.atProvider` when the backend normalises what it stores. Defaults to `value`. |
 | `skip` | Optional. A reason for not testing this field. The entry is reported as `SKIPPED` and still counts as coverage for `validate`. |
+| `clear` | Optional. A list of OTHER top-level `spec.forProvider` field names nulled in the SAME merge patch that sets `field`'s value, so a union modeled as separate top-level fields switches arms atomically. Only valid when `field` itself is top-level (not dotted); a dotted entry, or one naming `field` itself, is rejected at parse time. |
 
 None of `converge-skip: <reason>`, `assert-unchanged: <fields>` or
 `ignore-fields: <fields>` is valid YAML as a sibling of top-level sequence

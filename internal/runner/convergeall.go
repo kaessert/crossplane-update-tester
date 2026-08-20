@@ -2,6 +2,7 @@ package runner
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -168,6 +169,33 @@ func forEachConcurrently(n, limit int, fn func(i int)) {
 // FormatConvergeAllSummary renders a one-line-per-target summary plus a
 // tally. Returns the text and whether every target passed.
 func FormatConvergeAllSummary(results []ConvergeAllResult) (text string, ok bool) {
+	return formatConvergeAllSummary(results, nil)
+}
+
+// FormatConvergeAllSummaryWithFindings renders the same summary as
+// FormatConvergeAllSummary, but additionally prints, immediately after a
+// FAILING target's own verdict line, the pre-formatted round-trip findings
+// text supplied for that target's Label (see RoundtripFindingsForFailures) —
+// adjacent to the verdict, not in a separate trailing report. A target with
+// no entry in findings (including every passing, skipped, or errored one —
+// see the switch below) renders identically to FormatConvergeAllSummary.
+//
+// Findings are advisory only: ok is derived from the SAME pass/fail/error
+// counts FormatConvergeAllSummary itself uses, so their presence or content
+// can never change whether the run is reported as passing. Passing a nil or
+// empty findings map reproduces FormatConvergeAllSummary's output exactly —
+// that equivalence is itself asserted by a test, not just implied by the
+// shared implementation below.
+func FormatConvergeAllSummaryWithFindings(results []ConvergeAllResult, findings map[string]string) (text string, ok bool) {
+	return formatConvergeAllSummary(results, findings)
+}
+
+// formatConvergeAllSummary is the shared implementation behind both
+// exported summary formatters above. findings is only ever consulted in the
+// FAILING branch — a passing, skipped, or errored target never looks it up
+// — which is what makes a findings entry for any other target's Label
+// structurally inert rather than merely untested.
+func formatConvergeAllSummary(results []ConvergeAllResult, findings map[string]string) (text string, ok bool) {
 	var b []byte
 	pass, fail, skip, errs := 0, 0, 0, 0
 	for _, r := range results {
@@ -186,6 +214,11 @@ func FormatConvergeAllSummary(results []ConvergeAllResult) (text string, ok bool
 			b = append(b, fmt.Sprintf("  ✗ %-40s %s\n", r.Label, r.Result.Message)...)
 			for _, d := range r.Result.Diagnostics {
 				b = append(b, fmt.Sprintf("      %s\n", d)...)
+			}
+			if f := findings[r.Label]; f != "" {
+				for _, line := range strings.Split(f, "\n") {
+					b = append(b, fmt.Sprintf("      %s\n", line)...)
+				}
 			}
 		}
 	}

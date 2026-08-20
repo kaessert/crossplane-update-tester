@@ -47,6 +47,7 @@
 //	update-tester expect-skeleton <types.go> --kind <Kind> --field <field>
 //	update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
 //	update-tester resolve-recover <manifest.yaml> [--timeout 120]
+//	update-tester roundtrip-diff <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30]
 //	update-tester hook <invocation-name> [--root <dir>] [--manifest <path>] [--skip-converge]
 //	update-tester version
 package main
@@ -57,6 +58,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -66,6 +68,7 @@ import (
 	"github.com/kaessert/crossplane-update-tester/internal/differ"
 	"github.com/kaessert/crossplane-update-tester/internal/hook"
 	"github.com/kaessert/crossplane-update-tester/internal/manifest"
+	"github.com/kaessert/crossplane-update-tester/internal/roundtrip"
 	"github.com/kaessert/crossplane-update-tester/internal/runner"
 	"github.com/kaessert/crossplane-update-tester/internal/validator"
 )
@@ -121,6 +124,8 @@ func runCommand(name string, args []string) error {
 		return cmdCheckExternalNamePrefix(args)
 	case "resolve-recover":
 		return cmdResolveRecover(args)
+	case "roundtrip-diff":
+		return cmdRoundtripDiff(args)
 	case "hook":
 		return cmdHook(args)
 	case "version":
@@ -144,6 +149,7 @@ update-tester validate <manifest.yaml> --types-file <types.go> [--controller-dir
 update-tester expect-skeleton <types.go> --kind <Kind> --field <field>
 update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
 update-tester resolve-recover <manifest.yaml> [--timeout 120]
+update-tester roundtrip-diff <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30]
 update-tester hook <invocation-name> [--root <dir>] [--manifest <path>] [--skip-converge]
 update-tester version`
 
@@ -195,6 +201,13 @@ Commands:
              event across the resource's lifecycle) rather than silently
              creating a duplicate. Exercises the ref-less identity-search
              path a standing ref-addressed lifecycle never reaches.
+  roundtrip-diff
+             Print an advisory report of which spec.forProvider fields
+             round-trip faithfully into status.atProvider for one or more
+             already-live manifests: what the backend defaulted, dropped,
+             or changed. Read-only, and never fails on what it finds —
+             converge-all inlines the same report next to a FAILING
+             target's own verdict when UPDATE_TESTER_ROOT is set.
   hook       Derive a manifest from the name this binary was invoked
              under and run the full post-assert sequence for it
   version    Print the version of the tool in use
@@ -802,7 +815,20 @@ func cmdConvergeAll(args []string) error {
 	results := runner.RunConvergeAll(targets, opts.concurrency)
 	elapsed := time.Since(start)
 
-	summary, ok := runner.FormatConvergeAllSummary(results)
+	// UPDATE_TESTER_ROOT is read here, not as a --root flag, deliberately:
+	// this keeps converge-all's own flag surface — and therefore its
+	// --help output — byte-identical whether or not a caller ever sets
+	// it. Unset (the default for every existing caller), no CRD lookup is
+	// attempted and the summary is exactly what FormatConvergeAllSummary
+	// alone would have produced. Set, a FAILING target's advisory
+	// spec.forProvider <-> status.atProvider round-trip report — see
+	// package roundtrip — is inlined immediately under that target's own
+	// verdict line, so the finding is visible at the moment the run
+	// actually failed instead of buried in a separate trailing report a
+	// reviewer has to go looking for.
+	findings := runner.RoundtripFindingsForFailures(targets, results, os.Getenv(envRoundtripRoot))
+
+	summary, ok := runner.FormatConvergeAllSummaryWithFindings(results, findings)
 	printfTo(os.Stdout, "%s", summary)
 	printfTo(os.Stdout, "barrier wall clock: %s\n", elapsed.Round(time.Millisecond))
 
@@ -811,6 +837,13 @@ func cmdConvergeAll(args []string) error {
 	}
 	return nil
 }
+
+// envRoundtripRoot names the provider repository root — the directory
+// holding package/crds/ — that converge-all uses to find each failing
+// target's CRD for the advisory round-trip report above. An environment
+// variable rather than a flag so converge-all's own --help output never
+// changes based on whether a caller sets it.
+const envRoundtripRoot = "UPDATE_TESTER_ROOT"
 
 // ─── check-external-name-prefix ───────────────────────────────────────────
 
@@ -933,6 +966,105 @@ func printResolveRecoverResult(w io.Writer, m *manifest.Manifest, r *runner.Reso
 			printfTo(w, "    - %s\n", d)
 		}
 	}
+}
+
+// ─── roundtrip-diff ───────────────────────────────────────────────────────
+
+// roundtripDiffOptions holds the parsed command line of `roundtrip-diff`.
+type roundtripDiffOptions struct {
+	manifestPaths []string
+	root          string
+	timeout       int
+}
+
+func parseRoundtripDiffArgs(args []string) (roundtripDiffOptions, error) {
+	fs := flag.NewFlagSet("roundtrip-diff", flag.ContinueOnError)
+	root := fs.String("root", "", "Provider repo root holding package/crds (default: working directory)")
+	timeout := fs.Int("timeout", 30, "Timeout in seconds for kubectl calls")
+	if err := fs.Parse(cli.ReorderArgs(fs, args)); err != nil {
+		return roundtripDiffOptions{}, err
+	}
+	if fs.NArg() < 1 {
+		return roundtripDiffOptions{}, errors.New(
+			"usage: update-tester roundtrip-diff <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30]")
+	}
+
+	// Accept both a comma-separated list and repeated positional
+	// arguments, matching converge-all's own manifest-list convention.
+	var paths []string
+	for _, arg := range fs.Args() {
+		for _, p := range strings.Split(arg, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				paths = append(paths, p)
+			}
+		}
+	}
+
+	resolvedRoot := *root
+	if resolvedRoot == "" {
+		wd, err := os.Getwd()
+		if err != nil {
+			return roundtripDiffOptions{}, fmt.Errorf("determining working directory for --root: %w", err)
+		}
+		resolvedRoot = wd
+	}
+
+	return roundtripDiffOptions{manifestPaths: paths, root: resolvedRoot, timeout: *timeout}, nil
+}
+
+// cmdRoundtripDiff prints the advisory spec.forProvider <-> status.atProvider
+// round-trip report for one or more already-live manifests — one `kubectl
+// get` per manifest, plus a scan of --root/package/crds to find each one's
+// CRD. Like the Python tool it replaces (see package roundtrip's doc
+// comment), this is read-only end to end and its own exit status reflects
+// only whether it could RUN, never what it found: a manifest that cannot be
+// resolved, has no matching CRD, or cannot be diffed for any other reason is
+// skipped with a note on stderr rather than failing the command.
+func cmdRoundtripDiff(args []string) error {
+	opts, err := parseRoundtripDiffArgs(args)
+	if err != nil {
+		return err
+	}
+
+	reported := 0
+	for _, p := range opts.manifestPaths {
+		m, err := manifest.Parse(p)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "roundtrip-diff: SKIP %s — %v\n", p, err)
+			continue
+		}
+
+		r := runner.NewRunner(p, opts.timeout)
+		if err := r.ResolveResource(m); err != nil {
+			fmt.Fprintf(os.Stderr, "roundtrip-diff: SKIP %s/%s — %v\n", m.Kind, m.Name, err)
+			continue
+		}
+		obj, err := r.GetObject()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "roundtrip-diff: SKIP %s/%s — %v\n", m.Kind, m.Name, err)
+			continue
+		}
+
+		crd, _ := roundtrip.FindCRD(opts.root, m.APIVersion, m.Kind)
+		if crd == nil {
+			fmt.Fprintf(os.Stderr, "roundtrip-diff: SKIP %s/%s — no matching CRD under %s\n",
+				m.Kind, m.Name, filepath.Join(opts.root, "package", "crds"))
+			continue
+		}
+		rows, err := roundtrip.DiffReport(crd, obj)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "roundtrip-diff: SKIP %s/%s — %v\n", m.Kind, m.Name, err)
+			continue
+		}
+
+		printfTo(os.Stdout, "%s\n", roundtrip.FormatReport(m.Kind, m.Name, rows))
+		reported++
+	}
+
+	if reported == 0 {
+		fmt.Fprintln(os.Stderr, "roundtrip-diff: no resources produced a report (see stderr for skips, if any)")
+	}
+	return nil
 }
 
 // ─── hook ─────────────────────────────────────────────────────────────────

@@ -843,6 +843,22 @@ func TestFlagAfterPositionalTakesEffect(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("RoundtripDiff", func(t *testing.T) {
+		for _, args := range [][]string{
+			{"--root", "/repo", "--timeout", "45", path},
+			{path, "--root", "/repo", "--timeout", "45"},
+			{path, "--timeout=45", "--root=/repo"},
+		} {
+			got, err := parseRoundtripDiffArgs(args)
+			if err != nil {
+				t.Fatalf("parseRoundtripDiffArgs(%q): %v", args, err)
+			}
+			if len(got.manifestPaths) != 1 || got.manifestPaths[0] != path || got.root != "/repo" || got.timeout != 45 {
+				t.Errorf("parseRoundtripDiffArgs(%q) = %+v, want manifestPaths [%q], root /repo, timeout 45", args, got, path)
+			}
+		}
+	})
 }
 
 // TestParseConvergeArgsRejectsDottedIgnoreField pins the flag-sourced half of
@@ -979,6 +995,7 @@ func TestParseArgsRequiresItsPositional(t *testing.T) {
 		{name: "CheckExternalNamePrefix", parse: func(a []string) error { _, err := parseCheckExternalNamePrefixArgs(a); return err }},
 		{name: "ResolveRecover", parse: func(a []string) error { _, err := parseResolveRecoverArgs(a); return err }},
 		{name: "Hook", parse: func(a []string) error { _, err := parseHookArgs(a); return err }},
+		{name: "RoundtripDiff", parse: func(a []string) error { _, err := parseRoundtripDiffArgs(a); return err }},
 	}
 
 	for _, tc := range tests {
@@ -1264,6 +1281,68 @@ func TestRunCommandRejectsUnknownCommand(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "converg") {
 		t.Errorf("error %q does not name the command the operator typed", err)
+	}
+}
+
+// TestRunCommandDispatchesRoundtripDiff proves the new subcommand actually
+// reaches runCommand's dispatch switch: calling it with no positional
+// argument must fail with roundtrip-diff's OWN usage error, not
+// errUnknownCommand — the failure mode that would appear if the "case
+// roundtrip-diff" line above were ever accidentally removed or misspelled.
+func TestRunCommandDispatchesRoundtripDiff(t *testing.T) {
+	err := runCommand("roundtrip-diff", nil)
+	if err == nil {
+		t.Fatal("roundtrip-diff with no manifest accepted, want a usage error")
+	}
+	if errors.Is(err, errUnknownCommand) {
+		t.Errorf("error %v wraps errUnknownCommand — roundtrip-diff is not wired into the dispatch switch", err)
+	}
+	if !strings.Contains(err.Error(), "roundtrip-diff") {
+		t.Errorf("error %q does not name the roundtrip-diff usage", err)
+	}
+}
+
+// TestParseRoundtripDiffArgsDefaultsRootToWorkingDirectory mirrors
+// cmdHook's own --root default (parseHookArgs / cmdHook), which every other
+// user of hook.Resolve already relies on: an operator invoking the command
+// directly, without --root, gets the process's own working directory
+// rather than an error.
+func TestParseRoundtripDiffArgsDefaultsRootToWorkingDirectory(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("os.Getwd: %v", err)
+	}
+
+	got, err := parseRoundtripDiffArgs([]string{"manifest.yaml"})
+	if err != nil {
+		t.Fatalf("parseRoundtripDiffArgs: %v", err)
+	}
+	if got.root != wd {
+		t.Errorf("root = %q, want the working directory %q", got.root, wd)
+	}
+}
+
+// TestParseRoundtripDiffArgsAcceptsCommaSeparatedManifests mirrors
+// converge-all's own manifest-list convention (parseConvergeAllArgs): a
+// single comma-separated argument and repeated positional arguments must be
+// equivalent.
+func TestParseRoundtripDiffArgsAcceptsCommaSeparatedManifests(t *testing.T) {
+	want := []string{"a.yaml", "b.yaml", "c.yaml"}
+
+	commaJoined, err := parseRoundtripDiffArgs([]string{"--root", "/repo", "a.yaml,b.yaml,c.yaml"})
+	if err != nil {
+		t.Fatalf("parseRoundtripDiffArgs (comma-joined): %v", err)
+	}
+	if !reflect.DeepEqual(commaJoined.manifestPaths, want) {
+		t.Errorf("manifestPaths (comma-joined) = %#v, want %#v", commaJoined.manifestPaths, want)
+	}
+
+	repeated, err := parseRoundtripDiffArgs([]string{"--root", "/repo", "a.yaml", "b.yaml", "c.yaml"})
+	if err != nil {
+		t.Fatalf("parseRoundtripDiffArgs (repeated positional): %v", err)
+	}
+	if !reflect.DeepEqual(repeated.manifestPaths, want) {
+		t.Errorf("manifestPaths (repeated positional) = %#v, want %#v", repeated.manifestPaths, want)
 	}
 }
 

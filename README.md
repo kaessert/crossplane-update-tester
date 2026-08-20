@@ -39,6 +39,7 @@ update-tester validate <manifest.yaml> --types-file <types.go> [--controller-dir
 update-tester expect-skeleton <types.go> --kind <Kind> --field <field>
 update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
 update-tester resolve-recover <manifest.yaml> [--timeout 120]
+update-tester roundtrip-diff <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30]
 update-tester hook <invocation-name> [--root <dir>] [--manifest <path>] [--skip-converge]
 update-tester version
 ```
@@ -487,6 +488,41 @@ spec, so the duplicate's external-name is correctly prefixed too. The second
 `CreatedExternalResource` Event is what distinguishes "found the existing
 object" from "created a second one".
 
+### `roundtrip-diff` — spec/status round-trip report (advisory)
+
+Whether a field round-trips faithfully through the backend is not knowable
+from the generated types alone: the API may default a field that was never
+sent, canonicalise a value, or silently drop something the client submitted.
+`roundtrip-diff` answers that by observation: for each manifest, it walks the
+matching CRD's OpenAPI schema (found under `--root/package/crds`) to
+enumerate every declared `spec.forProvider` field, then classifies each one
+against the live object's `spec.forProvider` value and its
+`status.atProvider` mirror:
+
+- `equal` — present on both sides, same value.
+- `value-changed` — present on both sides, different value.
+- `present-in-spec-absent-from-mirror` — the client set it; the mirror never
+  reports it.
+- `defaulted-by-server` — the client never set it; the backend supplied a
+  value anyway.
+- `present-in-mirror-absent-from-spec` — the field exists only in the
+  `atProvider` schema (no `forProvider` counterpart at all), and the mirror
+  reports a value for it.
+
+A field never populated on either side is not reported — there is nothing to
+observe yet. A schema field declared `type: array` is a leaf, whole-value
+comparison: its element schema is never descended into, so a nested
+difference inside one array element (a backend adding a sibling key to one
+list entry) surfaces as `value-changed` on the array's own path, not as a
+separate per-element sub-path.
+
+This command is entirely read-only (`kubectl get`, nothing else) and, like
+the check it replaced, is always advisory: a finding is printed, never a
+reason to fail. `converge-all` inlines the same report next to a **FAILING**
+target's own verdict line when `UPDATE_TESTER_ROOT` is set — see
+"Environment" below — so the finding is visible at the moment the run
+actually failed instead of requiring a second, separate invocation.
+
 ### `hook` — the post-assert entry point
 
 `hook` derives the manifest path from the name it was invoked under and then
@@ -765,6 +801,7 @@ Each example manifest then points its
 | `UPDATE_TESTER_POLL_INTERVAL` | `hook` | Provider poll interval. Passed to both convergence checks, which wait `interval * 1.5`, and to `run`, which uses it only to calibrate the `slow-observe` annotation (half the interval). One variable, so both checks are measured against the same cadence. |
 | `UPDATE_TESTER_IGNORE_FIELDS` | `hook` | Comma-separated `atProvider` field names excluded from the snapshot diff. Forwarded only to the two `converge` steps — `run`, `check-external-name-prefix` and `resolve-recover` do not define `--ignore-fields` and would reject it. For a resource with a field the backend populates asynchronously and independently of any controller write (e.g. a one-time timestamp set once the first automated action completes), that field's presence would otherwise fail every convergence check as if it were reconciliation drift. |
 | `UPDATE_TESTER_PROVIDER_DEPLOYMENT` | `run` | Name of the provider controller `Deployment` to restart for event-burst resets. Required when more than one provider package is installed, since the Pod-label lookup is then ambiguous. |
+| `UPDATE_TESTER_ROOT` | `converge-all` | Provider repository root — the directory holding `package/crds/`. Unset (the default), `converge-all` behaves exactly as it always has. Set, a FAILING target's `roundtrip-diff` report is inlined next to its own verdict line. Deliberately an environment variable rather than a `--root` flag, so `converge-all --help` never changes based on whether a caller sets it. |
 
 ## Versioning and compatibility
 

@@ -38,7 +38,7 @@ update-tester converge-all <m1.yaml,m2.yaml,...> [--poll-interval 60s] [--concur
 update-tester validate <manifest.yaml> --types-file <types.go> [--controller-dir <dir>]
 update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
 update-tester resolve-recover <manifest.yaml> [--timeout 120]
-update-tester hook <invocation-name> --root <provider-repo-root>
+update-tester hook <invocation-name> [--root <dir>] [--manifest <path>] [--skip-converge]
 update-tester version
 ```
 

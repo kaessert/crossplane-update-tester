@@ -45,7 +45,7 @@
 //	update-tester validate <manifest.yaml> --types-file <types.go> [--controller-dir <dir>]
 //	update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
 //	update-tester resolve-recover <manifest.yaml> [--timeout 120]
-//	update-tester hook <invocation-name> [--root <dir>] [--manifest <path>]
+//	update-tester hook <invocation-name> [--root <dir>] [--manifest <path>] [--skip-converge]
 //	update-tester version
 package main
 
@@ -136,7 +136,7 @@ Usage:
   update-tester validate <manifest.yaml> --types-file <types.go> [--controller-dir <dir>]
   update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
   update-tester resolve-recover <manifest.yaml> [--timeout 120]
-  update-tester hook <invocation-name> [--root <dir>] [--manifest <path>]
+  update-tester hook <invocation-name> [--root <dir>] [--manifest <path>] [--skip-converge]
   update-tester version
 
 Flags may appear before or after the manifest path.

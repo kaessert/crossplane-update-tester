@@ -65,10 +65,15 @@ type Manifest struct {
 	// vulnerable field here makes the runner check it after every patch in
 	// the run and fail the run the moment it moves — see runner.Runner.RunTests.
 	AssertUnchanged []string
-	// IgnoreFields lists dot-separated status.atProvider field paths
-	// excluded from a convergence check's snapshot diff for THIS resource
-	// only. It is populated from the "ignore-fields:" directive line in the
+	// IgnoreFields lists TOP-LEVEL status.atProvider field names excluded
+	// from a convergence check's snapshot diff for THIS resource only. It is
+	// populated from the "ignore-fields:" directive line in the
 	// crossplane.io/update-test annotation — see ParseAnnotation.
+	//
+	// Unlike AssertUnchanged, a dot-separated path is NOT supported here:
+	// differ.DiffSnapshotsExcluding matches the exclusion set against the
+	// top-level keys of the status.atProvider snapshot only, so a nested
+	// path excludes nothing.
 	//
 	// This exists because the fleet-wide `converge-all --ignore-fields` flag
 	// is lossy the moment two resources in the same run need different
@@ -236,7 +241,8 @@ func manifestFromDoc(doc manifestDoc) (*Manifest, error) {
 // changes are contradictory requests, so that combination is a parse error
 // rather than a runtime race between the two.
 //
-// "ignore-fields" takes the same comma-separated field-path shape — see
+// "ignore-fields" takes a comma-separated list too, but of TOP-LEVEL
+// status.atProvider field names rather than dot-separated paths — see
 // Manifest.IgnoreFields for what a convergence check does with it.
 func ParseAnnotation(annotation string) ([]UpdateTest, string, []string, []string, error) {
 	rest, convergeSkip, assertUnchanged, ignoreFields, err := extractDirectives(annotation)

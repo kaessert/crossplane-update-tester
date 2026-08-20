@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime/debug"
 	"strings"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	"github.com/kaessert/crossplane-update-tester/internal/differ"
 	"github.com/kaessert/crossplane-update-tester/internal/manifest"
 	"github.com/kaessert/crossplane-update-tester/internal/runner"
+	"github.com/kaessert/crossplane-update-tester/internal/validator"
 )
 
 // counts mirrors the five return values of printResults, so a table can
@@ -1461,4 +1463,100 @@ func TestUsageSynopsisSourcesAgree(t *testing.T) {
 			t.Errorf("README.md's ## Commands fence diverges from usageSynopsis:\ngot:  %#v\nwant: %#v", got, want)
 		}
 	})
+}
+
+// reReadmeValidateHeading matches the exact "### `validate` — offline
+// coverage check" heading that opens the section
+// readmeValidateStatusBullets scans, and reReadmeAnyHeading matches any
+// "###" heading, used to detect where that section ends.
+var (
+	reReadmeValidateHeading = regexp.MustCompile("^### `validate` \u2014 offline coverage check$")
+	reReadmeAnyHeading      = regexp.MustCompile(`^#{1,6}\s`)
+	reReadmeBulletHead      = regexp.MustCompile(`^- (.+?) \x{2014} `)
+	reReadmeCodeSpan        = regexp.MustCompile("`([^`]+)`")
+)
+
+// readmeValidateStatusBullets extracts the status names documented in
+// README.md's "### `validate` — offline coverage check" section. Each
+// bullet line there opens with one or more backtick-quoted status names
+// followed by " — " and a description, e.g.:
+//
+//   - `tested` / `skipped` — the field appears in the annotation.
+//
+// which yields ["tested", "skipped"]. Only backtick spans appearing before
+// the first em dash on a bullet's opening line are taken, so backtick code
+// spans inside the description (e.g. `self == oldSelf`) are not mistaken
+// for status names.
+func readmeValidateStatusBullets(t *testing.T) []string {
+	t.Helper()
+
+	data, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatalf("reading README.md: %v", err)
+	}
+
+	var statuses []string
+	inSection := false
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if reReadmeValidateHeading.MatchString(trimmed) {
+			inSection = true
+			continue
+		}
+		if !inSection {
+			continue
+		}
+		if reReadmeAnyHeading.MatchString(trimmed) {
+			break // the next heading of any level ends the section
+		}
+		m := reReadmeBulletHead.FindStringSubmatch(trimmed)
+		if m == nil {
+			continue
+		}
+		for _, code := range reReadmeCodeSpan.FindAllStringSubmatch(m[1], -1) {
+			statuses = append(statuses, code[1])
+		}
+	}
+
+	if !inSection {
+		t.Fatalf("README.md: no \"### `validate` — offline coverage check\" heading found")
+	}
+	if len(statuses) == 0 {
+		t.Fatalf("README.md: no status bullets found under the `validate` offline coverage check section")
+	}
+	return statuses
+}
+
+// TestValidateStatusesDocumented guards README.md's `validate` offline
+// coverage check status enumeration against drifting away from
+// validator.KnownStatuses — the status set PrintValidation can actually
+// emit. The comparison runs in both directions: a status PrintValidation can
+// emit but README.md never mentions, and a status README.md documents that
+// PrintValidation can never produce, are both failures. This has already
+// silently drifted twice (README fell behind two added statuses across two
+// separate feature commits); the next status added or removed must fail
+// this test instead of leaving the README's enumeration wrong.
+func TestValidateStatusesDocumented(t *testing.T) {
+	code := validator.KnownStatuses()
+	doc := readmeValidateStatusBullets(t)
+
+	codeSet := make(map[string]bool, len(code))
+	for _, s := range code {
+		codeSet[s] = true
+	}
+	docSet := make(map[string]bool, len(doc))
+	for _, s := range doc {
+		docSet[s] = true
+	}
+
+	for _, s := range code {
+		if !docSet[s] {
+			t.Errorf("validator.KnownStatuses() includes %q, but README.md's `validate` status bullet list does not document it", s)
+		}
+	}
+	for _, s := range doc {
+		if !codeSet[s] {
+			t.Errorf("README.md's `validate` status bullet list documents %q, but validator.KnownStatuses() does not include it — PrintValidation can never emit this status", s)
+		}
+	}
 }

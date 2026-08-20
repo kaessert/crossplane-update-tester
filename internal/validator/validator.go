@@ -370,38 +370,60 @@ func ValidateManifest(m *manifest.Manifest, fields []FieldInfo) *ValidationResul
 	return result
 }
 
+// statusIconDetail pairs one FieldValidation.Status value with the console
+// icon and human-readable detail line PrintValidation renders for it.
+type statusIconDetail struct {
+	Status string
+	Icon   string
+	Detail string
+}
+
+// statusOrder is the single declared list of every status
+// FieldValidation.Status can hold, in the order PrintValidation renders
+// them. A status can reach the console only by having an entry here, so
+// there is no second switch statement that can fall out of step with it —
+// and KnownStatuses lets a test assert this list against README.md's
+// `validate` status documentation without hand-listing the statuses again.
+// See main_test.go TestValidateStatusesDocumented.
+var statusOrder = []statusIconDetail{
+	{Status: "tested", Icon: "✓", Detail: "covered (tested)"},
+	{Status: "skipped", Icon: "✓", Detail: "covered (skipped)"},
+	{Status: "immutable", Icon: "✓", Detail: "immutable (excluded)"},
+	{Status: "reference-plumbing", Icon: "✓", Detail: "reference plumbing (excluded)"},
+	{Status: clearCreditStatus, Icon: "✓", Detail: "covered (nulled by a sibling entry's clear: — proven clearable, not independently value-tested)"},
+	{Status: "MISSING", Icon: "✗", Detail: "MISSING — not covered by update-test annotation"},
+	{Status: clearTargetUnknownStatus, Icon: "✗", Detail: "INVALID — named in a clear: list but not a declared field on this type"},
+}
+
+// KnownStatuses returns every status FieldValidation.Status can hold, in
+// statusOrder's declared order. Exported so a test outside this package can
+// assert README.md documents exactly this set, deriving the comparison from
+// the code instead of hand-listing the statuses a second time.
+func KnownStatuses() []string {
+	out := make([]string, len(statusOrder))
+	for i, sd := range statusOrder {
+		out[i] = sd.Status
+	}
+	return out
+}
+
 // PrintValidation outputs the validation result to stdout.
 func PrintValidation(r *ValidationResult) {
 	structName := r.Kind + "Parameters"
 	fmt.Printf("Validating %s manifest against %s\n", r.Kind, structName)
 
+	details := make(map[string]statusIconDetail, len(statusOrder))
+	for _, sd := range statusOrder {
+		details[sd.Status] = sd
+	}
+
 	for _, f := range r.Fields {
-		var icon string
-		var detail string
-		switch f.Status {
-		case "tested":
-			icon = "✓"
-			detail = "covered (tested)"
-		case "skipped":
-			icon = "✓"
-			detail = "covered (skipped)"
-		case "immutable":
-			icon = "✓"
-			detail = "immutable (excluded)"
-		case "reference-plumbing":
-			icon = "✓"
-			detail = "reference plumbing (excluded)"
-		case "MISSING":
-			icon = "✗"
-			detail = "MISSING — not covered by update-test annotation"
-		case clearCreditStatus:
-			icon = "✓"
-			detail = "covered (nulled by a sibling entry's clear: — proven clearable, not independently value-tested)"
-		case clearTargetUnknownStatus:
-			icon = "✗"
-			detail = "INVALID — named in a clear: list but not a declared field on this type"
-		}
-		fmt.Printf("  %s %s: %s\n", icon, f.JSONName, detail)
+		// Zero value (empty icon and detail) for a status absent from
+		// statusOrder, matching the original switch's implicit no-op when
+		// no case matched — ValidateManifest never assigns one, so this is
+		// unreached in practice.
+		d := details[f.Status]
+		fmt.Printf("  %s %s: %s\n", d.Icon, f.JSONName, d.Detail)
 	}
 
 	fmt.Println()

@@ -558,13 +558,13 @@ func printConvergeResult(w io.Writer, m *manifest.Manifest, r *runner.ConvergeRe
 
 // convergeAllOptions holds the parsed command line of `converge-all`.
 //
-// There is deliberately no --ignore-fields here. That option is per-resource
-// (a Loadbalancer's forwardRules is meaningless to a Network), and a single
-// flag applied across a whole fleet would silently widen every resource's
-// exclusion set to the union of all of them — turning a targeted exclusion
-// into fleet-wide blindness, which is the exact failure convention 0033
-// warns about for converge-skip. A real implementation reads each manifest's
-// own exclusions; this POC carries none.
+// --ignore-fields here is FLEET-WIDE: one set applied to every target. That
+// option is really per-resource (a Loadbalancer's forwardRules is meaningless
+// to a Network), and a single flag applied across a whole fleet does silently
+// widen every resource's exclusion set to the union of all of them — turning
+// a targeted exclusion into fleet-wide blindness, which is the exact failure
+// convention 0033 warns about for converge-skip. A real implementation reads
+// each manifest's own exclusions; that is the open design fork.
 type convergeAllOptions struct {
 	manifestPaths    []string
 	pollInterval     time.Duration

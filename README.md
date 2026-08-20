@@ -237,9 +237,10 @@ update-tester converge-all a.yaml b.yaml c.yaml
 ```
 
 `converge-all` is a separate entry point, not part of the `hook` sequence —
-`hook` (below) still runs its own two per-resource `converge` steps
-unconditionally. It exists for a provider that wants one shared window across
-many resources instead of `hook`'s per-resource ones.
+`hook` (below) runs its own two per-resource `converge` steps by default, and
+drops both only when passed `--skip-converge`. It exists for a provider that
+wants one shared window across many resources instead of `hook`'s per-resource
+ones.
 
 ### `validate` — offline coverage check
 

@@ -99,14 +99,23 @@ type ConvergeResult struct {
 // Algorithm:
 //  1. Resolve the resource from the manifest.
 //  2. PRE-CHECK: poll until metadata.generation == status.conditions[].observedGeneration.
-//  3. READINESS GATE: poll until the Ready condition is "True", bounded by
+//  3. SYNCED GATE: poll until the Synced condition is "True" at the resource's
+//     CURRENT generation, bounded by Timeout. Step 2 alone cannot see a
+//     reconcile that failed to persist a write — a late-init conflict still
+//     stamps observedGeneration == the current generation on the Synced
+//     condition it marks False — so "settled" there can already be true on a
+//     pass that never succeeded. Unlike step 4, a timeout here FAILS the
+//     check with "RESOURCE NOT IN STEADY STATE". A resource whose reconciler
+//     emits no Synced condition at all is treated as not applicable and does
+//     not block.
+//  4. READINESS GATE: poll until the Ready condition is "True", bounded by
 //     ReadinessTimeout. A resource still coming up mirrors live readiness
 //     facts into atProvider; snapshotting before it settles reads those as
 //     drift. On timeout this proceeds anyway (see ConvergeOptions.ReadinessTimeout)
 //     rather than replacing a field-level diagnostic with a bare timeout.
-//  4. RECORD: snapshot atProvider, generation, and update-event count.
-//  5. WAIT: pollInterval * 1.5.
-//  6. ASSERT: atProvider unchanged, zero new update events, generation
+//  5. RECORD: snapshot atProvider, generation, and update-event count.
+//  6. WAIT: pollInterval * 1.5.
+//  7. ASSERT: atProvider unchanged, zero new update events, generation
 //     unchanged, and Ready is still "True" (a readiness flap is reported as
 //     its own diagnostic, not folded into the atProvider diff).
 func (r *Runner) RunConverge(m *manifest.Manifest, opts ConvergeOptions) (*ConvergeResult, error) {

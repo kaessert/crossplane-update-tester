@@ -141,7 +141,16 @@ controller; set `UPDATE_TESTER_PROVIDER_DEPLOYMENT` to disambiguate.
 
 1. Poll until `metadata.generation` equals the `observedGeneration` carried by
    `status.conditions` (bounded by `--timeout`).
-2. Poll until the `Ready` condition reports `True` (bounded by
+2. Poll until the `Synced` condition reports `True` at the resource's *current*
+   `metadata.generation` (bounded by `--timeout`). Step 1 alone cannot see a
+   reconcile that failed to persist a write: a late-initialization conflict
+   still stamps `observedGeneration` equal to the current generation on the
+   `Synced` condition it marks `False`, so "settled" above can already be true
+   on a pass that never succeeded. Unlike step 3, a timeout here **fails the
+   check**, reporting `RESOURCE NOT IN STEADY STATE`. A resource whose
+   reconciler emits no `Synced` condition at all is treated as not applicable
+   and does not block.
+3. Poll until the `Ready` condition reports `True` (bounded by
    `--readiness-timeout`, defaulting to the same 120s as `--timeout`). A
    resource that is still coming up mirrors live readiness facts into
    `status.atProvider`, and snapshotting before it settles would read those
@@ -149,10 +158,10 @@ controller; set `UPDATE_TESTER_PROVIDER_DEPLOYMENT` to disambiguate.
    outright — it only narrows the window in which that can happen — and adds
    a diagnostic line noting the timeout without dropping anything else the
    check finds.
-3. Snapshot `status.atProvider`, the generation, and the update-Event count.
-4. Wait `--poll-interval * 1.5`, which guarantees at least one full reconcile
+4. Snapshot `status.atProvider`, the generation, and the update-Event count.
+5. Wait `--poll-interval * 1.5`, which guarantees at least one full reconcile
    cycle.
-5. Assert that `status.atProvider` is unchanged (minus `--ignore-fields`),
+6. Assert that `status.atProvider` is unchanged (minus `--ignore-fields`),
    that the generation is unchanged, that **zero** new update Events were
    recorded, and that `Ready` is still `True`. A `Ready` flap at this point is
    reported as its own diagnostic, separate from the `atProvider` diff.

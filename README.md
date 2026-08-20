@@ -258,6 +258,14 @@ the manifest's annotation covers it:
   struct. A scalar base field gets the singular `*Ref`; a list-typed
   (`[]string`) base field gets the plural `*Refs`; either cardinality also
   gets one `*Selector`.
+- `tested-via-switch` — the field has no entry of its own, but is named in
+  another non-skipped entry's `clear:` list. That entry's merge patch proved it
+  clearable, never proved it settable, so it is credited under its own status
+  and never folded into `tested`. A `skip:` entry's `clear:` list grants no
+  credit, and a field with its own direct entry keeps that entry's status.
+- `clear-target-unknown` — a `clear:` list names something that is not a
+  declared field on this type (a typo, or a field renamed or removed since the
+  entry was written). The command exits non-zero.
 - `MISSING` — none of the above; the command exits non-zero.
 
 This is what stops an annotation from quietly falling behind the API type as

@@ -2272,11 +2272,14 @@ func TestShortenTimeout(t *testing.T) {
 }
 
 // TestClassifyKnownDefect covers classifyKnownDefect's verdict inversion in
-// isolation, without a live cluster: non-convergence (Passed=false, for any
-// reason) is credited as the entry's expected outcome; convergence
-// (Passed=true) is flagged KnownDefectConverged; and NoOp/EvidenceUntrusted
-// results are left untouched because neither proves anything about whether
-// the defect still holds.
+// isolation, without a live cluster: non-convergence (Passed=false, backed
+// by trustworthy evidence one way or the other) is credited as the entry's
+// expected outcome; convergence (Passed=true) is flagged KnownDefectConverged;
+// and NoOp/EvidenceUntrusted/NotEvidenced results are all left untouched
+// because none of the three proves the defect still holds — NotEvidenced in
+// particular means the value DID reach its target, so crediting it as
+// non-convergence would be the exact false verdict this function exists to
+// prevent (see classifyKnownDefect's own doc comment).
 func TestClassifyKnownDefect(t *testing.T) {
 	const ticketID = "e9ce03ee-920d-46f5-9aa3-120228b196fb"
 
@@ -2292,10 +2295,10 @@ func TestClassifyKnownDefect(t *testing.T) {
 			wantKnownDefect: ticketID,
 			wantConverged:   false,
 		},
-		"NonConvergenceViaNotEvidencedIsCredited": {
-			reason:          "NotEvidenced is still Passed=false — still credited as expected non-convergence",
+		"NotEvidencedIsLeftUntouched": {
+			reason:          "the value converged, but with no evidence Update() produced it — the same 'cannot trust this either way' reasoning as EvidenceUntrusted, so it must NOT be credited as expected non-convergence",
 			in:              TestResult{Field: "useTls", Passed: false, NotEvidenced: true},
-			wantKnownDefect: ticketID,
+			wantKnownDefect: "",
 			wantConverged:   false,
 		},
 		"NonConvergenceViaErrorIsCredited": {
@@ -2338,15 +2341,19 @@ func TestClassifyKnownDefect(t *testing.T) {
 }
 
 // TestRunTestsKnownDefectNonConvergenceDoesNotFailTheRun is the end-to-end
-// counterpart to TestClassifyKnownDefect: a KnownDefect entry whose patch
-// converges in value but is never evidenced (recordUpdateEvent left false,
-// the fakeCluster default) must come back with KnownDefect set and
-// KnownDefectConverged false — RunTests itself must return no error, since
-// nothing about a KnownDefect entry not converging is a run-level failure.
-// It also proves r.timeout is restored to its original value once the
-// shortened-timeout call returns, so a later ordinary field test in the
-// same run is not left running under the KnownDefect entry's narrowed
-// window.
+// regression test for the exact bug this classification exists to prevent:
+// a KnownDefect entry whose patch converges in value but is never evidenced
+// (recordUpdateEvent left false, the fakeCluster default) must NOT be
+// credited as the entry's expected non-convergence. The field's value DID
+// reach its target — only the proof that Update() produced it is missing —
+// so classifyKnownDefect must leave KnownDefect empty and let the result
+// report through its own NOT-EVIDENCED verdict instead (main.go's
+// printResults, not covered here). RunTests itself still returns no error
+// either way: the run-level pass/fail decision belongs to printResults/
+// cmdRun, never to RunTests. It also proves r.timeout is restored to its
+// original value once the shortened-timeout call returns, so a later
+// ordinary field test in the same run is not left running under the
+// KnownDefect entry's narrowed window.
 func TestRunTestsKnownDefectNonConvergenceDoesNotFailTheRun(t *testing.T) {
 	const ticketID = "e9ce03ee-920d-46f5-9aa3-120228b196fb"
 	f := &fakeCluster{
@@ -2358,8 +2365,8 @@ func TestRunTestsKnownDefectNonConvergenceDoesNotFailTheRun(t *testing.T) {
 		// recordUpdateEvent left false: the value converges (handlePatch
 		// always mirrors forProvider into atProvider) but no update event
 		// is ever recorded, so the evidence check downgrades Passed to
-		// NotEvidenced — standing in for a real defect where the value
-		// never actually reaches the backend's own observable state.
+		// NotEvidenced — this is the "converges + no update event"
+		// scenario that used to pass quietly as a credited known defect.
 	}
 	r := newFakeRunner(f)
 	originalTimeout := r.timeout
@@ -2379,11 +2386,14 @@ func TestRunTestsKnownDefectNonConvergenceDoesNotFailTheRun(t *testing.T) {
 	}
 
 	res := results[0]
-	if res.KnownDefect != ticketID {
-		t.Errorf("KnownDefect = %q, want %q", res.KnownDefect, ticketID)
+	if res.KnownDefect != "" {
+		t.Errorf("KnownDefect = %q, want empty — a converged-but-unevidenced result must not be credited as expected non-convergence", res.KnownDefect)
+	}
+	if !res.NotEvidenced {
+		t.Error("NotEvidenced = false, want true — the value converged but no update event was ever recorded")
 	}
 	if res.KnownDefectConverged {
-		t.Error("KnownDefectConverged = true, want false — the field was never evidenced as updated")
+		t.Error("KnownDefectConverged = true, want false — convergence was never trustworthily evidenced, so this must not be reported as the defect appearing fixed either")
 	}
 	if r.timeout != originalTimeout {
 		t.Errorf("r.timeout after RunTests = %q, want it restored to %q", r.timeout, originalTimeout)

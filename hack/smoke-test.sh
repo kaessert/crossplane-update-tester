@@ -886,6 +886,53 @@ else
   dump "run output" "$OUT"
 fi
 
+section "8c. knownDefect entry: a converged-but-unevidenced field is NOT credited as non-convergence"
+
+# FAIL_MODE=unevidenced: status.atProvider DOES pick up the new value (the
+# field genuinely converges), but no UpdatedExternalResource event is ever
+# recorded. This is the middle case between 8a (never converges) and 8b
+# (converges with evidence): a converged value backed by no evidence must
+# NOT be credited as the entry's expected non-convergence, or a genuinely
+# fixed defect could pass quietly whenever its update event happens to be
+# dropped — reported instead through the entry's own NOT-EVIDENCED verdict,
+# which fails the run.
+run_direct knowndefect-unevidenced "$KNOWNDEFECT_MANIFEST" unevidenced --timeout 3
+
+if [ "$RC" -ne 0 ]; then
+  ok "run exited $RC (non-zero) for a knownDefect field that converged without evidence"
+else
+  bad "run exited 0 for a knownDefect field that converged without evidence — a converged value must never exit clean"
+  dump "run output" "$OUT"
+fi
+
+if grep -q "NOT-EVIDENCED" "$OUT"; then
+  ok "reported NOT-EVIDENCED, not a credited known-defect verdict"
+else
+  bad "expected a 'NOT-EVIDENCED' line in the output"
+  dump "run output" "$OUT"
+fi
+
+if grep -q "KNOWN-DEFECT" "$OUT"; then
+  bad "output printed a KNOWN-DEFECT verdict — a converged-but-unevidenced result must not be credited as expected non-convergence"
+  dump "run output" "$OUT"
+else
+  ok "did not print a KNOWN-DEFECT verdict for the converged-but-unevidenced result"
+fi
+
+if grep -q '0 known-defects' "$OUT"; then
+  ok "summary line reports 0 known-defects — the result is not folded into the credited count"
+else
+  bad "expected the summary line to report '0 known-defects'"
+  dump "run output" "$OUT"
+fi
+
+if grep -q '1 not-evidenced' "$OUT"; then
+  ok "summary line reports 1 not-evidenced"
+else
+  bad "expected the summary line to report '1 not-evidenced'"
+  dump "run output" "$OUT"
+fi
+
 # ─── summary ───────────────────────────────────────────────────────────────
 
 printf '\n'

@@ -99,7 +99,12 @@ For each entry in the manifest's `crossplane.io/update-test` annotation, `run`:
    pass nor a failure. If the field actually converges with positive
    evidence, that is reported as `KNOWN-DEFECT CONVERGED` and FAILS the run
    hard, naming the ticket ID and instructing the reader to delete the token
-   — see "`crossplane.io/update-test`" below.
+   — see "`crossplane.io/update-test`" below. A field whose value converges
+   but whose `Update()` Event is never recorded (point 6's `NOT-EVIDENCED`)
+   is **not** credited as the entry's expected non-convergence either: the
+   value reaching its target is itself evidence against "still broken", so
+   that case is reported through its own `NOT-EVIDENCED` verdict — which
+   also fails the run — rather than as a confirmed `KNOWN-DEFECT`.
 
 Point 6 is the reason this tool exists rather than a `kubectl patch` followed by
 a value assertion. A value match alone cannot distinguish "the controller
@@ -627,7 +632,7 @@ three top-level directive lines: `converge-skip:`, `assert-unchanged:` and
 | `expect` | Optional. The value expected in `status.atProvider` when the backend normalises what it stores. Defaults to `value`. |
 | `skip` | Optional. A reason for not testing this field. The entry is reported as `SKIPPED` and still counts as coverage for `validate`. Mutually exclusive with `knownDefect`. |
 | `clear` | Optional. A list of OTHER top-level `spec.forProvider` field names nulled in the SAME merge patch that sets `field`'s value, so a union modeled as separate top-level fields switches arms atomically. Only valid when `field` itself is top-level (not dotted); a dotted entry, or one naming `field` itself, is rejected at parse time. |
-| `knownDefect` | Optional. The ID of the ticket tracking a real defect that keeps this field's update path from converging. Unlike `skip`, the entry RUNS: `value` is required, the patch is applied exactly as normal, and non-convergence is reported as `KNOWN-DEFECT` — expected, not a failure. If the field DOES converge, that FAILS the run hard as `KNOWN-DEFECT CONVERGED`, naming the ticket and telling the reader to delete the token. Mutually exclusive with `skip`. The value must be non-empty, contain no whitespace, not be a placeholder (`TODO`, `TBD`, `n/a`, etc.), and be at least 6 characters — reject anything that cannot be followed back to an actual ticket. Also rejected if the same top-level field name appears in this manifest's own `ignore-fields:` set (dead config — see `ignore-fields:` below). |
+| `knownDefect` | Optional. The ID of the ticket tracking a real defect that keeps this field's update path from converging. Unlike `skip`, the entry RUNS: `value` is required, the patch is applied exactly as normal, and non-convergence is reported as `KNOWN-DEFECT` — expected, not a failure. If the field DOES converge, that FAILS the run hard as `KNOWN-DEFECT CONVERGED`, naming the ticket and telling the reader to delete the token. A field that converges in value but has no `Update()` Event to prove it (`NOT-EVIDENCED`) is likewise never credited as `KNOWN-DEFECT` — it fails the run through its own `NOT-EVIDENCED` verdict instead, since a value match is evidence the defect may already be fixed. Mutually exclusive with `skip`. The value must be non-empty, contain no whitespace, not be a placeholder (`TODO`, `TBD`, `n/a`, etc.), and be at least 6 characters — reject anything that cannot be followed back to an actual ticket. Also rejected if the same top-level field name appears in this manifest's own `ignore-fields:` set (dead config — see `ignore-fields:` below). |
 
 None of `converge-skip: <reason>`, `assert-unchanged: <fields>` or
 `ignore-fields: <fields>` is valid YAML as a sibling of top-level sequence

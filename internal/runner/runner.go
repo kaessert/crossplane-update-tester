@@ -659,11 +659,12 @@ type TestResult struct {
 	// unexpected pass is a verdict-level judgment, not something
 	// runFieldTest (which knows nothing about KnownDefect) should make.
 	//
-	// Left empty for a result whose underlying outcome says nothing about
-	// whether the defect still holds — NoOp (the patch never ran) and
-	// EvidenceUntrusted (the evidence backing Passed cannot be trusted
-	// either way) are reported through their own existing verdicts
-	// instead; see classifyKnownDefect.
+	// Left empty for a result whose underlying outcome does not prove the
+	// defect still holds — NoOp (the patch never ran), EvidenceUntrusted
+	// (the evidence backing Passed cannot be trusted either way), and
+	// NotEvidenced (the value converged but no update event proves
+	// Update() produced it) are reported through their own existing
+	// verdicts instead; see classifyKnownDefect.
 	KnownDefect string
 	// KnownDefectConverged marks a KnownDefect result whose field actually
 	// reached its target value with trustworthy evidence that Update() ran
@@ -1223,9 +1224,9 @@ func shortenTimeout(original string, divisor int, floor time.Duration) string {
 // FAILURE naming the ticket ID, because the suppressed defect appears to be
 // fixed and the token must be deleted.
 //
-// Two outcomes are left un-classified (Result.KnownDefect stays empty, and
+// Three outcomes are left un-classified (Result.KnownDefect stays empty, and
 // the result is reported through its own pre-existing verdict instead)
-// because neither says anything about whether the defect still holds:
+// because none of them says the defect still holds:
 //
 //   - NoOp: the pre-patch value already equalled the target, so the patch
 //     never ran and never had a chance to exercise the broken path at all.
@@ -1233,8 +1234,19 @@ func shortenTimeout(original string, divisor int, floor time.Duration) string {
 //     the evidence backing Passed cannot be trusted either way — crediting
 //     a "confirmed still broken" verdict on unreliable evidence would be as
 //     wrong as crediting a false PASS on it.
+//   - NotEvidenced: applyEvidenceCheck already downgraded this result from
+//     a value-matching PASS because no update event was ever recorded —
+//     see TestResult.NotEvidenced. The field's value DID reach its target;
+//     only the proof that Update() produced it is missing. That is a
+//     stronger reason to withhold the "still broken" verdict than
+//     EvidenceUntrusted is: crediting it as expected non-convergence would
+//     report a defect as still-broken on a field that just converged,
+//     which is exactly the false verdict this classifier exists to
+//     prevent. Leaving it un-classified routes the result through its own
+//     NOT-EVIDENCED verdict instead, which fails the run — a converged
+//     value under a knownDefect entry must never exit clean.
 func classifyKnownDefect(result TestResult, ticketID string) TestResult {
-	if result.NoOp || result.EvidenceUntrusted {
+	if result.NoOp || result.EvidenceUntrusted || result.NotEvidenced {
 		return result
 	}
 	result.KnownDefect = ticketID

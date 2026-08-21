@@ -400,9 +400,10 @@ construction. This is printed as
 ✗ headerMatcher: SIBLING-SURVIVES — key(s) invertMatch are absent from value: and will survive the RFC 7386 merge patch unaddressed; either add expect: recording the merged shape, or set the surviving key(s) to null if they are a mutually exclusive alternative being replaced
 ```
 
-and the command exits non-zero. This check runs entirely offline — the
-manifest's own `spec.forProvider` and `crossplane.io/update-test` annotation
-are enough — so it applies even without `--types-file`.
+and the command exits non-zero. This check runs entirely offline and consults
+no Go types — the manifest's own `spec.forProvider` and
+`crossplane.io/update-test` annotation are enough — though `validate` itself
+still requires `--types-file` for its mutable-field coverage report.
 
 `validate` also flags an `expect:`/`value:` object that omits a top-level key
 the target field's generated Observation struct declares WITHOUT
@@ -489,9 +490,10 @@ and the command exits non-zero. The remedy is to change `value:` to something
 the resource does not already hold at creation — the same fix a `NO-OP`
 result from a live `run` would prompt, found here without spending the run.
 
-This check runs entirely offline — the manifest's own `spec.forProvider` and
-`crossplane.io/update-test` annotation are enough — so it applies even
-without `--types-file`, exactly like `SIBLING-SURVIVES`. It compares
+This check runs entirely offline and consults no Go types — the manifest's
+own `spec.forProvider` and `crossplane.io/update-test` annotation are enough
+— exactly like `SIBLING-SURVIVES`; `validate` itself still requires
+`--types-file` for its mutable-field coverage report. It compares
 `value:` itself, never an `expect:` override: that is exactly what the live
 pre-patch guard compares against the value already on the resource, so
 substituting `expect:` here would make this check disagree with the runtime

@@ -53,6 +53,29 @@ type UpdateTest struct {
 	// the one arm being switched away from — see ValidateClear and
 	// runner.buildMergePatch for how this list is consumed.
 	Clear []string `yaml:"clear"`
+	// KnownDefect names the ticket ID tracking a real provider defect that
+	// makes this field's update path fail. Unlike Skip, a KnownDefect entry
+	// IS expressible and IS run: it exists for the field between "the test
+	// passes" and "no test exists to write" — an entry that runs, is
+	// expected NOT to converge, and says exactly why.
+	//
+	// It requires Value (a KnownDefect entry with no value is a parse
+	// error — see ParseAnnotation), because the whole point is to exercise
+	// the real patch path rather than describe one that was never tried.
+	// It is mutually exclusive with Skip — the two states already cover
+	// "converges" and "no test exists"; this is a distinct third state,
+	// not a variant of either.
+	//
+	// The runner applies the patch exactly as it would for an ordinary
+	// entry, but inverts the verdict: non-convergence is the EXPECTED
+	// outcome here and does not fail the run, while a field that DOES
+	// converge fails the run hard, naming this ticket ID and instructing
+	// the reader to delete the token and restore a plain value:/expect:
+	// entry. That inversion is what makes the suppression self-retiring —
+	// once the underlying defect is fixed, the annotation itself breaks
+	// the next run until someone removes it, rather than rotting silently
+	// the way a stale Skip reason does.
+	KnownDefect string `yaml:"knownDefect"`
 }
 
 // Manifest holds the parsed Kubernetes manifest metadata needed for testing.
@@ -288,8 +311,18 @@ func ParseAnnotation(annotation string) ([]UpdateTest, string, []string, []strin
 		if t.Field == "" {
 			return nil, "", nil, nil, fmt.Errorf("entry %d: field is required", i)
 		}
+		if t.KnownDefect != "" && t.Skip != "" {
+			return nil, "", nil, nil, fmt.Errorf(
+				"entry %d (%s): knownDefect and skip are mutually exclusive — skip asserts no test exists to write, "+
+					"knownDefect asserts an expressible test fails; an entry cannot be both", i, t.Field)
+		}
 		if t.Value == nil && t.Skip == "" {
 			return nil, "", nil, nil, fmt.Errorf("entry %d (%s): value is required unless skip is set", i, t.Field)
+		}
+		if t.KnownDefect != "" {
+			if err := ValidateKnownDefect(t.KnownDefect); err != nil {
+				return nil, "", nil, nil, fmt.Errorf("entry %d (%s): %w", i, t.Field, err)
+			}
 		}
 		if err := ValidateClear(t.Field, t.Clear); err != nil {
 			return nil, "", nil, nil, fmt.Errorf("entry %d (%s): %w", i, t.Field, err)
@@ -301,6 +334,9 @@ func ParseAnnotation(annotation string) ([]UpdateTest, string, []string, []strin
 			return nil, "", nil, nil, fmt.Errorf(
 				"assert-unchanged field %q is also an update-test field; a field cannot be both patched and asserted unchanged in the same run", f)
 		}
+	}
+	if err := ValidateKnownDefectIgnoreFields(tests, ignoreFields); err != nil {
+		return nil, "", nil, nil, err
 	}
 	return tests, convergeSkip, assertUnchanged, ignoreFields, nil
 }
@@ -419,6 +455,93 @@ func ValidateClear(field string, clear []string) error {
 		if c == field {
 			return fmt.Errorf(
 				"clear entry %q: clear must name OTHER sibling fields, not the field being patched itself", c)
+		}
+	}
+	return nil
+}
+
+// knownDefectPlaceholders lists knownDefect values that LOOK non-empty but
+// name nothing followable — the exact failure mode this token exists to
+// close off (see UpdateTest.KnownDefect): a suppression that survives
+// review because it passes every gate a real ticket ID would, while
+// pointing nowhere a later reader can search.
+var knownDefectPlaceholders = map[string]bool{
+	"todo": true, "tbd": true, "fixme": true, "xxx": true,
+	"n/a": true, "na": true, "unknown": true, "none": true, "?": true,
+}
+
+// minKnownDefectLen is the shortest string ValidateKnownDefect accepts as
+// ticket-ID-shaped. It is deliberately loose — pheromone ticket IDs are
+// either a UUID or a short custom slug of the filer's choosing, and this
+// package has no way to confirm a ticket with that ID actually exists — so
+// the bar is simply "long enough that it cannot be a stray character and
+// contains no whitespace", not "matches one specific ID format".
+const minKnownDefectLen = 6
+
+// ValidateKnownDefect rejects a knownDefect value that cannot be a real
+// ticket ID, at parse time, before any cluster is touched: empty, containing
+// whitespace (prose describing the defect rather than citing where it is
+// tracked), a known placeholder, or too short to plausibly be an ID.
+//
+// This is what keeps the suppression followable by search instead of by
+// reading a comment: a knownDefect entry that passed this check can always
+// be traced back to the ticket that explains why the field does not
+// converge yet.
+func ValidateKnownDefect(ticketID string) error {
+	trimmed := strings.TrimSpace(ticketID)
+	if trimmed == "" {
+		return fmt.Errorf("knownDefect requires a ticket ID; got an empty value")
+	}
+	if trimmed != ticketID || strings.ContainsAny(trimmed, " \t\n") {
+		return fmt.Errorf(
+			"knownDefect value %q looks like a prose description, not a ticket ID — "+
+				"a ticket ID carries no whitespace; put the reason in a code comment and cite the ticket ID here", ticketID)
+	}
+	if knownDefectPlaceholders[strings.ToLower(trimmed)] {
+		return fmt.Errorf("knownDefect value %q is a placeholder, not a real ticket ID", ticketID)
+	}
+	if len(trimmed) < minKnownDefectLen {
+		return fmt.Errorf(
+			"knownDefect value %q is too short to be a ticket ID (need at least %d characters)", ticketID, minKnownDefectLen)
+	}
+	return nil
+}
+
+// ValidateKnownDefectIgnoreFields rejects a knownDefect entry whose field
+// also appears (by its top-level name) in the manifest's own ignore-fields
+// set, at parse time.
+//
+// ignore-fields excludes a status.atProvider field from a convergence
+// check's snapshot diff entirely — declaring it there says "this field is
+// expected to differ and that difference means nothing". knownDefect on the
+// same field name says "this field's update path is broken and every run
+// proves it stays broken". Both declared on the same manifest for the same
+// field is dead config: whichever the author actually intended, the other
+// directive silently defeats it — either the convergence diff never looks
+// at the field the knownDefect entry is trying to characterise, or the
+// knownDefect entry runs unaware that something else has already decided
+// this field's drift means nothing. Neither combination is something an
+// author would choose on purpose, so it is rejected here rather than left
+// to silently pick one behaviour over the other.
+func ValidateKnownDefectIgnoreFields(tests []UpdateTest, ignoreFields []string) error {
+	ignored := make(map[string]bool, len(ignoreFields))
+	for _, f := range ignoreFields {
+		ignored[f] = true
+	}
+	for _, t := range tests {
+		if t.KnownDefect == "" {
+			continue
+		}
+		top := t.Field
+		if idx := strings.Index(top, "."); idx != -1 {
+			top = top[:idx]
+		}
+		if ignored[top] {
+			return fmt.Errorf(
+				"field %q is both a knownDefect entry (%s) and named in ignore-fields — this is dead config: "+
+					"ignore-fields excludes the field from convergence checking entirely, so the knownDefect "+
+					"entry's non-convergence proof is never meaningfully checked against it; remove one directive",
+				t.Field, t.KnownDefect)
 		}
 	}
 	return nil

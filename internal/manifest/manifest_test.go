@@ -704,6 +704,287 @@ func TestParseAnnotationRejectsUnsupportedClearShapes(t *testing.T) {
 	}
 }
 
+// TestParseBytesKnownDefect proves a "knownDefect:" key on an update-test
+// entry parses onto UpdateTest.KnownDefect, and that an entry with no such
+// key parses with an empty KnownDefect — the additive-only case every
+// pre-existing entry in the fleet must keep matching.
+func TestParseBytesKnownDefect(t *testing.T) {
+	cases := map[string]struct {
+		reason string
+		yaml   string
+		want   string
+	}{
+		"Absent": {
+			reason: "an entry with no knownDefect key parses with an empty KnownDefect, not an error",
+			yaml: `
+apiVersion: network.example.crossplane.io/v1alpha1
+kind: Network
+metadata:
+  name: example-network
+  annotations:
+    crossplane.io/update-test: |
+      - field: comment
+        value: "updated"
+`,
+			want: "",
+		},
+		"Present": {
+			reason: "the ticket ID is extracted verbatim",
+			yaml: `
+apiVersion: network.example.crossplane.io/v1alpha1
+kind: Network
+metadata:
+  name: example-network
+  annotations:
+    crossplane.io/update-test: |
+      - field: useTls
+        value: true
+        knownDefect: e9ce03ee-920d-46f5-9aa3-120228b196fb
+`,
+			want: "e9ce03ee-920d-46f5-9aa3-120228b196fb",
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			m, err := ParseBytes([]byte(tc.yaml))
+			if err != nil {
+				t.Fatalf("%s: ParseBytes() error = %v", tc.reason, err)
+			}
+			if len(m.Tests) != 1 {
+				t.Fatalf("%s: len(Tests) = %d, want 1", tc.reason, len(m.Tests))
+			}
+			if m.Tests[0].KnownDefect != tc.want {
+				t.Errorf("%s: Tests[0].KnownDefect = %q, want %q", tc.reason, m.Tests[0].KnownDefect, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseAnnotationKnownDefectRejectsInvalidShapes pins every parse-time
+// rejection a knownDefect entry can trigger: paired with skip, missing a
+// value, and a ticket ID that is prose, a placeholder, or too short — see
+// ValidateKnownDefect and the mutual-exclusion/value-required checks in
+// ParseAnnotation. An EMPTY knownDefect value is not tested here: YAML
+// decodes an omitted key and an explicit `knownDefect: ""` to the identical
+// Go zero value, so ParseAnnotation cannot tell them apart and correctly
+// treats both as "not a knownDefect entry" rather than invoking
+// ValidateKnownDefect at all — see TestValidateKnownDefect for that check's
+// own empty-value rejection, exercised directly.
+func TestParseAnnotationKnownDefectRejectsInvalidShapes(t *testing.T) {
+	cases := map[string]struct {
+		reason        string
+		annotation    string
+		wantErrSubstr string
+	}{
+		"PairedWithSkip": {
+			reason: "knownDefect and skip are mutually exclusive — one says no test exists, the other says an expressible test fails",
+			annotation: `
+- field: useTls
+  value: true
+  skip: "not ready yet"
+  knownDefect: e9ce03ee-920d-46f5-9aa3-120228b196fb
+`,
+			wantErrSubstr: "knownDefect and skip are mutually exclusive",
+		},
+		"MissingValue": {
+			reason: "a knownDefect entry still has to run, so it needs a value exactly like an ordinary entry",
+			annotation: `
+- field: useTls
+  knownDefect: e9ce03ee-920d-46f5-9aa3-120228b196fb
+`,
+			wantErrSubstr: "value is required unless skip is set",
+		},
+		"ProseTicketID": {
+			reason: "a knownDefect value with whitespace is a description, not a ticket ID to search for",
+			annotation: `
+- field: useTls
+  value: true
+  knownDefect: "fix later once backend supports it"
+`,
+			wantErrSubstr: "looks like a prose description",
+		},
+		"PlaceholderTicketID": {
+			reason: "a placeholder value passes no gate a real ticket ID would have to",
+			annotation: `
+- field: useTls
+  value: true
+  knownDefect: TODO
+`,
+			wantErrSubstr: "is a placeholder, not a real ticket ID",
+		},
+		"TooShortTicketID": {
+			reason: "a handful of characters is too short to plausibly be a ticket ID",
+			annotation: `
+- field: useTls
+  value: true
+  knownDefect: ab1
+`,
+			wantErrSubstr: "too short to be a ticket ID",
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, _, _, _, err := ParseAnnotation(tc.annotation)
+			if err == nil {
+				t.Fatalf("%s: ParseAnnotation() error = nil, want an error", tc.reason)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrSubstr) {
+				t.Errorf("%s: ParseAnnotation() error = %q, want it to contain %q", tc.reason, err.Error(), tc.wantErrSubstr)
+			}
+		})
+	}
+}
+
+// TestValidateKnownDefect exercises ValidateKnownDefect directly, including
+// the empty-value case ParseAnnotation can never reach (see
+// TestParseAnnotationKnownDefectRejectsInvalidShapes).
+func TestValidateKnownDefect(t *testing.T) {
+	cases := map[string]struct {
+		reason        string
+		ticketID      string
+		wantErrSubstr string // empty means ValidateKnownDefect must return nil
+	}{
+		"Empty": {
+			reason:        "an empty value cannot be followed back to anything",
+			ticketID:      "",
+			wantErrSubstr: "knownDefect requires a ticket ID",
+		},
+		"WhitespaceOnly": {
+			reason:        "a whitespace-only value trims to empty",
+			ticketID:      "   ",
+			wantErrSubstr: "knownDefect requires a ticket ID",
+		},
+		"Prose": {
+			reason:        "a value containing spaces reads as a description, not an ID",
+			ticketID:      "fix this later",
+			wantErrSubstr: "looks like a prose description",
+		},
+		"PlaceholderCaseInsensitive": {
+			reason:        "placeholder matching is case-insensitive",
+			ticketID:      "Todo",
+			wantErrSubstr: "is a placeholder, not a real ticket ID",
+		},
+		"TooShort": {
+			reason:        "fewer than 6 characters cannot plausibly be a ticket ID",
+			ticketID:      "abcde",
+			wantErrSubstr: "too short to be a ticket ID",
+		},
+		"ValidUUID": {
+			reason:   "a full UUID passes",
+			ticketID: "e9ce03ee-920d-46f5-9aa3-120228b196fb",
+		},
+		"ValidShortSlug": {
+			reason:   "a short custom slug at the length floor passes",
+			ticketID: "e6b026d6",
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := ValidateKnownDefect(tc.ticketID)
+			if tc.wantErrSubstr == "" {
+				if err != nil {
+					t.Fatalf("%s: ValidateKnownDefect(%q) error = %v, want nil", tc.reason, tc.ticketID, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("%s: ValidateKnownDefect(%q) error = nil, want an error containing %q", tc.reason, tc.ticketID, tc.wantErrSubstr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrSubstr) {
+				t.Errorf("%s: ValidateKnownDefect(%q) error = %q, want it to contain %q", tc.reason, tc.ticketID, err.Error(), tc.wantErrSubstr)
+			}
+		})
+	}
+}
+
+// TestParseAnnotationKnownDefectAcceptsBothTicketIDShapes proves
+// ValidateKnownDefect is not tied to one specific ticket-ID format: a full
+// UUID and a short custom slug (both real pheromone ticket ID shapes) are
+// each accepted.
+func TestParseAnnotationKnownDefectAcceptsBothTicketIDShapes(t *testing.T) {
+	cases := map[string]struct {
+		reason     string
+		ticketID   string
+		annotation string
+	}{
+		"UUID": {
+			reason:   "a full UUID ticket ID is accepted",
+			ticketID: "e9ce03ee-920d-46f5-9aa3-120228b196fb",
+		},
+		"ShortSlug": {
+			reason:   "a short custom ticket ID slug is accepted",
+			ticketID: "e6b026d6",
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			annotation := "- field: useTls\n  value: true\n  knownDefect: " + tc.ticketID + "\n"
+			tests, _, _, _, err := ParseAnnotation(annotation)
+			if err != nil {
+				t.Fatalf("%s: ParseAnnotation() error = %v", tc.reason, err)
+			}
+			if len(tests) != 1 || tests[0].KnownDefect != tc.ticketID {
+				t.Fatalf("%s: tests = %+v, want one entry with KnownDefect = %q", tc.reason, tests, tc.ticketID)
+			}
+		})
+	}
+}
+
+// TestParseAnnotationKnownDefectRejectsIgnoreFieldsOverlap pins the
+// dead-config guard: a knownDefect entry naming the same top-level field a
+// manifest's own ignore-fields directive also excludes is rejected at parse
+// time, before any cluster is touched — see ValidateKnownDefectIgnoreFields.
+func TestParseAnnotationKnownDefectRejectsIgnoreFieldsOverlap(t *testing.T) {
+	cases := map[string]struct {
+		reason        string
+		annotation    string
+		wantErrSubstr string
+	}{
+		"DirectOverlap": {
+			reason: "the same top-level field name in both directives is dead config",
+			annotation: `
+ignore-fields: useTls
+- field: useTls
+  value: true
+  knownDefect: e9ce03ee-920d-46f5-9aa3-120228b196fb
+`,
+			wantErrSubstr: `field "useTls" is both a knownDefect entry`,
+		},
+		"NoOverlapIsFine": {
+			reason: "a knownDefect entry and an unrelated ignore-fields entry coexist without error",
+			annotation: `
+ignore-fields: latestBackup
+- field: useTls
+  value: true
+  knownDefect: e9ce03ee-920d-46f5-9aa3-120228b196fb
+`,
+			wantErrSubstr: "",
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, _, _, _, err := ParseAnnotation(tc.annotation)
+			if tc.wantErrSubstr == "" {
+				if err != nil {
+					t.Fatalf("%s: ParseAnnotation() error = %v, want no error", tc.reason, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("%s: ParseAnnotation() error = nil, want an error", tc.reason)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrSubstr) {
+				t.Errorf("%s: ParseAnnotation() error = %q, want it to contain %q", tc.reason, err.Error(), tc.wantErrSubstr)
+			}
+		})
+	}
+}
+
 // stringSlicesEqual compares two string slices for equality, treating nil
 // and empty as distinct only when one is nil and the other is non-nil with
 // elements — a plain reflect.DeepEqual would report nil != []string{} as

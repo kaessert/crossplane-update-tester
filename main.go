@@ -259,16 +259,19 @@ func cmdRun(args []string) error {
 		return fmt.Errorf("no %s annotation found in manifest", manifest.AnnotationKey)
 	}
 
-	// Count tested vs skipped.
-	var skipped int
+	// Count tested vs skipped vs known-defect.
+	var skipped, knownDefectDeclared int
 	for _, t := range m.Tests {
 		if t.Skip != "" {
 			skipped++
 		}
+		if t.KnownDefect != "" {
+			knownDefectDeclared++
+		}
 	}
 
-	fmt.Printf("Testing %s/%s (%d fields, %d skipped)\n",
-		m.Kind, m.Name, len(m.Tests), skipped)
+	fmt.Printf("Testing %s/%s (%d fields, %d skipped, %d known-defect)\n",
+		m.Kind, m.Name, len(m.Tests), skipped, knownDefectDeclared)
 
 	results, unchangedViolations, err := runner.NewRunner(opts.manifestPath, opts.timeout).
 		WithPollInterval(opts.pollInterval).
@@ -277,12 +280,12 @@ func cmdRun(args []string) error {
 		return err
 	}
 
-	passed, failed, noop, notEvidenced, untrusted := printResults(os.Stdout, results)
+	passed, failed, noop, notEvidenced, untrusted, knownDefect := printResults(os.Stdout, results)
 	assertUnchangedFailed := printUnchangedAssertions(os.Stdout, m.AssertUnchanged, unchangedViolations)
 
 	total := passed + failed
-	fmt.Printf("%s: %d/%d tested, %d/%d skipped, %d no-op, %d not-evidenced, %d untrusted\n",
-		verdict(failed == 0 && !assertUnchangedFailed), passed, total, skipped, len(m.Tests), noop, notEvidenced, untrusted)
+	fmt.Printf("%s: %d/%d tested, %d/%d skipped, %d no-op, %d not-evidenced, %d untrusted, %d known-defects\n",
+		verdict(failed == 0 && !assertUnchangedFailed), passed, total, skipped, len(m.Tests), noop, notEvidenced, untrusted, knownDefect)
 
 	if failed > 0 && assertUnchangedFailed {
 		return fmt.Errorf("%d of %d field tests failed, and %d assert-unchanged field(s) drifted", failed, total, len(unchangedViolations))
@@ -329,19 +332,28 @@ func printUnchangedAssertions(w io.Writer, fields []string, violations []runner.
 }
 
 // printResults prints one line per test result (plus any side effects) and
-// returns the passed/failed counts, plus the no-op, not-evidenced, and
-// untrusted counts (all subsets of failed, reported separately so each
-// distinct failure mode is easy to spot in the summary line without being
-// confused with a genuine PASS or SKIP). A PASS whose field converged at or
-// above the runner's slow-observe threshold is annotated "slow-observe"
-// inline — it is still a PASS backed by positive update-event evidence, not
-// a reason for a reviewer to suspect the result. An UNTRUSTED result is
-// reported and counted as a failure regardless of the field's own
-// Passed/NotEvidenced value: it ran after a burst-reset failure earlier in
-// the same run, so neither outcome can be trusted to prove or disprove that
-// Update() ran — the run's summary line must not be able to read a clean
-// "0 not-evidenced" in that case.
-func printResults(w io.Writer, results []runner.TestResult) (passed, failed, noop, notEvidenced, untrusted int) {
+// returns the passed/failed counts, plus the no-op, not-evidenced,
+// untrusted, and known-defect counts (reported separately so each distinct
+// verdict is easy to spot in the summary line without being confused with a
+// genuine PASS or SKIP). A PASS whose field converged at or above the
+// runner's slow-observe threshold is annotated "slow-observe" inline — it is
+// still a PASS backed by positive update-event evidence, not a reason for a
+// reviewer to suspect the result. An UNTRUSTED result is reported and
+// counted as a failure regardless of the field's own Passed/NotEvidenced
+// value: it ran after a burst-reset failure earlier in the same run, so
+// neither outcome can be trusted to prove or disprove that Update() ran —
+// the run's summary line must not be able to read a clean "0 not-evidenced"
+// in that case.
+//
+// A KnownDefect result (see runner.TestResult.KnownDefect) is its OWN
+// verdict class, not folded into either passed or failed: non-convergence is
+// the entry's expected outcome and must not read as a failure, but it is
+// also not a PASS — the field is not actually working. The one exception is
+// KnownDefectConverged: the field DID converge, which means the suppressed
+// defect appears to be fixed, and that is reported as a hard failure naming
+// the ticket ID so the run cannot go green with a stale suppression still in
+// place.
+func printResults(w io.Writer, results []runner.TestResult) (passed, failed, noop, notEvidenced, untrusted, knownDefect int) {
 	var hasSideFx bool
 	for _, r := range results {
 		switch {
@@ -357,6 +369,14 @@ func printResults(w io.Writer, results []runner.TestResult) (passed, failed, noo
 				r.Field, fmtDuration(r.Duration))
 			failed++
 			untrusted++
+		case r.KnownDefect != "" && r.KnownDefectConverged:
+			printfTo(w, "  ✗ %s: KNOWN-DEFECT CONVERGED (%s) — the suppressed defect appears to be fixed; delete the knownDefect token and restore this entry to a plain value:/expect: test (%s)\n",
+				r.Field, r.KnownDefect, fmtDuration(r.Duration))
+			failed++
+		case r.KnownDefect != "":
+			printfTo(w, "  ⚑ %s: KNOWN-DEFECT (%s) — non-convergence expected and confirmed (%s)\n",
+				r.Field, r.KnownDefect, fmtDuration(r.Duration))
+			knownDefect++
 		case r.NotEvidenced:
 			printfTo(w, "  ⚡ %s: NOT-EVIDENCED (%v) (%s)\n", r.Field, r.Error, fmtDuration(r.Duration))
 			failed++
@@ -388,7 +408,7 @@ func printResults(w io.Writer, results []runner.TestResult) (passed, failed, noo
 		printfTo(w, "  Differential: all non-target fields stable ✓\n")
 		printfTo(w, "\n")
 	}
-	return passed, failed, noop, notEvidenced, untrusted
+	return passed, failed, noop, notEvidenced, untrusted, knownDefect
 }
 
 // passTransition formats the value pairing shown on a PASS line. It prefers

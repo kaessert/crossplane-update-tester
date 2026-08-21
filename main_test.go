@@ -18,16 +18,16 @@ import (
 	"github.com/kaessert/crossplane-update-tester/internal/validator"
 )
 
-// counts mirrors the five return values of printResults, so a table can
-// declare an expected outcome in one literal instead of five parallel fields.
+// counts mirrors the six return values of printResults, so a table can
+// declare an expected outcome in one literal instead of six parallel fields.
 type counts struct {
-	passed, failed, noop, notEvidenced, untrusted int
+	passed, failed, noop, notEvidenced, untrusted, knownDefect int
 }
 
 func run(results []runner.TestResult) (string, counts) {
 	var buf bytes.Buffer
-	p, f, n, ne, u := printResults(&buf, results)
-	return buf.String(), counts{p, f, n, ne, u}
+	p, f, n, ne, u, kd := printResults(&buf, results)
+	return buf.String(), counts{p, f, n, ne, u, kd}
 }
 
 func TestPrintResultsCounters(t *testing.T) {
@@ -125,6 +125,33 @@ func TestPrintResultsCounters(t *testing.T) {
 				{Field: "f", Expected: "1", Actual: "2"},
 			},
 			want: counts{passed: 1, failed: 4, noop: 1, notEvidenced: 1, untrusted: 1},
+		},
+		{
+			// Non-convergence is the entry's EXPECTED outcome: it must be
+			// visible in the report, but must NOT count as a failure or a
+			// pass — see runner.TestResult.KnownDefect.
+			name: "KnownDefectNonConvergenceIsItsOwnClassNotAFailure",
+			results: []runner.TestResult{{
+				Field: "useTls", KnownDefect: "e9ce03ee-920d-46f5-9aa3-120228b196fb",
+				NotEvidenced: true, Error: errors.New("no update event"), Duration: 3 * time.Second,
+			}},
+			want:     counts{knownDefect: 1},
+			contains: []string{"  ⚑ useTls: KNOWN-DEFECT (e9ce03ee-920d-46f5-9aa3-120228b196fb) — non-convergence expected and confirmed"},
+		},
+		{
+			// The suppressed defect actually converged: this MUST fail the
+			// run hard and name the ticket ID, so a fixed defect cannot
+			// silently keep running under a stale knownDefect token.
+			name: "KnownDefectConvergedIsAHardFailure",
+			results: []runner.TestResult{{
+				Field: "useTls", KnownDefect: "e9ce03ee-920d-46f5-9aa3-120228b196fb", KnownDefectConverged: true,
+				Passed: true, Before: "false", BeforeKnown: true, Expected: "true", Actual: "true", Duration: time.Second,
+			}},
+			want: counts{failed: 1},
+			contains: []string{
+				"  ✗ useTls: KNOWN-DEFECT CONVERGED (e9ce03ee-920d-46f5-9aa3-120228b196fb)",
+				"delete the knownDefect token",
+			},
 		},
 	}
 

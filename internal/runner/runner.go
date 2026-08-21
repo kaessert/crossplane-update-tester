@@ -652,6 +652,27 @@ type TestResult struct {
 	// must never print as a clean PASS when the evidence behind it is
 	// unreliable.
 	EvidenceUntrusted bool
+	// KnownDefect carries the ticket ID from the manifest entry's
+	// manifest.UpdateTest.KnownDefect, empty for an ordinary entry. Set by
+	// runKnownDefectFieldTest AFTER the field test itself runs — deciding
+	// whether the raw result counts as the expected non-convergence or an
+	// unexpected pass is a verdict-level judgment, not something
+	// runFieldTest (which knows nothing about KnownDefect) should make.
+	//
+	// Left empty for a result whose underlying outcome says nothing about
+	// whether the defect still holds — NoOp (the patch never ran) and
+	// EvidenceUntrusted (the evidence backing Passed cannot be trusted
+	// either way) are reported through their own existing verdicts
+	// instead; see classifyKnownDefect.
+	KnownDefect string
+	// KnownDefectConverged marks a KnownDefect result whose field actually
+	// reached its target value with trustworthy evidence that Update() ran
+	// — i.e. Passed would otherwise be true. This is the self-retiring half
+	// of the mechanism: it is reported as a HARD FAILURE (see printResults
+	// in main.go), not a pass, because the suppressed defect appears to be
+	// fixed and the knownDefect token must be deleted so the entry goes
+	// back to being a plain, ordinary assertion.
+	KnownDefectConverged bool
 }
 
 // defaultPollInterval is the provider poll interval assumed when the caller
@@ -864,12 +885,24 @@ func (r *Runner) RunTests(m *manifest.Manifest) ([]TestResult, []UnchangedAssert
 		}
 
 		var result TestResult
-		result, snapshot = r.runFieldTest(t, snapshot, m.Kind, m.Name, m.Namespace, m.APIVersion)
+		if t.KnownDefect != "" {
+			result, snapshot = r.runFieldTestWithShortenedTimeout(t, snapshot, m.Kind, m.Name, m.Namespace, m.APIVersion)
+		} else {
+			result, snapshot = r.runFieldTest(t, snapshot, m.Kind, m.Name, m.Namespace, m.APIVersion)
+		}
 		// A no-op test never reaches applyPatchAndReconcile, so it never
 		// consults the event-evidence check — the burst reset's success or
 		// failure is irrelevant to it.
 		if resetFailed && !result.NoOp {
 			result.EvidenceUntrusted = true
+		}
+		// classifyKnownDefect must run AFTER the EvidenceUntrusted
+		// assignment above, not before: an untrusted result proves nothing
+		// about whether the defect still holds, so it must be excluded from
+		// KnownDefect classification exactly the same way NoOp already is —
+		// see classifyKnownDefect.
+		if t.KnownDefect != "" {
+			result = classifyKnownDefect(result, t.KnownDefect)
 		}
 		results = append(results, result)
 		// Only a real (non-no-op) patch has a chance of consuming a burst
@@ -1114,6 +1147,101 @@ func latestControllerPodIdentity(identities []controllerPodIdentity) (identity c
 		}
 	}
 	return latest, true
+}
+
+// knownDefectTimeoutDivisor shortens the reconcile/poll window a KnownDefect
+// entry runs under, relative to the run's own --timeout.
+//
+// Cost decision (see the ticket that introduced KnownDefect): a KnownDefect
+// entry that has NOT been fixed yet is, by construction, expected to spend
+// its ENTIRE window failing to converge on every single run — unlike an
+// ordinary entry, which typically converges in well under the window and
+// returns early the moment it does. Running an unfixed KnownDefect entry at
+// the run's full --timeout would tax every E2E invocation that carries one
+// by the full window for no benefit: the entry exists to prove
+// non-convergence, not to race a slow backend. Dividing the window by 4
+// keeps most of that tax while still leaving enough time for the two forced
+// reconciles applyPatchAndReconcile always drives — the floor below exists
+// so a fast CI invocation's already-short --timeout does not divide down to
+// something too short for even one of them to complete.
+//
+// The trade-off this buys: a defect that would genuinely converge only in
+// the LAST quarter of the full window is misreported as KNOWN-DEFECT
+// (non-convergence) rather than caught as fixed. That is an acceptable
+// false negative for a suppression mechanism whose entire purpose is
+// bounded-cost surveillance of a defect already tracked by its own ticket —
+// the fix ticket, not this tool, is what proves the fix; this only notices
+// when it happens to notice within a shortened window.
+const knownDefectTimeoutDivisor = 4
+
+// knownDefectMinTimeout floors knownDefectTimeoutDivisor's division so a
+// very short --timeout (fast CI runs) still leaves a KnownDefect entry
+// enough time for applyPatchAndReconcile's two forced reconciles — each of
+// which itself waits out WaitReady plus waitSynced — to plausibly complete
+// before the shortened window gives up.
+const knownDefectMinTimeout = 15 * time.Second
+
+// runFieldTestWithShortenedTimeout runs one field test exactly like
+// runFieldTest, but temporarily narrows r.timeout to knownDefectTimeoutDivisor's
+// share of its normal value (floored at knownDefectMinTimeout) for the
+// duration of the call — see knownDefectTimeoutDivisor for why a KnownDefect
+// entry runs under a shortened window. r.timeout is restored before
+// returning regardless of outcome. Safe to call only from the single-
+// threaded RunTests loop, which never runs a second field test
+// concurrently with this one.
+func (r *Runner) runFieldTestWithShortenedTimeout(t manifest.UpdateTest, snapshot []byte, kind, name, namespace, apiVersion string) (TestResult, []byte) {
+	original := r.timeout
+	r.timeout = shortenTimeout(original, knownDefectTimeoutDivisor, knownDefectMinTimeout)
+	defer func() { r.timeout = original }()
+	return r.runFieldTest(t, snapshot, kind, name, namespace, apiVersion)
+}
+
+// shortenTimeout parses original as a Go duration string (the same form
+// Runner.timeout is always stored in), divides it by divisor, and floors the
+// result at floor, re-rendering it in the same string form the rest of
+// Runner expects. An unparseable or non-positive input falls back to
+// defaultPollInterval before dividing — mirroring slowObserveThreshold's own
+// fallback — so a KnownDefect entry never ends up with an effectively
+// unbounded window merely because the base timeout could not be parsed.
+func shortenTimeout(original string, divisor int, floor time.Duration) string {
+	base, err := time.ParseDuration(original)
+	if err != nil || base <= 0 {
+		base = defaultPollInterval
+	}
+	shortened := base / time.Duration(divisor)
+	if shortened < floor {
+		shortened = floor
+	}
+	return shortened.String()
+}
+
+// classifyKnownDefect interprets a just-completed field-test result for a
+// KnownDefect entry, inverting the ordinary pass/fail verdict: non-
+// convergence is this entry's EXPECTED outcome, so it is reported through
+// its own KnownDefect verdict rather than as a failure (see printResults in
+// main.go), while convergence is reported as KnownDefectConverged — a HARD
+// FAILURE naming the ticket ID, because the suppressed defect appears to be
+// fixed and the token must be deleted.
+//
+// Two outcomes are left un-classified (Result.KnownDefect stays empty, and
+// the result is reported through its own pre-existing verdict instead)
+// because neither says anything about whether the defect still holds:
+//
+//   - NoOp: the pre-patch value already equalled the target, so the patch
+//     never ran and never had a chance to exercise the broken path at all.
+//   - EvidenceUntrusted: an earlier event-burst reset failed this run, so
+//     the evidence backing Passed cannot be trusted either way — crediting
+//     a "confirmed still broken" verdict on unreliable evidence would be as
+//     wrong as crediting a false PASS on it.
+func classifyKnownDefect(result TestResult, ticketID string) TestResult {
+	if result.NoOp || result.EvidenceUntrusted {
+		return result
+	}
+	result.KnownDefect = ticketID
+	if result.Passed {
+		result.KnownDefectConverged = true
+	}
+	return result
 }
 
 // runFieldTest executes a single (non-skipped) update test: it patches the

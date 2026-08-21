@@ -179,6 +179,28 @@ mkdir -p "$TREE/examples/burst"
   done
 } >"$TREE/examples/burst/burst.yaml"
 
+# A fourth example, for the knownDefect verdict-inversion checks below
+# (section 8). One field, no skip: — the entry has to RUN, and the two
+# scenarios in section 8 toggle whether it converges via SMOKE_FAIL_MODE
+# alone, no second fixture needed.
+mkdir -p "$TREE/examples/knowndefect"
+KNOWNDEFECT_TICKET="e9ce03ee-920d-46f5-9aa3-120228b196fb"
+{
+  echo "apiVersion: knowndefect.example.crossplane.io/v1alpha1"
+  echo "kind: KnownDefect"
+  echo "metadata:"
+  echo "  name: example-knowndefect"
+  echo "  annotations:"
+  echo "    crossplane.io/update-test: |"
+  echo "      - field: comment"
+  echo "        value: \"Updated by update-tester\""
+  echo "        knownDefect: $KNOWNDEFECT_TICKET"
+  echo "spec:"
+  echo "  forProvider:"
+  echo "    comment: Managed by Crossplane"
+} >"$TREE/examples/knowndefect/knowndefect.yaml"
+KNOWNDEFECT_MANIFEST="$TREE/examples/knowndefect/knowndefect.yaml"
+
 # The fake kubectl, first on PATH.
 cp "$TESTDATA/fake-kubectl.sh" "$BIN/kubectl"
 chmod +x "$BIN/kubectl"
@@ -218,6 +240,28 @@ run_hook() {
     cd "$cwd" &&
       SMOKE_STATE="$state" SMOKE_FAIL_MODE="$mode" \
         "$invocation"
+  ) >"$OUT" 2>&1
+  RC=$?
+  set -e
+}
+
+# run_direct <scenario> <manifest> [fail-mode] [extra tool args...]
+# Invokes the `run` subcommand directly through the stub module — bypassing
+# the post-assert hook's converge/identity steps entirely — with its own
+# state directory, exactly like run_hook. Used where a check cares only
+# about `run`'s own verdict (section 8's knownDefect checks), not the
+# 5-step sequence a real post-assert hook drives. Sets OUT and RC.
+run_direct() {
+  local scenario=$1 manifest=$2 mode=${3:-}
+  shift 3 || true
+  local state="$TMP/state-$scenario"
+  mkdir -p "$state"
+  OUT="$TMP/$scenario.out"
+  set +e
+  (
+    cd "$ELSEWHERE" &&
+      SMOKE_STATE="$state" SMOKE_FAIL_MODE="$mode" \
+        go -C "$STUB" tool crossplane-update-tester run "$manifest" "$@"
   ) >"$OUT" 2>&1
   RC=$?
   set -e
@@ -782,6 +826,64 @@ if grep -qE '^patch ' "$TMP/state-wipe-badpath/kubectl.log"; then
   dump "kubectl transcript" "$TMP/state-wipe-badpath/kubectl.log"
 else
   ok "no patch was issued before the baseline check rejected the unresolvable path"
+fi
+
+# ─── 8. knownDefect verdict inversion ──────────────────────────────────────
+
+section "8a. knownDefect entry: non-convergence is reported, not a failure"
+
+# FAIL_MODE=stuck: the patch is accepted and an event is emitted, but
+# status.atProvider never picks up the new value — the knownDefect entry's
+# expected state. run itself, not the full hook, is what is under test here.
+run_direct knowndefect-nonconverge "$KNOWNDEFECT_MANIFEST" stuck --timeout 3
+
+if [ "$RC" -eq 0 ]; then
+  ok "run exited 0 for a knownDefect entry that did not converge (its expected outcome)"
+else
+  bad "run exited $RC, expected 0 — non-convergence is a knownDefect entry's expected outcome, not a failure"
+  dump "run output" "$OUT"
+fi
+
+if grep -q "KNOWN-DEFECT ($KNOWNDEFECT_TICKET)" "$OUT"; then
+  ok "reported KNOWN-DEFECT, naming the ticket ID"
+else
+  bad "expected a 'KNOWN-DEFECT ($KNOWNDEFECT_TICKET)' line in the output"
+  dump "run output" "$OUT"
+fi
+
+if grep -q '1 known-defects' "$OUT"; then
+  ok "summary line counts the known-defect separately from pass/fail"
+else
+  bad "expected the summary line to report '1 known-defects'"
+  dump "run output" "$OUT"
+fi
+
+section "8b. knownDefect entry: convergence FAILS the run hard"
+
+# FAIL_MODE unset (well-behaved backend): the field genuinely converges,
+# standing in for the underlying defect having been fixed. The verdict must
+# invert to a hard failure naming the ticket, not a pass.
+run_direct knowndefect-converged "$KNOWNDEFECT_MANIFEST" "" --timeout 3
+
+if [ "$RC" -ne 0 ]; then
+  ok "run exited $RC (non-zero) when the knownDefect field actually converged"
+else
+  bad "run exited 0 despite the knownDefect field converging — a fixed defect must fail the run so the stale token is caught"
+  dump "run output" "$OUT"
+fi
+
+if grep -q "KNOWN-DEFECT CONVERGED ($KNOWNDEFECT_TICKET)" "$OUT"; then
+  ok "reported KNOWN-DEFECT CONVERGED, naming the ticket ID"
+else
+  bad "expected a 'KNOWN-DEFECT CONVERGED ($KNOWNDEFECT_TICKET)' line in the output"
+  dump "run output" "$OUT"
+fi
+
+if grep -q 'delete the knownDefect token' "$OUT"; then
+  ok "instructs the reader to delete the knownDefect token"
+else
+  bad "expected an instruction to delete the knownDefect token"
+  dump "run output" "$OUT"
 fi
 
 # ─── summary ───────────────────────────────────────────────────────────────

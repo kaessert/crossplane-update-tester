@@ -2220,6 +2220,222 @@ func TestRunTestsAmbiguousProviderDeploymentDegradesToUntrusted(t *testing.T) {
 	}
 }
 
+// TestShortenTimeout covers shortenTimeout's parsing, division, flooring,
+// and fallback-on-unparseable-input behaviour directly — it is a pure
+// function with no cluster dependency.
+func TestShortenTimeout(t *testing.T) {
+	cases := map[string]struct {
+		reason   string
+		original string
+		divisor  int
+		floor    time.Duration
+		want     string
+	}{
+		"DividesCleanly": {
+			reason:   "a value comfortably above the floor after division is used as-is",
+			original: "120s",
+			divisor:  4,
+			floor:    15 * time.Second,
+			want:     "30s",
+		},
+		"FloorsWhenDivisionGoesBelowIt": {
+			reason:   "a short base timeout divides below the floor and is clamped up to it",
+			original: "20s",
+			divisor:  4,
+			floor:    15 * time.Second,
+			want:     "15s",
+		},
+		"UnparseableFallsBackToDefaultPollInterval": {
+			reason:   "an unparseable original falls back to defaultPollInterval before dividing, rather than producing a zero or unbounded window",
+			original: "not-a-duration",
+			divisor:  4,
+			floor:    15 * time.Second,
+			want:     (defaultPollInterval / 4).String(),
+		},
+		"ZeroFallsBackToDefaultPollInterval": {
+			reason:   "a zero-valued original is treated the same as unparseable — dividing zero would otherwise silently produce a zero window",
+			original: "0s",
+			divisor:  4,
+			floor:    15 * time.Second,
+			want:     (defaultPollInterval / 4).String(),
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := shortenTimeout(tc.original, tc.divisor, tc.floor)
+			if got != tc.want {
+				t.Errorf("%s: shortenTimeout(%q, %d, %s) = %q, want %q", tc.reason, tc.original, tc.divisor, tc.floor, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestClassifyKnownDefect covers classifyKnownDefect's verdict inversion in
+// isolation, without a live cluster: non-convergence (Passed=false, for any
+// reason) is credited as the entry's expected outcome; convergence
+// (Passed=true) is flagged KnownDefectConverged; and NoOp/EvidenceUntrusted
+// results are left untouched because neither proves anything about whether
+// the defect still holds.
+func TestClassifyKnownDefect(t *testing.T) {
+	const ticketID = "e9ce03ee-920d-46f5-9aa3-120228b196fb"
+
+	cases := map[string]struct {
+		reason          string
+		in              TestResult
+		wantKnownDefect string
+		wantConverged   bool
+	}{
+		"NonConvergenceViaMismatchIsCredited": {
+			reason:          "a plain value mismatch is the entry's expected outcome",
+			in:              TestResult{Field: "useTls", Passed: false},
+			wantKnownDefect: ticketID,
+			wantConverged:   false,
+		},
+		"NonConvergenceViaNotEvidencedIsCredited": {
+			reason:          "NotEvidenced is still Passed=false — still credited as expected non-convergence",
+			in:              TestResult{Field: "useTls", Passed: false, NotEvidenced: true},
+			wantKnownDefect: ticketID,
+			wantConverged:   false,
+		},
+		"NonConvergenceViaErrorIsCredited": {
+			reason:          "a reconcile-timeout error is still Passed=false — still credited",
+			in:              TestResult{Field: "useTls", Passed: false, Error: fmt.Errorf("waiting for Synced: timed out")},
+			wantKnownDefect: ticketID,
+			wantConverged:   false,
+		},
+		"ConvergenceIsFlaggedHardFailure": {
+			reason:          "the field actually reached its target with trustworthy evidence — the defect appears fixed",
+			in:              TestResult{Field: "useTls", Passed: true},
+			wantKnownDefect: ticketID,
+			wantConverged:   true,
+		},
+		"NoOpIsLeftUntouched": {
+			reason:          "a no-op patch never exercised the broken path at all — it says nothing about the defect",
+			in:              TestResult{Field: "useTls", NoOp: true, Passed: false},
+			wantKnownDefect: "",
+			wantConverged:   false,
+		},
+		"EvidenceUntrustedIsLeftUntouched": {
+			reason:          "untrusted evidence cannot prove or disprove convergence either way",
+			in:              TestResult{Field: "useTls", EvidenceUntrusted: true, Passed: true},
+			wantKnownDefect: "",
+			wantConverged:   false,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := classifyKnownDefect(tc.in, ticketID)
+			if got.KnownDefect != tc.wantKnownDefect {
+				t.Errorf("%s: KnownDefect = %q, want %q", tc.reason, got.KnownDefect, tc.wantKnownDefect)
+			}
+			if got.KnownDefectConverged != tc.wantConverged {
+				t.Errorf("%s: KnownDefectConverged = %v, want %v", tc.reason, got.KnownDefectConverged, tc.wantConverged)
+			}
+		})
+	}
+}
+
+// TestRunTestsKnownDefectNonConvergenceDoesNotFailTheRun is the end-to-end
+// counterpart to TestClassifyKnownDefect: a KnownDefect entry whose patch
+// converges in value but is never evidenced (recordUpdateEvent left false,
+// the fakeCluster default) must come back with KnownDefect set and
+// KnownDefectConverged false — RunTests itself must return no error, since
+// nothing about a KnownDefect entry not converging is a run-level failure.
+// It also proves r.timeout is restored to its original value once the
+// shortened-timeout call returns, so a later ordinary field test in the
+// same run is not left running under the KnownDefect entry's narrowed
+// window.
+func TestRunTestsKnownDefectNonConvergenceDoesNotFailTheRun(t *testing.T) {
+	const ticketID = "e9ce03ee-920d-46f5-9aa3-120228b196fb"
+	f := &fakeCluster{
+		forProvider: map[string]interface{}{testFieldFeatureEnabled: false},
+		atProvider:  map[string]interface{}{testFieldFeatureEnabled: false},
+		generation:  1,
+		kind:        testKindExample,
+		name:        testNameExample,
+		// recordUpdateEvent left false: the value converges (handlePatch
+		// always mirrors forProvider into atProvider) but no update event
+		// is ever recorded, so the evidence check downgrades Passed to
+		// NotEvidenced — standing in for a real defect where the value
+		// never actually reaches the backend's own observable state.
+	}
+	r := newFakeRunner(f)
+	originalTimeout := r.timeout
+
+	m := &manifest.Manifest{
+		Kind: testKindExample, Name: testNameExample,
+		Tests: []manifest.UpdateTest{
+			{Field: testFieldFeatureEnabled, Value: true, KnownDefect: ticketID},
+		},
+	}
+	results, _, err := r.RunTests(m)
+	if err != nil {
+		t.Fatalf("RunTests: unexpected error: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("got %d results, want 1", len(results))
+	}
+
+	res := results[0]
+	if res.KnownDefect != ticketID {
+		t.Errorf("KnownDefect = %q, want %q", res.KnownDefect, ticketID)
+	}
+	if res.KnownDefectConverged {
+		t.Error("KnownDefectConverged = true, want false — the field was never evidenced as updated")
+	}
+	if r.timeout != originalTimeout {
+		t.Errorf("r.timeout after RunTests = %q, want it restored to %q", r.timeout, originalTimeout)
+	}
+}
+
+// TestRunTestsKnownDefectConvergenceFailsTheRun is
+// TestRunTestsKnownDefectNonConvergenceDoesNotFailTheRun's counterpart: a
+// KnownDefect entry whose field DOES converge with trustworthy evidence
+// (recordUpdateEvent: true) must be reported as KnownDefectConverged — the
+// self-retiring half of the mechanism. RunTests itself still returns no
+// error: the decision to fail the overall command on this belongs to
+// printResults/cmdRun (main.go), which is where the run-level exit code is
+// decided; RunTests only reports results.
+func TestRunTestsKnownDefectConvergenceFailsTheRun(t *testing.T) {
+	const ticketID = "e9ce03ee-920d-46f5-9aa3-120228b196fb"
+	f := &fakeCluster{
+		forProvider:       map[string]interface{}{testFieldFeatureEnabled: false},
+		atProvider:        map[string]interface{}{testFieldFeatureEnabled: false},
+		generation:        1,
+		kind:              testKindExample,
+		name:              testNameExample,
+		recordUpdateEvent: true,
+	}
+	r := newFakeRunner(f)
+
+	m := &manifest.Manifest{
+		Kind: testKindExample, Name: testNameExample,
+		Tests: []manifest.UpdateTest{
+			{Field: testFieldFeatureEnabled, Value: true, KnownDefect: ticketID},
+		},
+	}
+	results, _, err := r.RunTests(m)
+	if err != nil {
+		t.Fatalf("RunTests: unexpected error: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("got %d results, want 1", len(results))
+	}
+
+	res := results[0]
+	if res.KnownDefect != ticketID {
+		t.Errorf("KnownDefect = %q, want %q", res.KnownDefect, ticketID)
+	}
+	if !res.KnownDefectConverged {
+		t.Error("KnownDefectConverged = false, want true — the field genuinely converged with evidence")
+	}
+	if !res.Passed {
+		t.Error("Passed = false, want true — the underlying field test itself passed; the run-level verdict inversion happens in main.go's printResults")
+	}
+}
+
 // TestRestartControllerDeploymentResolvesViaPodLabel exercises
 // restartControllerDeployment's actual kubectl argv through execFunc,
 // simulating a fake kubectl that mirrors a live Crossplane v2.2.1 cluster:

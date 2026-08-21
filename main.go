@@ -502,6 +502,9 @@ func cmdValidate(args []string) error {
 	}
 	validator.PrintServerEchoedExpectations(echoFindings)
 
+	noOpFindings := validator.CheckGuaranteedNoOp(m)
+	validator.PrintGuaranteedNoOp(noOpFindings)
+
 	if !result.AllGood {
 		return errors.New("mutable-field coverage is incomplete")
 	}
@@ -516,6 +519,9 @@ func cmdValidate(args []string) error {
 	}
 	if len(echoFindings) > 0 {
 		return errors.New("update-test expectation omits a member the provider's controller declares server-echoed")
+	}
+	if len(noOpFindings) > 0 {
+		return errors.New("update-test entry repeats the field's own create-time value and can never exercise the update path")
 	}
 	return nil
 }

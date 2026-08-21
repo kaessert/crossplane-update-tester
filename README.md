@@ -471,6 +471,41 @@ hand-written one does), since the two are named independently by the
 generator and the controller author. A controller package with no such
 registration leaves this check inert — no findings, no error.
 
+`validate` also flags a non-`skip:` entry whose `value:` is byte-for-byte the
+same shape already present at the entry's field path in the manifest's own
+create-time `spec.forProvider`. A merge patch that repeats a value the API
+server already holds makes no change for it to persist — `metadata.generation`
+never bumps, so the controller's `Update()` path is never invoked. This is the
+same pre-patch guard the `run` command itself applies immediately before
+building the patch, checked here offline instead of against a live read, so
+the defect is caught before a cluster and an admission slot are spent
+rediscovering something the manifest already said. This is printed as
+
+```
+✗ enableApiDiscovery: GUARANTEED-NO-OP — value: already equals the create-time spec.forProvider value at this field, so the merge patch changes nothing, metadata.generation never bumps, and Update() is never invoked; change value: to something the resource does not already hold
+```
+
+and the command exits non-zero. The remedy is to change `value:` to something
+the resource does not already hold at creation — the same fix a `NO-OP`
+result from a live `run` would prompt, found here without spending the run.
+
+This check runs entirely offline — the manifest's own `spec.forProvider` and
+`crossplane.io/update-test` annotation are enough — so it applies even
+without `--types-file`, exactly like `SIBLING-SURVIVES`. It compares
+`value:` itself, never an `expect:` override: that is exactly what the live
+pre-patch guard compares against the value already on the resource, so
+substituting `expect:` here would make this check disagree with the runtime
+verdict it exists to predict.
+
+It is deliberately conservative, the same bar as this tool's other offline
+checks. An entry is flagged only when every EARLIER non-skipped entry in the
+same manifest left the field's top-level name untouched — neither as its own
+`field:`, nor named in its own `clear:` list. Entries run in order against
+one live resource, so an earlier entry naming the same top-level field may
+have changed what is actually there by the time this entry's patch is built;
+this check has no way to know whether that earlier entry converged, so it
+declines to guess rather than risk a false positive.
+
 ### `expect-skeleton` — expect: key-set generator (dev aid)
 
 `expect-skeleton` needs no cluster and no manifest — only `--kind` and

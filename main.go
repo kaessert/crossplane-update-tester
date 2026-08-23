@@ -43,7 +43,7 @@
 //	update-tester run <manifest.yaml> [--timeout 120] [--poll-interval 60s]
 //	update-tester converge <manifest.yaml> [--poll-interval 60s] [--ignore-fields a,b] [--timeout 120s] [--readiness-timeout 120s]
 //	update-tester converge-all <m1.yaml,m2.yaml,...> [--poll-interval 60s] [--concurrency 8] [--timeout 120s] [--readiness-timeout 120s]
-//	update-tester validate <manifest.yaml> --types-file <types.go> [--controller-dir <dir>]
+//	update-tester validate <manifest.yaml> [--types-file <types.go>] [--controller-dir <dir>] [--root <dir>]
 //	update-tester expect-skeleton <types.go> --kind <Kind> --field <field>
 //	update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
 //	update-tester resolve-recover <manifest.yaml> [--timeout 120]
@@ -149,7 +149,7 @@ func runCommand(name string, args []string) error {
 const usageSynopsis = `update-tester run <manifest.yaml> [--timeout 120] [--poll-interval 60s]
 update-tester converge <manifest.yaml> [--poll-interval 60s] [--ignore-fields a,b] [--timeout 120s] [--readiness-timeout 120s]
 update-tester converge-all <m1.yaml,m2.yaml,...> [--poll-interval 60s] [--concurrency 8] [--timeout 120s] [--readiness-timeout 120s]
-update-tester validate <manifest.yaml> --types-file <types.go> [--controller-dir <dir>]
+update-tester validate <manifest.yaml> [--types-file <types.go>] [--controller-dir <dir>] [--root <dir>]
 update-tester expect-skeleton <types.go> --kind <Kind> --field <field>
 update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
 update-tester resolve-recover <manifest.yaml> [--timeout 120]
@@ -458,25 +458,43 @@ type validateOptions struct {
 	manifestPath  string
 	typesFile     string
 	controllerDir string
+	// root is the provider repo root holding apis/cluster and
+	// apis/namespaced. It is only consulted when typesFile is empty — see
+	// cmdValidate, which resolves the types file by identity under
+	// root/apis/<scope> in that case.
+	root string
 }
 
 func parseValidateArgs(args []string) (validateOptions, error) {
 	fs := flag.NewFlagSet("validate", flag.ContinueOnError)
-	typesFile := fs.String("types-file", "", "Path to Go types file containing Parameters struct")
+	typesFile := fs.String("types-file", "",
+		"Path to Go types file containing Parameters struct (optional — resolved by identity under "+
+			"--root/apis/<scope> when omitted)")
 	controllerDir := fs.String("controller-dir", "",
 		"Path to the resource's controller package directory (optional). When set, also flags an expect:/value: "+
 			"object that omits a member the controller declares server-echoed via a registered go-cmp Transformer "+
 			"normalizer, even when that member carries omitempty")
+	root := fs.String("root", "",
+		"Provider repo root holding apis/cluster and apis/namespaced, used to resolve --types-file by identity "+
+			"when it is omitted (default: working directory)")
 	if err := fs.Parse(cli.ReorderArgs(fs, args)); err != nil {
 		return validateOptions{}, err
 	}
 	if fs.NArg() < 1 {
-		return validateOptions{}, errors.New("usage: update-tester validate <manifest.yaml> --types-file <types.go> [--controller-dir <dir>]")
+		return validateOptions{}, errors.New(
+			"usage: update-tester validate <manifest.yaml> [--types-file <types.go>] [--controller-dir <dir>] [--root <dir>]")
 	}
-	if *typesFile == "" {
-		return validateOptions{}, errors.New("--types-file is required")
+
+	resolvedRoot := *root
+	if resolvedRoot == "" {
+		wd, err := os.Getwd()
+		if err != nil {
+			return validateOptions{}, fmt.Errorf("determining working directory for --root: %w", err)
+		}
+		resolvedRoot = wd
 	}
-	return validateOptions{manifestPath: fs.Arg(0), typesFile: *typesFile, controllerDir: *controllerDir}, nil
+
+	return validateOptions{manifestPath: fs.Arg(0), typesFile: *typesFile, controllerDir: *controllerDir, root: resolvedRoot}, nil
 }
 
 func cmdValidate(args []string) error {
@@ -490,7 +508,15 @@ func cmdValidate(args []string) error {
 		return err
 	}
 
-	fields, err := validator.ParseGoTypes(opts.typesFile, m.Kind)
+	typesFile := opts.typesFile
+	if typesFile == "" {
+		typesFile, err = validator.FindTypesFile(opts.root, m.APIVersion, m.Kind)
+		if err != nil {
+			return fmt.Errorf("resolving types file: %w", err)
+		}
+	}
+
+	fields, err := validator.ParseGoTypes(typesFile, m.Kind)
 	if err != nil {
 		return err
 	}
@@ -498,16 +524,16 @@ func cmdValidate(args []string) error {
 	result := validator.ValidateManifest(m, fields)
 	validator.PrintValidation(result)
 
-	findings := validator.CheckObservability(opts.typesFile, m.Kind, fields, m.Tests)
+	findings := validator.CheckObservability(typesFile, m.Kind, fields, m.Tests)
 	validator.PrintObservability(findings)
 
 	siblingFindings := validator.CheckMergePatchSiblings(m)
 	validator.PrintMergePatchSiblings(siblingFindings)
 
-	incompleteFindings := validator.CheckIncompleteExpectations(opts.typesFile, fields, m)
+	incompleteFindings := validator.CheckIncompleteExpectations(typesFile, fields, m)
 	validator.PrintIncompleteExpectations(incompleteFindings)
 
-	echoFindings, err := validator.CheckServerEchoedExpectations(opts.typesFile, fields, m, opts.controllerDir)
+	echoFindings, err := validator.CheckServerEchoedExpectations(typesFile, fields, m, opts.controllerDir)
 	if err != nil {
 		return fmt.Errorf("checking server-echoed expectations: %w", err)
 	}

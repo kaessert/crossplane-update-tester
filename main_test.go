@@ -1052,9 +1052,135 @@ func TestParseArgsRequiresItsPositional(t *testing.T) {
 	}
 }
 
-func TestParseValidateRequiresTypesFile(t *testing.T) {
-	if _, err := parseValidateArgs([]string{"manifest.yaml"}); err == nil {
-		t.Error("validate without --types-file accepted, want an error")
+// TestParseValidateTypesFileOptional covers the UTV-TOOL-TYPES-ID change:
+// --types-file is no longer required at parse time. When omitted,
+// parseValidateArgs must still succeed and leave typesFile empty (cmdValidate
+// resolves it later, by identity, under --root) rather than rejecting the
+// invocation outright.
+func TestParseValidateTypesFileOptional(t *testing.T) {
+	got, err := parseValidateArgs([]string{"manifest.yaml"})
+	if err != nil {
+		t.Fatalf("validate without --types-file rejected: %v", err)
+	}
+	if got.typesFile != "" {
+		t.Errorf("parseValidateArgs without --types-file: typesFile = %q, want empty", got.typesFile)
+	}
+	if got.root == "" {
+		t.Error("parseValidateArgs without --root: root defaulted to empty, want the working directory")
+	}
+}
+
+// TestParseValidateRootFlag covers --root: it reorders like every other
+// flag, and an explicit value is passed through untouched rather than
+// resolved against the working directory.
+func TestParseValidateRootFlag(t *testing.T) {
+	for _, args := range [][]string{
+		{"--root", "/abs/provider-root", "manifest.yaml"},
+		{"manifest.yaml", "--root", "/abs/provider-root"},
+		{"manifest.yaml", "--root=/abs/provider-root"},
+	} {
+		got, err := parseValidateArgs(args)
+		if err != nil {
+			t.Fatalf("parseValidateArgs(%q): %v", args, err)
+		}
+		if got.root != "/abs/provider-root" {
+			t.Errorf("parseValidateArgs(%q).root = %q, want /abs/provider-root", args, got.root)
+		}
+	}
+}
+
+// writeValidateFixtures writes a minimal WidgetParameters types file at
+// typesRelPath (relative to root, using the "/" separator regardless of
+// OS — filepath.Join normalizes it) and a Widget manifest with no
+// crossplane.io/update-test annotation and no forProvider fields, so
+// cmdValidate's coverage check trivially passes (zero fields declared, zero
+// fields expected) and any non-nil error it returns can only come from types
+// file resolution itself — exactly what these tests are pinning down.
+func writeValidateFixtures(t *testing.T, root, apiVersion, typesRelPath string) (manifestPath, typesPath string) {
+	t.Helper()
+	typesPath = filepath.Join(root, filepath.FromSlash(typesRelPath))
+	if err := os.MkdirAll(filepath.Dir(typesPath), 0o750); err != nil {
+		t.Fatalf("creating parent dirs for %s: %v", typesRelPath, err)
+	}
+	src := "package v1alpha1\n\ntype WidgetParameters struct {\n}\n"
+	if err := os.WriteFile(typesPath, []byte(src), 0o600); err != nil {
+		t.Fatalf("writing types file: %v", err)
+	}
+
+	manifestPath = filepath.Join(root, "widget.yaml")
+	yamlDoc := "apiVersion: " + apiVersion + "\n" +
+		"kind: Widget\n" +
+		"metadata:\n" +
+		"  name: example-widget\n"
+	if err := os.WriteFile(manifestPath, []byte(yamlDoc), 0o600); err != nil {
+		t.Fatalf("writing manifest fixture: %v", err)
+	}
+	return manifestPath, typesPath
+}
+
+// TestCmdValidateDiscoversTypesFileByIdentity covers the end-to-end path:
+// omitting --types-file and passing --root must still resolve and validate
+// against the file FindTypesFile locates, without the caller ever naming a
+// path.
+func TestCmdValidateDiscoversTypesFileByIdentity(t *testing.T) {
+	root := t.TempDir()
+	manifestPath, _ := writeValidateFixtures(t, root, "widget.crossplane.io/v1alpha1", "apis/cluster/v1alpha1/zz_widget_types.go")
+
+	if err := cmdValidate([]string{"--root", root, manifestPath}); err != nil {
+		t.Fatalf("cmdValidate with discovered types file: %v", err)
+	}
+}
+
+// TestCmdValidateExplicitTypesFileOverridesDiscovery covers the backward
+// compatibility guarantee: passing --types-file explicitly must be honoured
+// even when it points somewhere identity discovery would never look (here,
+// directly at t.TempDir(), with no apis/ subtree at all present under
+// --root) — proving discovery is never consulted when an override is given.
+func TestCmdValidateExplicitTypesFileOverridesDiscovery(t *testing.T) {
+	root := t.TempDir()
+	// No apis/ subtree under root at all — discovery would fail loudly if
+	// it ran. The manifest and its (non-discoverable) types file live
+	// directly under root instead.
+	typesPath := filepath.Join(root, "custom-types.go")
+	src := "package v1alpha1\n\ntype WidgetParameters struct {\n}\n"
+	if err := os.WriteFile(typesPath, []byte(src), 0o600); err != nil {
+		t.Fatalf("writing types file: %v", err)
+	}
+	manifestPath := filepath.Join(root, "widget.yaml")
+	yamlDoc := "apiVersion: widget.crossplane.io/v1alpha1\n" +
+		"kind: Widget\n" +
+		"metadata:\n" +
+		"  name: example-widget\n"
+	if err := os.WriteFile(manifestPath, []byte(yamlDoc), 0o600); err != nil {
+		t.Fatalf("writing manifest fixture: %v", err)
+	}
+
+	if err := cmdValidate([]string{"--types-file", typesPath, manifestPath}); err != nil {
+		t.Fatalf("cmdValidate with explicit --types-file: %v", err)
+	}
+}
+
+// TestCmdValidateDiscoveryFailureIsReported confirms a discovery failure
+// (here: no apis/ subtree at all under --root) surfaces as a wrapped,
+// readable cmdValidate error rather than a panic or a bare validator.go
+// error with no indication which stage failed.
+func TestCmdValidateDiscoveryFailureIsReported(t *testing.T) {
+	root := t.TempDir() // no apis/ subtree present
+	manifestPath := filepath.Join(root, "widget.yaml")
+	yamlDoc := "apiVersion: widget.crossplane.io/v1alpha1\n" +
+		"kind: Widget\n" +
+		"metadata:\n" +
+		"  name: example-widget\n"
+	if err := os.WriteFile(manifestPath, []byte(yamlDoc), 0o600); err != nil {
+		t.Fatalf("writing manifest fixture: %v", err)
+	}
+
+	err := cmdValidate([]string{"--root", root, manifestPath})
+	if err == nil {
+		t.Fatal("expected an error when no types file can be discovered")
+	}
+	if !strings.Contains(err.Error(), "resolving types file") {
+		t.Errorf("cmdValidate discovery-failure error = %q, want it to mention \"resolving types file\"", err.Error())
 	}
 }
 

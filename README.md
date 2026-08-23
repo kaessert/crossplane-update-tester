@@ -35,7 +35,7 @@ Everything it asserts is derived from two sources:
 update-tester run <manifest.yaml> [--timeout 120] [--poll-interval 60s]
 update-tester converge <manifest.yaml> [--poll-interval 60s] [--ignore-fields a,b] [--timeout 120s] [--readiness-timeout 120s]
 update-tester converge-all <m1.yaml,m2.yaml,...> [--poll-interval 60s] [--concurrency 8] [--timeout 120s] [--readiness-timeout 120s]
-update-tester validate <manifest.yaml> --types-file <types.go> [--controller-dir <dir>]
+update-tester validate <manifest.yaml> [--types-file <types.go>] [--controller-dir <dir>] [--root <dir>]
 update-tester expect-skeleton <types.go> --kind <Kind> --field <field>
 update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
 update-tester resolve-recover <manifest.yaml> [--timeout 120]
@@ -296,7 +296,19 @@ ones.
 `validate` needs no cluster. It scans a generated `types.go` for the
 `<Kind>Parameters` struct (skipping every other struct declaration in the
 file, not only other `*Parameters` structs) and reports, per field, whether
-the manifest's annotation covers it:
+the manifest's annotation covers it.
+
+`--types-file` is optional. When omitted, `validate` resolves the types file
+itself: it derives the resource's scope from the manifest's apiVersion group
+(a group ending in `.m.crossplane.io` is namespaced, everything else is
+cluster-scoped — never the manifest's filename) and searches
+`--root/apis/<scope>/` for the one file that declares
+`type <Kind>Parameters struct`. Zero matches or more than one match is a
+hard failure naming the Kind, the resolved scope, and the directory
+searched — never a silent fallback to a wrong-but-existing path.
+`--root` defaults to the working directory, matching `roundtrip-diff`,
+`roundtrip-verify` and `hook`. Passing `--types-file` explicitly always
+overrides discovery.
 
 - `tested` / `skipped` — the field appears in the annotation with a value, or
   with a structured `skip:` reason (see "`skip:` reasons" below).
@@ -410,7 +422,8 @@ construction. This is printed as
 and the command exits non-zero. This check runs entirely offline and consults
 no Go types — the manifest's own `spec.forProvider` and
 `crossplane.io/update-test` annotation are enough — though `validate` itself
-still requires `--types-file` for its mutable-field coverage report.
+still resolves a types file (explicit `--types-file`, or discovered under
+`--root`) for its mutable-field coverage report.
 
 `validate` also flags an `expect:`/`value:` object that omits a top-level key
 the target field's generated Observation struct declares WITHOUT
@@ -499,8 +512,9 @@ result from a live `run` would prompt, found here without spending the run.
 
 This check runs entirely offline and consults no Go types — the manifest's
 own `spec.forProvider` and `crossplane.io/update-test` annotation are enough
-— exactly like `SIBLING-SURVIVES`; `validate` itself still requires
-`--types-file` for its mutable-field coverage report. It compares
+— exactly like `SIBLING-SURVIVES`; `validate` itself still resolves a types
+file (explicit `--types-file`, or discovered under `--root`) for its
+mutable-field coverage report. It compares
 `value:` itself, never an `expect:` override: that is exactly what the live
 pre-patch guard compares against the value already on the resource, so
 substituting `expect:` here would make this check disagree with the runtime

@@ -5,10 +5,12 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"reflect"
@@ -1664,6 +1666,13 @@ func (r *Runner) runRaw(args ...string) (string, error) {
 
 // exec runs the configured kubectl binary with args and returns stdout. If
 // execFunc is set (tests only), it is used instead of shelling out.
+//
+// Stderr is captured into a buffer rather than handed to cmd.Stderr =
+// os.Stderr directly: os/exec's ExitError only populates its own Stderr
+// field when the caller has left cmd.Stderr nil, so claiming the stream for
+// live display silently zeroes out the text a failing invocation's wrapped
+// error would otherwise carry. Teeing to os.Stderr preserves the live
+// display and keeps the captured copy for the returned error.
 func (r *Runner) exec(args ...string) (string, error) {
 	if r.execFunc != nil {
 		return r.execFunc(args)
@@ -1672,12 +1681,13 @@ func (r *Runner) exec(args ...string) (string, error) {
 	// "kubectl", overridable only via the KUBECTL env var), not
 	// attacker-controlled input.
 	cmd := exec.CommandContext(context.Background(), r.kubectl, args...)
-	cmd.Stderr = os.Stderr
+	var stderr bytes.Buffer
+	cmd.Stderr = io.MultiWriter(os.Stderr, &stderr)
 	out, err := cmd.Output()
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
-			return "", fmt.Errorf("%w: %s", err, string(exitErr.Stderr))
+			return "", fmt.Errorf("%w: %s", err, stderr.String())
 		}
 		return "", err
 	}

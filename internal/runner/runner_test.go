@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -3367,4 +3370,74 @@ func outputSpecOf(args []string) string {
 		}
 	}
 	return ""
+}
+
+// TestExecCapturesKubectlStderr exercises the REAL exec() path — r.kubectl
+// pointed at a fake script on disk — rather than the execFunc test seam
+// every other test in this file uses. execFunc short-circuits ahead of the
+// exec.Command construction this bug lives in (Go's os/exec only populates
+// ExitError.Stderr when the caller leaves cmd.Stderr nil), so it is the one
+// test that can prove or disprove the fix.
+//
+// It asserts two things a fix must hold simultaneously: the failing
+// command's stderr text reaches the returned error, AND it still reaches
+// os.Stderr live (the tee, not a switch from one destination to the other).
+func TestExecCapturesKubectlStderr(t *testing.T) {
+	const sentinel = "timed out waiting for the condition"
+
+	script := writeFakeKubectlStderrScript(t, sentinel)
+	r := &Runner{kubectl: script}
+
+	streamed := captureOSStderr(t, func() {
+		_, err := r.exec("get", "widget")
+		if err == nil {
+			t.Fatal("exec() returned a nil error for a non-zero exit")
+		}
+		if !strings.Contains(err.Error(), sentinel) {
+			t.Errorf("exec() error = %q, want it to contain %q", err.Error(), sentinel)
+		}
+	})
+
+	if !strings.Contains(streamed, sentinel) {
+		t.Errorf("live-streamed stderr = %q, want it to contain %q", streamed, sentinel)
+	}
+}
+
+// writeFakeKubectlStderrScript writes an executable shell script to a
+// t.TempDir() that writes sentinel to stderr and exits 1, standing in for a
+// failing kubectl invocation. It returns the script's path.
+func writeFakeKubectlStderrScript(t *testing.T, sentinel string) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fake-kubectl")
+	body := fmt.Sprintf("#!/bin/sh\necho %q 1>&2\nexit 1\n", sentinel)
+	if err := os.WriteFile(path, []byte(body), 0o755); err != nil { //nolint:gosec // test fixture, needs to be executable
+		t.Fatalf("write fake kubectl script: %v", err)
+	}
+	return path
+}
+
+// captureOSStderr redirects os.Stderr to an in-memory pipe for the duration
+// of fn, restores it afterward, and returns everything written during fn.
+func captureOSStderr(t *testing.T, fn func()) string {
+	t.Helper()
+
+	orig := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stderr = w
+
+	fn()
+
+	w.Close()
+	os.Stderr = orig
+
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read captured stderr: %v", err)
+	}
+	return string(out)
 }

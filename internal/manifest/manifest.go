@@ -133,15 +133,18 @@ const (
 	// resolvable offline — Ticket is checked for presence only.
 	SkipFixtureMissing SkipReason = "fixture-missing"
 	// SkipWriteOnly marks a field with no readable counterpart to assert
-	// against. Accepted here without further resolution: the tool's own
-	// full-mirror convention for atProvider means an atProvider
-	// counterpart exists in the generated type by construction, so
-	// telling a genuinely write-only field apart from one whose
-	// counterpart was simply never named requires comparing against a
-	// live roundtrip row, not the schema alone. UTV-TOOL-DENOM resolves
-	// this reason against that row; until it lands, a write-only entry
-	// here is accepted on the strength of its author's claim, same as
-	// vendor-defect and fixture-missing.
+	// against. Accepted here with no companion key, unlike the other four
+	// structured reasons: the tool's own full-mirror convention for
+	// atProvider means an atProvider counterpart exists in the generated
+	// type by construction, so telling a genuinely write-only field apart
+	// from one whose counterpart was simply never named cannot be done
+	// from the schema alone — it requires comparing against a live
+	// roundtrip row. That resolution happens at run time, in
+	// roundtrip.DenominatorReport, against the field's own row: a
+	// present-in-spec-absent-from-mirror row confirms the claim, any
+	// other row (or no row at all) rejects it. Parse-time validation here
+	// only checks that the reason is well-formed; it is not the
+	// resolution.
 	SkipWriteOnly SkipReason = "write-only"
 )
 

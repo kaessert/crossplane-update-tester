@@ -309,7 +309,7 @@ func TestPrintDenominatorFindingsListsEveryFinding(t *testing.T) {
 // file's own doc comment) rather than synthetic rows, so this ticket's
 // must-test set measurement is grounded in real backend behaviour and not
 // only in invented data: the AppFirewall fixture measures a must-test set
-// of 4 of 12 observed fields (3 present-in-spec-absent-from-mirror, 0
+// of 4 of 12 observed fields (4 present-in-spec-absent-from-mirror, 0
 // value-changed/defaulted-by-server), and HttpLoadbalancer measures 4 of 8
 // (3 defaulted-by-server, 1 value-changed) — the first live-classification
 // numbers this campaign has ever produced.
@@ -356,7 +356,57 @@ func TestDenominatorReportAgainstRealF5xcFixtures(t *testing.T) {
 	t.Run("MustTestSetSizeMatchesTheMeasuredFigure", func(t *testing.T) {
 		_, mustTestCount := DenominatorReport(&manifest.Manifest{}, rows)
 		if mustTestCount != 4 {
-			t.Errorf("mustTestCount = %d, want 4 (this fixture's measured must-test set: 3 present-in-spec-absent-from-mirror, 0 value-changed/defaulted-by-server)", mustTestCount)
+			t.Errorf("mustTestCount = %d, want 4 (this fixture's measured must-test set: 4 present-in-spec-absent-from-mirror, 0 value-changed/defaulted-by-server)", mustTestCount)
+		}
+	})
+}
+
+// TestDenominatorReportAgainstRealHttpLoadbalancerFixture runs
+// DenominatorReport over the same real, trimmed provider-f5xc
+// HttpLoadbalancer CRD/object fixtures roundtrip_test.go uses
+// (TestDiffReportMatchesPythonHttpLoadbalancer). This fixture is the ONLY
+// real fixture carrying value-changed and defaulted-by-server rows, so it
+// is the one arm that exercises the never-waivable path — the rows
+// write-only can never rescue — against real backend behaviour rather than
+// only against synthetic data.
+func TestDenominatorReportAgainstRealHttpLoadbalancerFixture(t *testing.T) {
+	crd := mustDecodeCRD(t, httpLoadbalancerCRD)
+	obj := mustDecodeObject(t, httpLoadbalancerObject)
+	rows, err := DiffReport(crd, obj)
+	if err != nil {
+		t.Fatalf("DiffReport(HttpLoadbalancer): %v", err)
+	}
+
+	t.Run("MustTestSetSizeMatchesTheMeasuredFigure", func(t *testing.T) {
+		_, mustTestCount := DenominatorReport(&manifest.Manifest{}, rows)
+		if mustTestCount != 4 {
+			t.Errorf("mustTestCount = %d, want 4 (this fixture's measured must-test set: 3 defaulted-by-server, 1 value-changed)", mustTestCount)
+		}
+	})
+
+	t.Run("DefaultedByServerRejectsWriteOnlyOnARealRow", func(t *testing.T) {
+		// corsPolicy.allowHeaders is a real defaulted-by-server row in this
+		// fixture — the backend supplies a value the client never sent, the
+		// exact shape write-only cannot rescue.
+		m := &manifest.Manifest{Tests: []manifest.UpdateTest{
+			{Field: "corsPolicy.allowHeaders", Skip: manifest.SkipInfo{Reason: manifest.SkipWriteOnly}},
+		}}
+		findings, _ := DenominatorReport(m, rows)
+		if !findingsContain(findings, wantFinding{field: "corsPolicy.allowHeaders", classification: ClassDefaultedByServer}) {
+			t.Errorf("findings = %+v, want a REJECTED finding for corsPolicy.allowHeaders — this field IS mirrored, write-only cannot rescue defaulted-by-server", findings)
+		}
+	})
+
+	t.Run("ValueChangedRejectsWriteOnlyOnARealRow", func(t *testing.T) {
+		// protectedCookies is a real value-changed row in this fixture — the
+		// backend echoes a nested value the client never sent, changing the
+		// whole array as compared at its own schema-declared leaf.
+		m := &manifest.Manifest{Tests: []manifest.UpdateTest{
+			{Field: "protectedCookies", Skip: manifest.SkipInfo{Reason: manifest.SkipWriteOnly}},
+		}}
+		findings, _ := DenominatorReport(m, rows)
+		if !findingsContain(findings, wantFinding{field: "protectedCookies", classification: ClassValueChanged}) {
+			t.Errorf("findings = %+v, want a REJECTED finding for protectedCookies — this field IS mirrored, write-only cannot rescue value-changed", findings)
 		}
 	})
 }

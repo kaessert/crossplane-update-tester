@@ -48,11 +48,13 @@
 //	update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
 //	update-tester resolve-recover <manifest.yaml> [--timeout 120]
 //	update-tester roundtrip-diff <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30]
+//	update-tester roundtrip-verify <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30]
 //	update-tester hook <invocation-name> [--root <dir>] [--manifest <path>] [--skip-converge]
 //	update-tester version
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -126,6 +128,8 @@ func runCommand(name string, args []string) error {
 		return cmdResolveRecover(args)
 	case "roundtrip-diff":
 		return cmdRoundtripDiff(args)
+	case "roundtrip-verify":
+		return cmdRoundtripVerify(args)
 	case "hook":
 		return cmdHook(args)
 	case "version":
@@ -150,6 +154,7 @@ update-tester expect-skeleton <types.go> --kind <Kind> --field <field>
 update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
 update-tester resolve-recover <manifest.yaml> [--timeout 120]
 update-tester roundtrip-diff <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30]
+update-tester roundtrip-verify <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30]
 update-tester hook <invocation-name> [--root <dir>] [--manifest <path>] [--skip-converge]
 update-tester version`
 
@@ -208,6 +213,12 @@ Commands:
              or changed. Read-only, and never fails on what it finds —
              converge-all inlines the same report next to a FAILING
              target's own verdict when UPDATE_TESTER_ROOT is set.
+  roundtrip-verify
+             The enforcing counterpart to roundtrip-diff: derives the
+             must-test denominator from the SAME live classification and
+             fails when a must-test field's skip: waiver does not hold up
+             against its own live row. Emits one JSON report per manifest
+             on every invocation, pass or fail.
   hook       Derive a manifest from the name this binary was invoked
              under and run the full post-assert sequence for it
   version    Print the version of the tool in use
@@ -1095,6 +1106,190 @@ func cmdRoundtripDiff(args []string) error {
 
 	if reported == 0 {
 		fmt.Fprintln(os.Stderr, "roundtrip-diff: no resources produced a report (see stderr for skips, if any)")
+	}
+	return nil
+}
+
+// ─── roundtrip-verify ─────────────────────────────────────────────────────
+
+// roundtripVerifyOptions holds the parsed command line of `roundtrip-verify`.
+type roundtripVerifyOptions struct {
+	manifestPaths []string
+	root          string
+	timeout       int
+}
+
+func parseRoundtripVerifyArgs(args []string) (roundtripVerifyOptions, error) {
+	fs := flag.NewFlagSet("roundtrip-verify", flag.ContinueOnError)
+	root := fs.String("root", "", "Provider repo root holding package/crds (default: working directory)")
+	timeout := fs.Int("timeout", 30, "Timeout in seconds for kubectl calls")
+	if err := fs.Parse(cli.ReorderArgs(fs, args)); err != nil {
+		return roundtripVerifyOptions{}, err
+	}
+	if fs.NArg() < 1 {
+		return roundtripVerifyOptions{}, errors.New(
+			"usage: update-tester roundtrip-verify <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30]")
+	}
+
+	// Accept both a comma-separated list and repeated positional
+	// arguments, matching roundtrip-diff's own manifest-list convention.
+	var paths []string
+	for _, arg := range fs.Args() {
+		for _, p := range strings.Split(arg, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				paths = append(paths, p)
+			}
+		}
+	}
+
+	resolvedRoot := *root
+	if resolvedRoot == "" {
+		wd, err := os.Getwd()
+		if err != nil {
+			return roundtripVerifyOptions{}, fmt.Errorf("determining working directory for --root: %w", err)
+		}
+		resolvedRoot = wd
+	}
+
+	return roundtripVerifyOptions{manifestPaths: paths, root: resolvedRoot, timeout: *timeout}, nil
+}
+
+// roundtripVerifyRowJSON is the machine-readable shape one roundtrip.Row
+// renders as in cmdRoundtripVerify's per-manifest report.
+type roundtripVerifyRowJSON struct {
+	Path           string      `json:"path"`
+	Classification string      `json:"classification"`
+	SpecFound      bool        `json:"specFound"`
+	SpecValue      interface{} `json:"specValue,omitempty"`
+	MirrorFound    bool        `json:"mirrorFound"`
+	MirrorValue    interface{} `json:"mirrorValue,omitempty"`
+}
+
+// roundtripVerifyFindingJSON is the machine-readable shape one
+// roundtrip.MustTestFinding renders as.
+type roundtripVerifyFindingJSON struct {
+	Field          string `json:"field"`
+	Classification string `json:"classification"`
+	Detail         string `json:"detail"`
+}
+
+// roundtripVerifyReportJSON is the full machine-readable report for one
+// manifest. It is printed on EVERY manifest roundtrip-verify can reach a
+// live object for — pass or fail — never gated on whether a finding turned
+// up, so a caller never has to infer "were rows even computed?" from the
+// exit code the way converge-all's advisory inline report requires.
+type roundtripVerifyReportJSON struct {
+	Kind          string                       `json:"kind"`
+	Name          string                       `json:"name"`
+	Rows          []roundtripVerifyRowJSON     `json:"rows"`
+	MustTestCount int                          `json:"mustTestCount"`
+	Findings      []roundtripVerifyFindingJSON `json:"findings"`
+}
+
+func toRoundtripVerifyRowJSON(rows []roundtrip.Row) []roundtripVerifyRowJSON {
+	out := make([]roundtripVerifyRowJSON, len(rows))
+	for i, r := range rows {
+		out[i] = roundtripVerifyRowJSON{
+			Path:           r.Path,
+			Classification: r.Classification,
+			SpecFound:      r.SpecFound,
+			SpecValue:      r.SpecValue,
+			MirrorFound:    r.MirrorFound,
+			MirrorValue:    r.MirrorValue,
+		}
+	}
+	return out
+}
+
+func toRoundtripVerifyFindingJSON(findings []roundtrip.MustTestFinding) []roundtripVerifyFindingJSON {
+	out := make([]roundtripVerifyFindingJSON, len(findings))
+	for i, f := range findings {
+		out[i] = roundtripVerifyFindingJSON{Field: f.Field, Classification: f.Classification, Detail: f.Detail}
+	}
+	return out
+}
+
+// cmdRoundtripVerify is the enforcing counterpart to roundtrip-diff: where
+// that command is purely advisory and never fails on what it finds, this
+// one derives the must-test denominator from the SAME live classification
+// (see package roundtrip's DenominatorReport) and fails when a must-test
+// field's own skip: waiver does not hold up against its own live row.
+//
+// Rows are computed and printed for every manifest this command can reach a
+// live object for, on every invocation — never conditioned on whether the
+// resource's converge/run checks passed or failed, unlike converge-all's
+// advisory inline report (see RoundtripFindingsForFailures), which stays
+// exactly as it was: gated to failures, and never gating the command's own
+// exit code. This command's exit code is the new, separate gate.
+func cmdRoundtripVerify(args []string) error {
+	opts, err := parseRoundtripVerifyArgs(args)
+	if err != nil {
+		return err
+	}
+
+	produced := 0
+	anyFindings := false
+	for _, p := range opts.manifestPaths {
+		m, err := manifest.Parse(p)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "roundtrip-verify: SKIP %s — %v\n", p, err)
+			continue
+		}
+
+		r := runner.NewRunner(p, opts.timeout)
+		if err := r.ResolveResource(m); err != nil {
+			fmt.Fprintf(os.Stderr, "roundtrip-verify: SKIP %s/%s — %v\n", m.Kind, m.Name, err)
+			continue
+		}
+		obj, err := r.GetObject()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "roundtrip-verify: SKIP %s/%s — %v\n", m.Kind, m.Name, err)
+			continue
+		}
+
+		crd, _ := roundtrip.FindCRD(opts.root, m.APIVersion, m.Kind)
+		if crd == nil {
+			fmt.Fprintf(os.Stderr, "roundtrip-verify: SKIP %s/%s — no matching CRD under %s\n",
+				m.Kind, m.Name, filepath.Join(opts.root, "package", "crds"))
+			continue
+		}
+		rows, err := roundtrip.DiffReport(crd, obj)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "roundtrip-verify: SKIP %s/%s — %v\n", m.Kind, m.Name, err)
+			continue
+		}
+
+		findings, mustTestCount := roundtrip.DenominatorReport(m, rows)
+
+		report := roundtripVerifyReportJSON{
+			Kind:          m.Kind,
+			Name:          m.Name,
+			Rows:          toRoundtripVerifyRowJSON(rows),
+			MustTestCount: mustTestCount,
+			Findings:      toRoundtripVerifyFindingJSON(findings),
+		}
+		encoded, err := json.Marshal(report)
+		if err != nil {
+			return fmt.Errorf("encoding roundtrip-verify report for %s/%s: %w", m.Kind, m.Name, err)
+		}
+		printfTo(os.Stdout, "%s\n", encoded)
+
+		printfTo(os.Stdout, "roundtrip-verify: %s/%s\n", m.Kind, m.Name)
+		roundtrip.PrintDenominatorFindings(func(format string, args ...interface{}) {
+			printfTo(os.Stdout, format, args...)
+		}, mustTestCount, findings)
+
+		produced++
+		if len(findings) > 0 {
+			anyFindings = true
+		}
+	}
+
+	if produced == 0 {
+		return errors.New("roundtrip-verify: no resources produced a report (see stderr for skips, if any)")
+	}
+	if anyFindings {
+		return errors.New("one or more must-test fields carry a skip: waiver this live run could not confirm")
 	}
 	return nil
 }

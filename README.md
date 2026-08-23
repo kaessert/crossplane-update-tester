@@ -40,6 +40,7 @@ update-tester expect-skeleton <types.go> --kind <Kind> --field <field>
 update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
 update-tester resolve-recover <manifest.yaml> [--timeout 120]
 update-tester roundtrip-diff <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30]
+update-tester roundtrip-verify <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30]
 update-tester hook <invocation-name> [--root <dir>] [--manifest <path>] [--skip-converge]
 update-tester version
 ```
@@ -611,6 +612,56 @@ reason to fail. `converge-all` inlines the same report next to a **FAILING**
 target's own verdict line when `UPDATE_TESTER_ROOT` is set — see
 "Environment" below — so the finding is visible at the moment the run
 actually failed instead of requiring a second, separate invocation.
+
+### `roundtrip-verify` — must-test denominator (enforcing)
+
+`roundtrip-diff` is advisory by design and never fails on what it finds.
+`roundtrip-verify` is its enforcing counterpart: it computes the SAME
+five-way classification for every manifest given to it, on every
+invocation — never only when something else already failed — and then
+checks every field the manifest's `crossplane.io/update-test` annotation
+`skip:`s against its own live row. It fails when a "must-test" field's
+waiver does not hold up.
+
+The must-test set is derived from the classification, not asserted by hand:
+
+- `equal` — the value round-trips faithfully. The only classification a
+  `skip:` waiver is cheap against, whatever reason it names.
+- `value-changed` / `defaulted-by-server` — the backend changed or defaulted
+  the value. These can never be waived, under any reason — including
+  `write-only`: a field that changed or was defaulted round-trips through
+  the mirror by definition, which already disproves a write-only claim.
+- `present-in-spec-absent-from-mirror` — the client set it, the mirror never
+  reports it. Must be tested, or waived `skip: {reason: write-only}` — this
+  is the one row shape that reason's claim is checked against.
+- `present-in-mirror-absent-from-spec` — not a spec field at all, so it is
+  never part of the denominator.
+- **No row at all** (the field was never populated on either side of the
+  live object) — a legacy free-prose `skip:` is a finding here: with no row
+  to confirm anything, a free-prose sentence is exactly the unchecked claim
+  this check exists to stop crediting cheaply. `write-only` is ALSO a
+  finding here, even though it is structured: its citation IS a
+  `present-in-spec-absent-from-mirror` row, and a no-row field gives it
+  nothing to resolve against. The other four structured reasons
+  (`union-arm`, `covered-elsewhere`, `vendor-defect`, `fixture-missing`) are
+  accepted — each carries its own citation (`sibling:`, `by:`,
+  `evidence:` + `ticket:`, or `ticket:`) resolved elsewhere (see `validate`'s
+  `skip: reasons` checks below).
+
+A field with no `skip:` entry at all is untouched by this command: direct
+testing is already proven by `run`, and a field neither tested nor skipped
+is already reported `MISSING` by `validate`.
+
+Each manifest's report is printed as one JSON object per line — `kind`,
+`name`, every row (`path`, `classification`, `specFound`/`specValue`,
+`mirrorFound`/`mirrorValue`), the must-test set size, and every unresolved
+finding — followed by a human-readable rendering of the same must-test size
+and findings. The report is emitted for every manifest this command can
+reach a live object for, whether or not any finding turns up: the JSON line
+is never conditioned on failure, unlike `converge-all`'s advisory inline
+report.
+
+Like `roundtrip-diff`, this command is entirely read-only.
 
 ### `hook` — the post-assert entry point
 

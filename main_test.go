@@ -14,6 +14,7 @@ import (
 
 	"github.com/kaessert/crossplane-update-tester/internal/differ"
 	"github.com/kaessert/crossplane-update-tester/internal/manifest"
+	"github.com/kaessert/crossplane-update-tester/internal/roundtrip"
 	"github.com/kaessert/crossplane-update-tester/internal/runner"
 	"github.com/kaessert/crossplane-update-tester/internal/validator"
 )
@@ -886,6 +887,22 @@ func TestFlagAfterPositionalTakesEffect(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("RoundtripVerify", func(t *testing.T) {
+		for _, args := range [][]string{
+			{"--root", "/repo", "--timeout", "45", path},
+			{path, "--root", "/repo", "--timeout", "45"},
+			{path, "--timeout=45", "--root=/repo"},
+		} {
+			got, err := parseRoundtripVerifyArgs(args)
+			if err != nil {
+				t.Fatalf("parseRoundtripVerifyArgs(%q): %v", args, err)
+			}
+			if len(got.manifestPaths) != 1 || got.manifestPaths[0] != path || got.root != "/repo" || got.timeout != 45 {
+				t.Errorf("parseRoundtripVerifyArgs(%q) = %+v, want manifestPaths [%q], root /repo, timeout 45", args, got, path)
+			}
+		}
+	})
 }
 
 // TestParseConvergeArgsRejectsDottedIgnoreField pins the flag-sourced half of
@@ -1023,6 +1040,7 @@ func TestParseArgsRequiresItsPositional(t *testing.T) {
 		{name: "ResolveRecover", parse: func(a []string) error { _, err := parseResolveRecoverArgs(a); return err }},
 		{name: "Hook", parse: func(a []string) error { _, err := parseHookArgs(a); return err }},
 		{name: "RoundtripDiff", parse: func(a []string) error { _, err := parseRoundtripDiffArgs(a); return err }},
+		{name: "RoundtripVerify", parse: func(a []string) error { _, err := parseRoundtripVerifyArgs(a); return err }},
 	}
 
 	for _, tc := range tests {
@@ -1370,6 +1388,107 @@ func TestParseRoundtripDiffArgsAcceptsCommaSeparatedManifests(t *testing.T) {
 	}
 	if !reflect.DeepEqual(repeated.manifestPaths, want) {
 		t.Errorf("manifestPaths (repeated positional) = %#v, want %#v", repeated.manifestPaths, want)
+	}
+}
+
+// TestRunCommandDispatchesRoundtripVerify mirrors
+// TestRunCommandDispatchesRoundtripDiff for the new enforcing subcommand:
+// calling it with no positional argument must fail with roundtrip-verify's
+// OWN usage error, not errUnknownCommand — the failure mode that would
+// appear if the "case roundtrip-verify" line were ever accidentally removed
+// or misspelled.
+func TestRunCommandDispatchesRoundtripVerify(t *testing.T) {
+	err := runCommand("roundtrip-verify", nil)
+	if err == nil {
+		t.Fatal("roundtrip-verify with no manifest accepted, want a usage error")
+	}
+	if errors.Is(err, errUnknownCommand) {
+		t.Errorf("error %v wraps errUnknownCommand — roundtrip-verify is not wired into the dispatch switch", err)
+	}
+	if !strings.Contains(err.Error(), "roundtrip-verify") {
+		t.Errorf("error %q does not name the roundtrip-verify usage", err)
+	}
+}
+
+// TestParseRoundtripVerifyArgsDefaultsRootToWorkingDirectory mirrors
+// TestParseRoundtripDiffArgsDefaultsRootToWorkingDirectory: an operator
+// invoking the command directly, without --root, gets the process's own
+// working directory rather than an error.
+func TestParseRoundtripVerifyArgsDefaultsRootToWorkingDirectory(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("os.Getwd: %v", err)
+	}
+
+	got, err := parseRoundtripVerifyArgs([]string{"manifest.yaml"})
+	if err != nil {
+		t.Fatalf("parseRoundtripVerifyArgs: %v", err)
+	}
+	if got.root != wd {
+		t.Errorf("root = %q, want the working directory %q", got.root, wd)
+	}
+}
+
+// TestParseRoundtripVerifyArgsAcceptsCommaSeparatedManifests mirrors
+// TestParseRoundtripDiffArgsAcceptsCommaSeparatedManifests: a single
+// comma-separated argument and repeated positional arguments must be
+// equivalent.
+func TestParseRoundtripVerifyArgsAcceptsCommaSeparatedManifests(t *testing.T) {
+	want := []string{"a.yaml", "b.yaml", "c.yaml"}
+
+	commaJoined, err := parseRoundtripVerifyArgs([]string{"--root", "/repo", "a.yaml,b.yaml,c.yaml"})
+	if err != nil {
+		t.Fatalf("parseRoundtripVerifyArgs (comma-joined): %v", err)
+	}
+	if !reflect.DeepEqual(commaJoined.manifestPaths, want) {
+		t.Errorf("manifestPaths (comma-joined) = %#v, want %#v", commaJoined.manifestPaths, want)
+	}
+
+	repeated, err := parseRoundtripVerifyArgs([]string{"--root", "/repo", "a.yaml", "b.yaml", "c.yaml"})
+	if err != nil {
+		t.Fatalf("parseRoundtripVerifyArgs (repeated positional): %v", err)
+	}
+	if !reflect.DeepEqual(repeated.manifestPaths, want) {
+		t.Errorf("manifestPaths (repeated positional) = %#v, want %#v", repeated.manifestPaths, want)
+	}
+}
+
+// TestCmdRoundtripVerifyNoResourcesProducedIsAnError confirms that, unlike
+// roundtrip-diff (which prints "no resources produced a report" to stderr
+// but still exits 0), roundtrip-verify treats "nothing could be checked" as
+// a real failure: every manifest here fails to parse (nonexistent files),
+// so nothing was ever verified, and returning nil would look identical to
+// "verified, and every waiver held up" — the one outcome this command must
+// never claim without evidence.
+func TestCmdRoundtripVerifyNoResourcesProducedIsAnError(t *testing.T) {
+	err := cmdRoundtripVerify([]string{"--root", "/repo", "/does/not/exist/a.yaml,/does/not/exist/b.yaml"})
+	if err == nil {
+		t.Fatal("cmdRoundtripVerify with only unparseable manifests returned nil, want an error")
+	}
+	if !strings.Contains(err.Error(), "no resources produced a report") {
+		t.Errorf("error = %q, want it to explain that nothing was verified", err)
+	}
+}
+
+// TestToRoundtripVerifyRowJSONAndFindingJSON confirms the JSON conversion
+// helpers carry every field through unchanged — the machine-readable
+// report is only as good as this mapping.
+func TestToRoundtripVerifyRowJSONAndFindingJSON(t *testing.T) {
+	rows := []roundtrip.Row{
+		{Path: "a.b", Classification: roundtrip.ClassValueChanged, SpecFound: true, SpecValue: 1, MirrorFound: true, MirrorValue: 2},
+	}
+	gotRows := toRoundtripVerifyRowJSON(rows)
+	if len(gotRows) != 1 || gotRows[0].Path != "a.b" || gotRows[0].Classification != roundtrip.ClassValueChanged ||
+		!gotRows[0].SpecFound || gotRows[0].SpecValue != 1 || !gotRows[0].MirrorFound || gotRows[0].MirrorValue != 2 {
+		t.Errorf("toRoundtripVerifyRowJSON(%+v) = %+v, fields did not carry through unchanged", rows, gotRows)
+	}
+
+	findings := []roundtrip.MustTestFinding{
+		{Field: "a.b", Classification: roundtrip.ClassValueChanged, Detail: "must be tested"},
+	}
+	gotFindings := toRoundtripVerifyFindingJSON(findings)
+	if len(gotFindings) != 1 || gotFindings[0].Field != "a.b" || gotFindings[0].Classification != roundtrip.ClassValueChanged || gotFindings[0].Detail != "must be tested" {
+		t.Errorf("toRoundtripVerifyFindingJSON(%+v) = %+v, fields did not carry through unchanged", findings, gotFindings)
 	}
 }
 

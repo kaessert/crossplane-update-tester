@@ -351,7 +351,7 @@ func TestCheckServerEchoedExpectationsSkipEntryNotFlagged(t *testing.T) {
 		Tests: []manifest.UpdateTest{
 			{
 				Field: "blockedClients",
-				Skip:  "not exercised in this example",
+				Skip:  manifest.LegacySkip("not exercised in this example"),
 				Value: []interface{}{blockedClientsHeader(false)},
 			},
 		},

@@ -60,7 +60,7 @@ type MergePatchSiblingFinding struct {
 func CheckMergePatchSiblings(m *manifest.Manifest) []MergePatchSiblingFinding {
 	var findings []MergePatchSiblingFinding
 	for _, t := range m.Tests {
-		if t.Skip != "" {
+		if t.Skip.Present() {
 			continue
 		}
 

@@ -298,7 +298,7 @@ func CheckServerEchoedExpectations(typesPath string, paramFields []FieldInfo, m 
 
 	var findings []ServerEchoedExpectationFinding
 	for _, t := range m.Tests {
-		if t.Skip != "" || strings.Contains(t.Field, ".") {
+		if t.Skip.Present() || strings.Contains(t.Field, ".") {
 			continue
 		}
 

@@ -34,7 +34,11 @@ type UpdateTest struct {
 	Field  string      `yaml:"field"`
 	Value  interface{} `yaml:"value"`
 	Expect interface{} `yaml:"expect"`
-	Skip   string      `yaml:"skip"`
+	// Skip declares that no test exists to write for Field. It accepts
+	// either the legacy free-prose string form or the structured mapping
+	// form — see SkipInfo for both shapes and the closed reason set the
+	// structured form is restricted to.
+	Skip SkipInfo `yaml:"skip"`
 	// Clear names OTHER top-level spec.forProvider fields that must be
 	// nulled in the SAME merge patch that sets Field's own Value.
 	//
@@ -76,6 +80,242 @@ type UpdateTest struct {
 	// the next run until someone removes it, rather than rotting silently
 	// the way a stale Skip reason does.
 	KnownDefect string `yaml:"knownDefect"`
+}
+
+// SkipReason is the closed set of reasons a structured "skip:" entry may
+// declare for why no update-test exists to write for a field. Unlike the
+// legacy free-prose string form (see SkipInfo.Legacy), a reason code names
+// one of a small number of shapes this package — and, for the two reasons
+// that need more than the entry's own text, the validator package — can
+// check offline.
+type SkipReason string
+
+// The closed set of structured skip reasons. An unrecognised value is a
+// parse-time error naming this set — see validateSkipInfo.
+const (
+	// SkipUnionArm marks a field as one alternative of a union modelled as
+	// separate top-level *Parameters fields, where Sibling names another
+	// arm of the same union. Resolved offline against the target type's
+	// own declared fields — see validator.CheckSkipReasons.
+	SkipUnionArm SkipReason = "union-arm"
+	// SkipCoveredElsewhere marks a field whose value is already exercised
+	// by another manifest's own update-test entry, named in By as
+	// "<path>#<field>". Resolved offline by loading that manifest and
+	// confirming the named entry is itself directly tested — see
+	// validator.CheckSkipReasons.
+	SkipCoveredElsewhere SkipReason = "covered-elsewhere"
+	// SkipVendorDefect marks a field whose update path cannot be tested
+	// because of an observed vendor/backend defect, recorded in Evidence
+	// and tracked in Ticket. Not resolvable offline — Evidence and Ticket
+	// are checked for presence only.
+	SkipVendorDefect SkipReason = "vendor-defect"
+	// SkipFixtureMissing marks a field that cannot be tested because the
+	// fixture data it needs does not exist yet, tracked in Ticket. Not
+	// resolvable offline — Ticket is checked for presence only.
+	SkipFixtureMissing SkipReason = "fixture-missing"
+	// SkipWriteOnly marks a field with no readable counterpart to assert
+	// against. Accepted here without further resolution: the tool's own
+	// full-mirror convention for atProvider means an atProvider
+	// counterpart exists in the generated type by construction, so
+	// telling a genuinely write-only field apart from one whose
+	// counterpart was simply never named requires comparing against a
+	// live roundtrip row, not the schema alone. UTV-TOOL-DENOM resolves
+	// this reason against that row; until it lands, a write-only entry
+	// here is accepted on the strength of its author's claim, same as
+	// vendor-defect and fixture-missing.
+	SkipWriteOnly SkipReason = "write-only"
+)
+
+// skipReasons is the closed set of valid SkipReason values, in the order
+// they are listed in a parse-time "not a valid reason" error.
+var skipReasons = []SkipReason{
+	SkipUnionArm, SkipCoveredElsewhere, SkipVendorDefect, SkipFixtureMissing, SkipWriteOnly,
+}
+
+// validSkipReasonList renders skipReasons as a comma-separated string for a
+// parse-time error message.
+func validSkipReasonList() string {
+	out := make([]string, len(skipReasons))
+	for i, r := range skipReasons {
+		out[i] = string(r)
+	}
+	return strings.Join(out, ", ")
+}
+
+// SkipInfo is a field's "skip:" declaration — the zero value means no
+// skip: key was present at all (see Present).
+//
+// Two shapes parse into it. The legacy shape is a bare string — a free-prose
+// reason with nothing to check — and is recorded as Legacy/LegacyText,
+// credited under a status distinct from the structured form's (see
+// validator's "covered (skipped, unstructured)" status) so the fleet's
+// existing free-prose entries keep working while carrying their own
+// burn-down count. The structured shape is a mapping with a Reason from the
+// closed SkipReason set above, plus whatever companion keys that reason
+// requires — see UnmarshalYAML and validateSkipInfo for the accepted shapes
+// and their required keys.
+type SkipInfo struct {
+	// Reason is the structured reason code. Empty when Legacy is true.
+	Reason SkipReason
+	// Sibling names another field in the same Parameters struct that this
+	// field is a union alternative to. Set only when Reason is
+	// SkipUnionArm.
+	Sibling string
+	// By names the manifest and field that already exercises this
+	// field's value, shaped "<path>#<field>". Set only when Reason is
+	// SkipCoveredElsewhere.
+	By string
+	// Evidence records what was observed that makes this field's update
+	// path untestable. Set only when Reason is SkipVendorDefect.
+	Evidence string
+	// Ticket names the ticket tracking why this field cannot be tested
+	// yet. Set when Reason is SkipVendorDefect or SkipFixtureMissing.
+	Ticket string
+	// Legacy is true when this value was parsed from a bare free-prose
+	// string rather than a structured mapping.
+	Legacy bool
+	// LegacyText is the original free-prose string, set only when Legacy
+	// is true.
+	LegacyText string
+}
+
+// LegacySkip builds the pre-migration free-prose form of a SkipInfo. YAML
+// unmarshalling reaches the same shape on its own (see
+// SkipInfo.UnmarshalYAML) for a manifest's own "skip:" string; this
+// constructor exists for Go code building an UpdateTest literal directly —
+// tests, mainly — without going through the YAML annotation parser.
+func LegacySkip(reason string) SkipInfo {
+	return SkipInfo{Legacy: true, LegacyText: reason}
+}
+
+// Present reports whether a "skip:" key was declared at all for this entry.
+// The zero value (no skip: key present in the source at all) reports false.
+func (s SkipInfo) Present() bool {
+	return s.Legacy || s.Reason != ""
+}
+
+// Describe renders a short, human-readable string for display in `run`
+// output (see runner.TestResult.SkipMsg): the legacy free-prose text
+// verbatim, or a rendering of the structured reason and whatever companion
+// fields it carries.
+func (s SkipInfo) Describe() string {
+	switch {
+	case s.Legacy:
+		return s.LegacyText
+	case s.Reason == SkipUnionArm:
+		return fmt.Sprintf("union-arm (sibling: %s)", s.Sibling)
+	case s.Reason == SkipCoveredElsewhere:
+		return fmt.Sprintf("covered-elsewhere (by: %s)", s.By)
+	case s.Reason == SkipVendorDefect:
+		return fmt.Sprintf("vendor-defect (%s; ticket: %s)", s.Evidence, s.Ticket)
+	case s.Reason == SkipFixtureMissing:
+		return fmt.Sprintf("fixture-missing (ticket: %s)", s.Ticket)
+	case s.Reason == SkipWriteOnly:
+		return "write-only"
+	default:
+		return string(s.Reason)
+	}
+}
+
+// UnmarshalYAML implements yaml.Unmarshaler so a "skip:" key accepts either
+// its legacy free-prose string form or the structured mapping form — see
+// SkipInfo. An explicit `skip: ""` (or an entry with no skip: key at all)
+// decodes to the zero value, matching the pre-this-ticket behaviour where an
+// empty string meant "no skip declared".
+func (s *SkipInfo) UnmarshalYAML(value *yaml.Node) error {
+	switch value.Kind {
+	case yaml.ScalarNode:
+		var raw string
+		if err := value.Decode(&raw); err != nil {
+			return fmt.Errorf("decoding skip: %w", err)
+		}
+		if raw == "" {
+			*s = SkipInfo{}
+			return nil
+		}
+		*s = LegacySkip(raw)
+		return nil
+	case yaml.MappingNode:
+		var m struct {
+			Reason   string `yaml:"reason"`
+			Sibling  string `yaml:"sibling"`
+			By       string `yaml:"by"`
+			Evidence string `yaml:"evidence"`
+			Ticket   string `yaml:"ticket"`
+		}
+		if err := value.Decode(&m); err != nil {
+			return fmt.Errorf("decoding skip: %w", err)
+		}
+		info := SkipInfo{
+			Reason:   SkipReason(m.Reason),
+			Sibling:  m.Sibling,
+			By:       m.By,
+			Evidence: m.Evidence,
+			Ticket:   m.Ticket,
+		}
+		if err := validateSkipInfo(info); err != nil {
+			return err
+		}
+		*s = info
+		return nil
+	default:
+		return fmt.Errorf("skip: must be a string or a mapping, got YAML node kind %d", value.Kind)
+	}
+}
+
+// validateSkipInfo enforces the closed reason set and each reason's own
+// required companion keys, at parse time, before any cluster or generated
+// type is touched.
+//
+// It deliberately stops short of the two checks that need context this
+// package does not have: SkipUnionArm's sibling being a field actually
+// declared on the target Parameters struct, and SkipCoveredElsewhere's by:
+// target being itself directly tested. Both run in
+// validator.CheckSkipReasons, which has the generated-type field list (for
+// the first) and can load another manifest file (for the second).
+func validateSkipInfo(s SkipInfo) error {
+	if s.Reason == "immutable" {
+		return fmt.Errorf(
+			"skip: reason \"immutable\" is not a valid reason — immutability is derived mechanically from the " +
+				"`self == oldSelf` CEL validation marker on the field's own declaration; add that marker instead " +
+				"of declaring skip: here")
+	}
+	valid := false
+	for _, r := range skipReasons {
+		if s.Reason == r {
+			valid = true
+			break
+		}
+	}
+	if !valid {
+		return fmt.Errorf("skip: reason %q is not one of the valid reasons (%s)", s.Reason, validSkipReasonList())
+	}
+
+	switch s.Reason {
+	case SkipUnionArm:
+		if s.Sibling == "" {
+			return fmt.Errorf("skip: reason %q requires a non-empty sibling: naming the other union-arm field", s.Reason)
+		}
+	case SkipCoveredElsewhere:
+		if s.By == "" {
+			return fmt.Errorf("skip: reason %q requires a non-empty by: shaped \"<path>#<field>\"", s.Reason)
+		}
+		if !strings.Contains(s.By, "#") {
+			return fmt.Errorf("skip: reason %q by: %q must be shaped \"<path>#<field>\"", s.Reason, s.By)
+		}
+	case SkipVendorDefect:
+		if s.Evidence == "" || s.Ticket == "" {
+			return fmt.Errorf("skip: reason %q requires both evidence: and ticket: to be non-empty", s.Reason)
+		}
+	case SkipFixtureMissing:
+		if s.Ticket == "" {
+			return fmt.Errorf("skip: reason %q requires a non-empty ticket: field", s.Reason)
+		}
+	case SkipWriteOnly:
+		// No required companion keys — see the SkipWriteOnly doc comment
+		// for why resolution is deferred rather than performed here.
+	}
+	return nil
 }
 
 // Manifest holds the parsed Kubernetes manifest metadata needed for testing.
@@ -311,12 +551,12 @@ func ParseAnnotation(annotation string) ([]UpdateTest, string, []string, []strin
 		if t.Field == "" {
 			return nil, "", nil, nil, fmt.Errorf("entry %d: field is required", i)
 		}
-		if t.KnownDefect != "" && t.Skip != "" {
+		if t.KnownDefect != "" && t.Skip.Present() {
 			return nil, "", nil, nil, fmt.Errorf(
 				"entry %d (%s): knownDefect and skip are mutually exclusive — skip asserts no test exists to write, "+
 					"knownDefect asserts an expressible test fails; an entry cannot be both", i, t.Field)
 		}
-		if t.Value == nil && t.Skip == "" {
+		if t.Value == nil && !t.Skip.Present() {
 			return nil, "", nil, nil, fmt.Errorf("entry %d (%s): value is required unless skip is set", i, t.Field)
 		}
 		if t.KnownDefect != "" {

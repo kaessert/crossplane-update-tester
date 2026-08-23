@@ -74,7 +74,7 @@ func CheckIncompleteExpectations(typesPath string, paramFields []FieldInfo, m *m
 
 	var findings []IncompleteExpectationFinding
 	for _, t := range m.Tests {
-		if t.Skip != "" || strings.Contains(t.Field, ".") {
+		if t.Skip.Present() || strings.Contains(t.Field, ".") {
 			continue
 		}
 

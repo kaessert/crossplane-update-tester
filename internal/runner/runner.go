@@ -831,11 +831,11 @@ func (r *Runner) RunTests(m *manifest.Manifest) ([]TestResult, []UnchangedAssert
 	}
 
 	for _, t := range m.Tests {
-		if t.Skip != "" {
+		if t.Skip.Present() {
 			results = append(results, TestResult{
 				Field:   t.Field,
 				Skipped: true,
-				SkipMsg: t.Skip,
+				SkipMsg: t.Skip.Describe(),
 			})
 			continue
 		}

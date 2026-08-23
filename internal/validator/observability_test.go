@@ -125,7 +125,7 @@ func TestCheckObservabilitySkipEntryNotFlagged(t *testing.T) {
 	tests := []manifest.UpdateTest{
 		{
 			Field: "owners",
-			Skip:  "server always overwrites this list",
+			Skip:  manifest.LegacySkip("server always overwrites this list"),
 			Value: []interface{}{
 				map[string]interface{}{
 					"ownerRef": map[string]interface{}{"name": "foo"},

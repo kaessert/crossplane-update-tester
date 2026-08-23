@@ -63,7 +63,7 @@ func CheckObservability(typesPath, kind string, paramFields []FieldInfo, tests [
 
 	var findings []ObservabilityFinding
 	for _, t := range tests {
-		if t.Skip != "" || strings.Contains(t.Field, ".") {
+		if t.Skip.Present() || strings.Contains(t.Field, ".") {
 			continue
 		}
 

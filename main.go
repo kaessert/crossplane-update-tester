@@ -262,7 +262,7 @@ func cmdRun(args []string) error {
 	// Count tested vs skipped vs known-defect.
 	var skipped, knownDefectDeclared int
 	for _, t := range m.Tests {
-		if t.Skip != "" {
+		if t.Skip.Present() {
 			skipped++
 		}
 		if t.KnownDefect != "" {
@@ -505,6 +505,9 @@ func cmdValidate(args []string) error {
 	noOpFindings := validator.CheckGuaranteedNoOp(m)
 	validator.PrintGuaranteedNoOp(noOpFindings)
 
+	skipReasonFindings := validator.CheckSkipReasons(m, fields)
+	validator.PrintSkipReasons(skipReasonFindings)
+
 	if !result.AllGood {
 		return errors.New("mutable-field coverage is incomplete")
 	}
@@ -522,6 +525,9 @@ func cmdValidate(args []string) error {
 	}
 	if len(noOpFindings) > 0 {
 		return errors.New("update-test entry repeats the field's own create-time value and can never exercise the update path")
+	}
+	if len(skipReasonFindings) > 0 {
+		return errors.New("skip: reason does not resolve against this manifest's own declared coverage")
 	}
 	return nil
 }

@@ -297,7 +297,13 @@ ones.
 file, not only other `*Parameters` structs) and reports, per field, whether
 the manifest's annotation covers it:
 
-- `tested` / `skipped` — the field appears in the annotation.
+- `tested` / `skipped` — the field appears in the annotation with a value, or
+  with a structured `skip:` reason (see "`skip:` reasons" below).
+- `skipped-unstructured` — the field's `skip:` is the pre-migration free-prose
+  string form rather than a structured reason. Still counts as coverage,
+  exactly like `skipped`, but is reported under its own status so a fleet
+  migrating its old free-prose entries to the structured form has a
+  burn-down count distinct from genuinely resolved coverage.
 - `immutable` — the field carries a `self == oldSelf` validation marker, so it
   has no update semantics.
 - `reference-plumbing` — the field is a generated `*Ref` / `*Refs` /
@@ -667,7 +673,7 @@ three top-level directive lines: `converge-skip:`, `assert-unchanged:` and
 | `field` | Required. Field name under `spec.forProvider`; dot-separated for nested fields. |
 | `value` | The value to patch in. Required unless `skip` is set. |
 | `expect` | Optional. The value expected in `status.atProvider` when the backend normalises what it stores. Defaults to `value`. |
-| `skip` | Optional. A reason for not testing this field. The entry is reported as `SKIPPED` and still counts as coverage for `validate`. Mutually exclusive with `knownDefect`. |
+| `skip` | Optional. Either a free-prose string (the legacy form, reported as `SKIPPED` and credited under `validate`'s `skipped-unstructured` status) or a structured mapping with a `reason:` from a closed set (reported as `SKIPPED` and credited under `validate`'s `skipped` status — see "`skip:` reasons" below). Either way the entry still counts as coverage for `validate` and is mutually exclusive with `knownDefect`. |
 | `clear` | Optional. A list of OTHER top-level `spec.forProvider` field names nulled in the SAME merge patch that sets `field`'s value, so a union modeled as separate top-level fields switches arms atomically. Only valid when `field` itself is top-level (not dotted); a dotted entry, or one naming `field` itself, is rejected at parse time. |
 | `knownDefect` | Optional. The ID of the ticket tracking a real defect that keeps this field's update path from converging. Unlike `skip`, the entry RUNS: `value` is required, the patch is applied exactly as normal, and non-convergence is reported as `KNOWN-DEFECT` — expected, not a failure. If the field DOES converge, that FAILS the run hard as `KNOWN-DEFECT CONVERGED`, naming the ticket and telling the reader to delete the token. A field that converges in value but has no `Update()` Event to prove it (`NOT-EVIDENCED`) is likewise never credited as `KNOWN-DEFECT` — it fails the run through its own `NOT-EVIDENCED` verdict instead, since a value match is evidence the defect may already be fixed. Mutually exclusive with `skip`. The value must be non-empty, contain no whitespace, not be a placeholder (`TODO`, `TBD`, `n/a`, etc.), and be at least 6 characters — reject anything that cannot be followed back to an actual ticket. Also rejected if the same top-level field name appears in this manifest's own `ignore-fields:` set (dead config — see `ignore-fields:` below). |
 
@@ -675,6 +681,44 @@ None of `converge-skip: <reason>`, `assert-unchanged: <fields>` or
 `ignore-fields: <fields>` is valid YAML as a sibling of top-level sequence
 items, so all three lines are extracted before the rest of the block is
 parsed as a sequence. Each must be unindented.
+
+#### `skip:` reasons
+
+A structured `skip:` is a mapping with a `reason:` from a closed set. An
+unrecognised reason is a parse-time error naming the valid set; `reason:
+immutable` is rejected by name, since immutability is already derived
+mechanically from the field's own `self == oldSelf` validation marker rather
+than declared here.
+
+| reason | required keys | resolved offline by `validate`? |
+|---|---|---|
+| `union-arm` | `sibling:` naming another field | yes — `sibling:` must be a field declared on the same `<Kind>Parameters` struct |
+| `covered-elsewhere` | `by:` as `<path>#<field>` | yes — that manifest and field must exist, and the named entry must itself be directly tested (not skipped, not missing, and not a `covered-elsewhere` cycle) |
+| `vendor-defect` | `evidence:` and `ticket:` | no — both keys are checked for presence only |
+| `fixture-missing` | `ticket:` | no — checked for presence only |
+| `write-only` | none | no |
+
+```yaml
+crossplane.io/update-test: |
+  - field: allowList
+    skip:
+      reason: union-arm
+      sibling: ruleList
+  - field: firewallGroupId
+    skip:
+      reason: fixture-missing
+      ticket: VU-FW-FIXTURE
+  - field: dnsVolterraManaged
+    skip:
+      reason: vendor-defect
+      evidence: "HTTP 400 'Change of domain type ... is not supported'"
+      ticket: FX-DNS-DELEGATION
+```
+
+The pre-existing free-prose string form (`skip: "some reason"`) still parses
+and still counts as coverage, but is reported under `validate`'s distinct
+`skipped-unstructured` status rather than `skipped` — see the status list
+above.
 
 #### `assert-unchanged:` — silent-wipe guard
 

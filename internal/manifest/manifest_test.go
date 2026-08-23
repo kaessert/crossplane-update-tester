@@ -1103,3 +1103,273 @@ spec:
 		t.Errorf("ForProvider[comment] = %v, want %v", got, want)
 	}
 }
+
+// TestParseAnnotationStructuredSkipAccepted pins every structured skip:
+// reason ParseAnnotation accepts, and what each one records on the parsed
+// SkipInfo.
+func TestParseAnnotationStructuredSkipAccepted(t *testing.T) {
+	cases := map[string]struct {
+		reason     string
+		annotation string
+		want       SkipInfo
+	}{
+		"UnionArm": {
+			reason: "union-arm carries the sibling field name",
+			annotation: `
+- field: allowList
+  skip:
+    reason: union-arm
+    sibling: ruleList
+`,
+			want: SkipInfo{Reason: SkipUnionArm, Sibling: "ruleList"},
+		},
+		"CoveredElsewhere": {
+			reason: "covered-elsewhere carries the by: pointer",
+			annotation: `
+- field: comment
+  skip:
+    reason: covered-elsewhere
+    by: examples/x/y.yaml#comment
+`,
+			want: SkipInfo{Reason: SkipCoveredElsewhere, By: "examples/x/y.yaml#comment"},
+		},
+		"VendorDefect": {
+			reason: "vendor-defect carries both evidence: and ticket:",
+			annotation: `
+- field: dnsVolterraManaged
+  skip:
+    reason: vendor-defect
+    evidence: "HTTP 400 'Change of domain type ... is not supported'"
+    ticket: FX-DNS-DELEGATION
+`,
+			want: SkipInfo{
+				Reason:   SkipVendorDefect,
+				Evidence: "HTTP 400 'Change of domain type ... is not supported'",
+				Ticket:   "FX-DNS-DELEGATION",
+			},
+		},
+		"FixtureMissing": {
+			reason: "fixture-missing carries the ticket:",
+			annotation: `
+- field: firewallGroupId
+  skip:
+    reason: fixture-missing
+    ticket: VU-FW-FIXTURE
+`,
+			want: SkipInfo{Reason: SkipFixtureMissing, Ticket: "VU-FW-FIXTURE"},
+		},
+		"WriteOnly": {
+			reason: "write-only carries no companion keys",
+			annotation: `
+- field: privateKey
+  skip:
+    reason: write-only
+`,
+			want: SkipInfo{Reason: SkipWriteOnly},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			tests, _, _, _, err := ParseAnnotation(tc.annotation)
+			if err != nil {
+				t.Fatalf("%s: ParseAnnotation() error = %v", tc.reason, err)
+			}
+			if len(tests) != 1 {
+				t.Fatalf("%s: got %d entries, want 1", tc.reason, len(tests))
+			}
+			if got := tests[0].Skip; got != tc.want {
+				t.Errorf("%s: Skip = %+v, want %+v", tc.reason, got, tc.want)
+			}
+			if !tests[0].Skip.Present() {
+				t.Errorf("%s: Skip.Present() = false, want true", tc.reason)
+			}
+			if tests[0].Skip.Legacy {
+				t.Errorf("%s: Skip.Legacy = true, want false for a structured entry", tc.reason)
+			}
+		})
+	}
+}
+
+// TestParseAnnotationStructuredSkipRejectsInvalidShapes pins every
+// parse-time rejection a structured skip: entry can trigger: an unknown
+// reason, the "immutable" reason specifically, and each reason's own
+// required companion keys being absent or malformed.
+func TestParseAnnotationStructuredSkipRejectsInvalidShapes(t *testing.T) {
+	cases := map[string]struct {
+		reason        string
+		annotation    string
+		wantErrSubstr string
+	}{
+		"UnknownReason": {
+			reason: "a reason outside the closed set is rejected naming the valid set",
+			annotation: `
+- field: comment
+  skip:
+    reason: not-a-real-reason
+`,
+			wantErrSubstr: "not one of the valid reasons",
+		},
+		"ImmutableRejectedByName": {
+			reason: "immutable is not a skip: reason — it is derived mechanically from the CEL marker",
+			annotation: `
+- field: region
+  skip:
+    reason: immutable
+`,
+			wantErrSubstr: "self == oldSelf",
+		},
+		"UnionArmMissingSibling": {
+			reason: "union-arm requires a non-empty sibling:",
+			annotation: `
+- field: allowList
+  skip:
+    reason: union-arm
+`,
+			wantErrSubstr: "requires a non-empty sibling:",
+		},
+		"CoveredElsewhereMissingBy": {
+			reason: "covered-elsewhere requires a non-empty by:",
+			annotation: `
+- field: comment
+  skip:
+    reason: covered-elsewhere
+`,
+			wantErrSubstr: "requires a non-empty by:",
+		},
+		"CoveredElsewhereMalformedBy": {
+			reason: "covered-elsewhere's by: must be shaped <path>#<field>",
+			annotation: `
+- field: comment
+  skip:
+    reason: covered-elsewhere
+    by: examples/x/y.yaml
+`,
+			wantErrSubstr: "must be shaped",
+		},
+		"VendorDefectMissingEvidence": {
+			reason: "vendor-defect requires both evidence: and ticket:",
+			annotation: `
+- field: comment
+  skip:
+    reason: vendor-defect
+    ticket: FX-DNS-DELEGATION
+`,
+			wantErrSubstr: "requires both evidence: and ticket:",
+		},
+		"VendorDefectMissingTicket": {
+			reason: "vendor-defect requires both evidence: and ticket:",
+			annotation: `
+- field: comment
+  skip:
+    reason: vendor-defect
+    evidence: "observed a 400"
+`,
+			wantErrSubstr: "requires both evidence: and ticket:",
+		},
+		"FixtureMissingNoTicket": {
+			reason: "fixture-missing requires a non-empty ticket:",
+			annotation: `
+- field: comment
+  skip:
+    reason: fixture-missing
+`,
+			wantErrSubstr: "requires a non-empty ticket:",
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, _, _, _, err := ParseAnnotation(tc.annotation)
+			if err == nil {
+				t.Fatalf("%s: expected an error, got nil", tc.reason)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrSubstr) {
+				t.Errorf("%s: error = %q, want substring %q", tc.reason, err.Error(), tc.wantErrSubstr)
+			}
+		})
+	}
+}
+
+// TestSkipInfoUnmarshalYAMLLegacyString confirms the pre-migration bare
+// string shape still parses, is credited as Legacy, and an empty string (or
+// an absent skip: key) still decodes to the zero value — matching the
+// pre-this-ticket behaviour where an empty string meant "no skip declared".
+func TestSkipInfoUnmarshalYAMLLegacyString(t *testing.T) {
+	tests, _, _, _, err := ParseAnnotation(`
+- field: comment
+  skip: "not exercised in this example"
+- field: owner
+  value: "updated-owner"
+`)
+	if err != nil {
+		t.Fatalf("ParseAnnotation() error = %v", err)
+	}
+	if len(tests) != 2 {
+		t.Fatalf("got %d entries, want 2", len(tests))
+	}
+
+	commentSkip := tests[0].Skip
+	if !commentSkip.Legacy {
+		t.Errorf("comment: Skip.Legacy = false, want true for a bare string skip:")
+	}
+	if commentSkip.LegacyText != "not exercised in this example" {
+		t.Errorf("comment: Skip.LegacyText = %q, want %q", commentSkip.LegacyText, "not exercised in this example")
+	}
+	if !commentSkip.Present() {
+		t.Errorf("comment: Skip.Present() = false, want true")
+	}
+
+	if got := tests[1].Skip; got.Present() {
+		t.Errorf("owner: Skip = %+v, want the zero value (no skip: key present)", got)
+	}
+}
+
+// TestSkipInfoDescribe pins the human-readable rendering SkipMsg (see
+// runner.TestResult) uses for each shape a SkipInfo can hold.
+func TestSkipInfoDescribe(t *testing.T) {
+	cases := map[string]struct {
+		reason string
+		skip   SkipInfo
+		want   string
+	}{
+		"Legacy": {
+			reason: "the legacy form renders its own free-prose text verbatim",
+			skip:   LegacySkip("not exercised in this example"),
+			want:   "not exercised in this example",
+		},
+		"UnionArm": {
+			reason: "union-arm names its sibling",
+			skip:   SkipInfo{Reason: SkipUnionArm, Sibling: "ruleList"},
+			want:   "union-arm (sibling: ruleList)",
+		},
+		"CoveredElsewhere": {
+			reason: "covered-elsewhere names its by: pointer",
+			skip:   SkipInfo{Reason: SkipCoveredElsewhere, By: "examples/x/y.yaml#comment"},
+			want:   "covered-elsewhere (by: examples/x/y.yaml#comment)",
+		},
+		"VendorDefect": {
+			reason: "vendor-defect names both evidence and ticket",
+			skip:   SkipInfo{Reason: SkipVendorDefect, Evidence: "observed a 400", Ticket: "FX-DNS-DELEGATION"},
+			want:   "vendor-defect (observed a 400; ticket: FX-DNS-DELEGATION)",
+		},
+		"FixtureMissing": {
+			reason: "fixture-missing names its ticket",
+			skip:   SkipInfo{Reason: SkipFixtureMissing, Ticket: "VU-FW-FIXTURE"},
+			want:   "fixture-missing (ticket: VU-FW-FIXTURE)",
+		},
+		"WriteOnly": {
+			reason: "write-only carries no companion data to render",
+			skip:   SkipInfo{Reason: SkipWriteOnly},
+			want:   "write-only",
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := tc.skip.Describe(); got != tc.want {
+				t.Errorf("%s: Describe() = %q, want %q", tc.reason, got, tc.want)
+			}
+		})
+	}
+}

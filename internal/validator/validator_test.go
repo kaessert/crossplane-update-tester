@@ -22,11 +22,12 @@ const (
 	fieldComment       = "comment"
 	fieldRegion        = "region"
 
-	statusTested      = "tested"
-	statusSkipped     = "skipped"
-	statusImmutable   = "immutable"
-	statusRefPlumbing = "reference-plumbing"
-	statusMissing     = "MISSING"
+	statusTested              = "tested"
+	statusSkipped             = "skipped"
+	statusSkippedUnstructured = "skipped-unstructured"
+	statusImmutable           = "immutable"
+	statusRefPlumbing         = "reference-plumbing"
+	statusMissing             = "MISSING"
 
 	fieldArmA = "botProtectionSetting"
 	fieldArmB = "defaultBotSetting"
@@ -144,7 +145,7 @@ func TestValidateManifestReferencePlumbingExclusion(t *testing.T) {
 	m := &manifest.Manifest{
 		Kind: kindWidget,
 		Tests: []manifest.UpdateTest{
-			{Field: fieldName, Skip: "renaming changes external identity"},
+			{Field: fieldName, Skip: manifest.LegacySkip("renaming changes external identity")},
 			{Field: fieldOwner, Value: "updated-owner"},
 			{Field: fieldComment, Value: "Updated by uptest"},
 		},
@@ -159,7 +160,7 @@ func TestValidateManifestReferencePlumbingExclusion(t *testing.T) {
 	statusByName := statusMap(result)
 
 	want := map[string]string{
-		fieldName:          statusSkipped,
+		fieldName:          statusSkippedUnstructured,
 		fieldOwner:         statusTested,
 		fieldOwnerRef:      statusRefPlumbing,
 		fieldOwnerRefs:     statusRefPlumbing,
@@ -343,15 +344,15 @@ func TestValidateManifestClearSkippedEntryGrantsNoCredit(t *testing.T) {
 	m := &manifest.Manifest{
 		Kind: kindWidget,
 		Tests: []manifest.UpdateTest{
-			{Field: fieldArmA, Skip: "not switchable in this backend", Clear: []string{fieldArmB}},
+			{Field: fieldArmA, Skip: manifest.LegacySkip("not switchable in this backend"), Clear: []string{fieldArmB}},
 		},
 	}
 
 	result := ValidateManifest(m, fields)
 
 	statusByName := statusMap(result)
-	if got := statusByName[fieldArmA]; got != statusSkipped {
-		t.Errorf("field %q: status = %q, want %q", fieldArmA, got, statusSkipped)
+	if got := statusByName[fieldArmA]; got != statusSkippedUnstructured {
+		t.Errorf("field %q: status = %q, want %q", fieldArmA, got, statusSkippedUnstructured)
 	}
 	if got := statusByName[fieldArmB]; got != statusMissing {
 		t.Errorf("field %q: status = %q, want %q — a skip: entry's clear: list must grant no credit", fieldArmB, got, statusMissing)

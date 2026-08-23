@@ -154,7 +154,7 @@ func TestCheckMergePatchSiblings(t *testing.T) {
 			tests: []manifest.UpdateTest{
 				{
 					Field: "httpHealthCheck",
-					Skip:  "not exercised in this example",
+					Skip:  manifest.LegacySkip("not exercised in this example"),
 					Value: map[string]interface{}{"path": "/healthz-updated"},
 				},
 			},

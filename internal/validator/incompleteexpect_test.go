@@ -300,7 +300,7 @@ func TestCheckIncompleteExpectationsSkipEntryNotFlagged(t *testing.T) {
 		Tests: []manifest.UpdateTest{
 			{
 				Field: "domainMatcher",
-				Skip:  "not exercised in this example",
+				Skip:  manifest.LegacySkip("not exercised in this example"),
 				Value: map[string]interface{}{"exactValues": []interface{}{"example.com"}},
 			},
 		},

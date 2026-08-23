@@ -43,7 +43,7 @@ type ValidationResult struct {
 // FieldValidation holds the status of a single field in validation.
 type FieldValidation struct {
 	JSONName string
-	Status   string // "tested", "skipped", "immutable", "reference-plumbing", "MISSING", "tested-via-switch", "clear-target-unknown"
+	Status   string // "tested", "skipped", "skipped-unstructured", "immutable", "reference-plumbing", "MISSING", "tested-via-switch", "clear-target-unknown"
 }
 
 // clearCreditStatus is the status a field is credited under when the ONLY
@@ -55,6 +55,15 @@ type FieldValidation struct {
 // sibling arms report all six as having had their own value tested. See
 // ValidateManifest.
 const clearCreditStatus = "tested-via-switch"
+
+// legacySkipStatus is the status a field is credited under when its
+// "skip:" entry is the pre-migration free-prose string form rather than the
+// structured mapping form (see manifest.SkipInfo.Legacy). It is deliberately
+// distinct from "skipped" — the field still counts as covered, but a legacy
+// entry carries no reason a machine can check, so keeping it a separate
+// status gives each provider its own burn-down count as entries migrate to
+// the structured form. See ValidateManifest.
+const legacySkipStatus = "skipped-unstructured"
 
 // clearTargetUnknownStatus flags a "clear:" entry naming a field that does
 // not exist in the target type's declared struct fields — a typo, or a
@@ -296,11 +305,14 @@ func ValidateManifest(m *manifest.Manifest, fields []FieldInfo) *ValidationResul
 	// clear: credit on top, so that a field's OWN direct entry (whichever
 	// order the two appear in m.Tests) always wins over a weaker credit
 	// picked up only because some other entry's clear: happened to name it.
-	tested := make(map[string]string) // jsonName → "tested" or "skipped"
+	tested := make(map[string]string) // jsonName → "tested", "skipped" or "skipped-unstructured"
 	for _, t := range m.Tests {
-		if t.Skip != "" {
+		switch {
+		case t.Skip.Legacy:
+			tested[t.Field] = legacySkipStatus
+		case t.Skip.Present():
 			tested[t.Field] = "skipped"
-		} else {
+		default:
 			tested[t.Field] = "tested"
 		}
 	}
@@ -329,7 +341,7 @@ func ValidateManifest(m *manifest.Manifest, fields []FieldInfo) *ValidationResul
 	// note above), and a sibling name that resolves to no declared struct
 	// field at all is flagged rather than silently ignored.
 	for _, t := range m.Tests {
-		if t.Skip != "" {
+		if t.Skip.Present() {
 			continue
 		}
 		for _, c := range t.Clear {
@@ -388,6 +400,7 @@ type statusIconDetail struct {
 var statusOrder = []statusIconDetail{
 	{Status: "tested", Icon: "✓", Detail: "covered (tested)"},
 	{Status: "skipped", Icon: "✓", Detail: "covered (skipped)"},
+	{Status: legacySkipStatus, Icon: "✓", Detail: "covered (skipped, unstructured)"},
 	{Status: "immutable", Icon: "✓", Detail: "immutable (excluded)"},
 	{Status: "reference-plumbing", Icon: "✓", Detail: "reference plumbing (excluded)"},
 	{Status: clearCreditStatus, Icon: "✓", Detail: "covered (nulled by a sibling entry's clear: — proven clearable, not independently value-tested)"},

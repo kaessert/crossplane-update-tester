@@ -63,7 +63,7 @@ func CheckGuaranteedNoOp(m *manifest.Manifest) []GuaranteedNoOpFinding {
 	touched := make(map[string]bool)
 
 	for _, t := range m.Tests {
-		if t.Skip != "" {
+		if t.Skip.Present() {
 			continue
 		}
 

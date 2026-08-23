@@ -77,7 +77,7 @@ func TestCheckGuaranteedNoOp(t *testing.T) {
 				"description": "original",
 			},
 			tests: []manifest.UpdateTest{
-				{Field: "description", Skip: "not exercised", Value: "original"},
+				{Field: "description", Skip: manifest.LegacySkip("not exercised"), Value: "original"},
 			},
 			wantFields: nil,
 		},
@@ -156,7 +156,7 @@ func TestCheckGuaranteedNoOp(t *testing.T) {
 				"description": "original",
 			},
 			tests: []manifest.UpdateTest{
-				{Field: "description", Skip: "not exercised here", Value: "updated"},
+				{Field: "description", Skip: manifest.LegacySkip("not exercised here"), Value: "updated"},
 				{Field: "description", Value: "original"},
 			},
 			wantFields: []string{"description"},
@@ -261,7 +261,7 @@ func TestCheckGuaranteedNoOpPostFixHTTPLoadbalancerNotFlagged(t *testing.T) {
 		Tests: []manifest.UpdateTest{
 			{
 				Field: "enableApiDiscovery",
-				Skip:  "live-confirmed side effect of the domains field, which runs first in field order",
+				Skip:  manifest.LegacySkip("live-confirmed side effect of the domains field, which runs first in field order"),
 				Value: enableAPIDiscovery,
 			},
 		},

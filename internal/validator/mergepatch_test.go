@@ -170,6 +170,23 @@ func TestCheckMergePatchSiblings(t *testing.T) {
 			},
 			wantKeys: nil,
 		},
+		"IgnoreMapKeysExemptsSurvivorNotFlagged": {
+			reason: "a create-time sibling named in the entry's own ignoreMapKeys is exempted from the survivor check the same way an expect:-named key already is — see manifest.UpdateTest.IgnoreMapKeys",
+			forProvider: map[string]interface{}{
+				"httpHealthCheck": map[string]interface{}{
+					"path":       "/healthz",
+					"ownerStamp": "server-assigned-at-create",
+				},
+			},
+			tests: []manifest.UpdateTest{
+				{
+					Field:         "httpHealthCheck",
+					Value:         map[string]interface{}{"path": "/healthz-updated"},
+					IgnoreMapKeys: []string{"ownerStamp"},
+				},
+			},
+			wantKeys: nil,
+		},
 	}
 
 	for name, tc := range cases {

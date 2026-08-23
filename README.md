@@ -676,6 +676,7 @@ three top-level directive lines: `converge-skip:`, `assert-unchanged:` and
 | `skip` | Optional. Either a free-prose string (the legacy form, reported as `SKIPPED` and credited under `validate`'s `skipped-unstructured` status) or a structured mapping with a `reason:` from a closed set (reported as `SKIPPED` and credited under `validate`'s `skipped` status — see "`skip:` reasons" below). Either way the entry still counts as coverage for `validate` and is mutually exclusive with `knownDefect`. |
 | `clear` | Optional. A list of OTHER top-level `spec.forProvider` field names nulled in the SAME merge patch that sets `field`'s value, so a union modeled as separate top-level fields switches arms atomically. Only valid when `field` itself is top-level (not dotted); a dotted entry, or one naming `field` itself, is rejected at parse time. |
 | `knownDefect` | Optional. The ID of the ticket tracking a real defect that keeps this field's update path from converging. Unlike `skip`, the entry RUNS: `value` is required, the patch is applied exactly as normal, and non-convergence is reported as `KNOWN-DEFECT` — expected, not a failure. If the field DOES converge, that FAILS the run hard as `KNOWN-DEFECT CONVERGED`, naming the ticket and telling the reader to delete the token. A field that converges in value but has no `Update()` Event to prove it (`NOT-EVIDENCED`) is likewise never credited as `KNOWN-DEFECT` — it fails the run through its own `NOT-EVIDENCED` verdict instead, since a value match is evidence the defect may already be fixed. Mutually exclusive with `skip`. The value must be non-empty, contain no whitespace, not be a placeholder (`TODO`, `TBD`, `n/a`, etc.), and be at least 6 characters — reject anything that cannot be followed back to an actual ticket. Also rejected if the same top-level field name appears in this manifest's own `ignore-fields:` set (dead config — see `ignore-fields:` below). |
+| `ignoreMapKeys` | Optional. A list of top-level member keys excluded, on BOTH sides, from `run`'s equality check between `expect` (or `value`, when `expect` is unset) and the live `status.atProvider` value — see "`ignoreMapKeys:` — excluding a provider-injected map member" below. Mutually exclusive with `skip` (there is no comparison left for it to affect). |
 
 None of `converge-skip: <reason>`, `assert-unchanged: <fields>` or
 `ignore-fields: <fields>` is valid YAML as a sibling of top-level sequence
@@ -796,7 +797,47 @@ E2E hook actually runs (`hook` -> `converge`, never `converge-all`), so a
 directive that reached only `converge-all` would never take effect for a
 provider's real test run.
 
-Worked example:
+#### `ignoreMapKeys:` — excluding a provider-injected map member
+
+A per-entry list of top-level member keys excluded, on BOTH sides, from
+`run`'s equality check between the entry's effective expectation (`expect`,
+or `value` when `expect` is unset) and the live `status.atProvider` value.
+
+It exists for a map-typed field whose live value carries a member the
+PROVIDER itself writes — an identity stamp, a server-managed marker —
+alongside the keys the manifest actually manages. Without it, `expect` for
+such a field has to predict that provider-written value verbatim, and a
+value derived from something that does not exist until the resource is
+created (a `metadata.uid`-derived stamp, for example) can never appear in a
+static example manifest — the whole-map comparison is unsatisfiable by
+construction, and there is no dotted-field workaround: a null-tombstone
+removal of one map key can only ever be expressed through a top-level,
+non-dotted entry (nesting the null inside a non-nil map value), and a
+top-level entry's `run` comparison is always against the ENTIRE map.
+
+`ignoreMapKeys` closes that gap without touching how the patch itself is
+built: `value` and `expect` still describe add, update and null-tombstone
+removal exactly as they always have; only the comparison ignores the named
+keys, on both sides, so `expect` never has to mention — let alone guess —
+the provider-injected member's value.
+
+```yaml
+crossplane.io/update-test: |
+  - field: extAttrs
+    value:
+      Team: "platform"        # add
+      Environment: "staging"  # update an existing key
+      Deprecated: null        # null-tombstone removal
+    expect:
+      Team: "platform"
+      Environment: "staging"
+      # Deprecated is correctly absent (removed), and the provider's own
+      # identity-stamp member is correctly absent too, without ever having
+      # to name its live value.
+    ignoreMapKeys: [OwnerStamp]
+```
+
+#### Worked example
 
 ```yaml
 apiVersion: network.example.crossplane.io/v1alpha1

@@ -199,6 +199,32 @@ func TestCheckIncompleteExpectationsFieldAbsentFromCreateTimeFlagged(t *testing.
 	}
 }
 
+// TestCheckIncompleteExpectationsIgnoreMapKeysExemptsMemberNotFlagged is the
+// same shape as TestCheckIncompleteExpectationsFieldAbsentFromCreateTimeFlagged
+// — the same missing non-omitempty regexValues sibling — except the entry
+// also names regexValues in its own ignoreMapKeys, which must exempt it from
+// this check exactly as an expect:-named key already does — see
+// manifest.UpdateTest.IgnoreMapKeys.
+func TestCheckIncompleteExpectationsIgnoreMapKeysExemptsMemberNotFlagged(t *testing.T) {
+	path, fields := matcherFixture(t)
+
+	m := &manifest.Manifest{
+		Kind: kindServicePolicyRule,
+		Tests: []manifest.UpdateTest{
+			{
+				Field:         "domainMatcher",
+				Value:         map[string]interface{}{"exactValues": []interface{}{"example.com"}},
+				IgnoreMapKeys: []string{"regexValues"},
+			},
+		},
+	}
+
+	findings := CheckIncompleteExpectations(path, fields, m)
+	if len(findings) != 0 {
+		t.Errorf("got %d findings, want 0 (ignoreMapKeys names regexValues): %+v", len(findings), findings)
+	}
+}
+
 // TestCheckIncompleteExpectationsSiblingSurvivesNotDoubleFlagged pins the
 // bodyMatcher shape: the field IS present at create time with both siblings,
 // so CheckMergePatchSiblings' own SIBLING-SURVIVES finding already covers

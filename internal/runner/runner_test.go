@@ -3172,6 +3172,192 @@ func containsArg(args []string, want string) bool {
 	return false
 }
 
+// TestCompareFieldValue covers compareFieldValue directly: with an empty
+// ignoreKeys it must behave exactly like jsonEqual (every existing caller's
+// contract), and with a non-empty ignoreKeys it must strip the named
+// top-level keys from BOTH sides before comparing, tolerating a side that
+// is not a JSON object (a still-converging read, or a genuinely
+// non-map-typed field) by simply not matching rather than erroring.
+func TestCompareFieldValue(t *testing.T) {
+	cases := map[string]struct {
+		reason     string
+		expected   interface{}
+		actual     string
+		ignoreKeys []string
+		want       bool
+	}{
+		"EmptyIgnoreKeysScalarMatch": {
+			reason:   "no ignoreKeys means this is exactly jsonEqual for a scalar",
+			expected: "hello",
+			actual:   "hello",
+			want:     true,
+		},
+		"EmptyIgnoreKeysMapMismatch": {
+			reason:     "with no ignoreKeys, an extra actual key is an ordinary mismatch",
+			expected:   map[string]interface{}{"a": "1"},
+			actual:     `{"a":"1","ownerStamp":"xyz"}`,
+			ignoreKeys: nil,
+			want:       false,
+		},
+		"IgnoredKeyStrippedFromActual": {
+			reason:     "a key named in ignoreKeys is removed from actual before comparing, so an unpredictable provider-injected value never has to be named",
+			expected:   map[string]interface{}{"a": "1"},
+			actual:     `{"a":"1","ownerStamp":"xyz-unpredictable"}`,
+			ignoreKeys: []string{"ownerStamp"},
+			want:       true,
+		},
+		"IgnoredKeyStrippedFromBothSides": {
+			reason:     "stripping is symmetric — an ignored key present on the expected side too is also removed",
+			expected:   map[string]interface{}{"a": "1", "ownerStamp": "whatever-the-author-guessed"},
+			actual:     `{"a":"1","ownerStamp":"xyz-unpredictable"}`,
+			ignoreKeys: []string{"ownerStamp"},
+			want:       true,
+		},
+		"NonIgnoredMismatchStillFails": {
+			reason:     "ignoreKeys only exempts the named keys — every other key still has to match",
+			expected:   map[string]interface{}{"a": "1"},
+			actual:     `{"a":"2","ownerStamp":"xyz"}`,
+			ignoreKeys: []string{"ownerStamp"},
+			want:       false,
+		},
+		"ActualNotYetAnObjectDuringConvergence": {
+			reason:     "a still-converging field (e.g. empty string before the first Observe) never satisfies the comparison, but must not panic or error",
+			expected:   map[string]interface{}{"a": "1"},
+			actual:     "",
+			ignoreKeys: []string{"ownerStamp"},
+			want:       false,
+		},
+		"ExpectedNotAnObject": {
+			reason:     "ignoreKeys set on a scalar-typed comparison has nothing to strip on the expected side; it simply never matches an object actual",
+			expected:   "hello",
+			actual:     `{"a":"1"}`,
+			ignoreKeys: []string{"ownerStamp"},
+			want:       false,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := compareFieldValue(tc.expected, tc.actual, tc.ignoreKeys)
+			if got != tc.want {
+				t.Errorf("%s: compareFieldValue(%v, %q, %v) = %v, want %v",
+					tc.reason, tc.expected, tc.actual, tc.ignoreKeys, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRunFieldTestIgnoreMapKeysProviderInjectedMember is the end-to-end
+// proof this mechanism exists for: a map-typed field (extAttrs) whose live
+// status.atProvider value carries BOTH the keys the manifest manages and a
+// stable member the PROVIDER itself writes (an identity stamp) — modelled
+// here the same way infobloxnios's identity.OwnExtAttrs mirrors one into
+// atProvider without ever appearing in spec.forProvider.
+//
+// One patch exercises all three of add, update and null-tombstone removal
+// in a single merge — add: newKey, update: existingKey, remove: removeMe —
+// and "expect:" (via IgnoreMapKeys) never has to name, let alone predict,
+// the provider-injected ownerStamp member. Without IgnoreMapKeys this same
+// entry could never pass: the whole-map comparison would have to match
+// ownerStamp's live value exactly, and that value is set up here to look
+// exactly as unpredictable as a real metadata.uid-derived stamp would be —
+// this test never hardcodes it into the expectation.
+func TestRunFieldTestIgnoreMapKeysProviderInjectedMember(t *testing.T) {
+	const ownerStampValue = "stamp-derived-from-a-uid-the-manifest-cannot-know-in-advance"
+
+	f := &fakeCluster{
+		forProvider: map[string]interface{}{
+			"extAttrs": map[string]interface{}{
+				"existingKey": "orig",
+				"removeMe":    "toBeGone",
+			},
+		},
+		atProvider: map[string]interface{}{
+			"extAttrs": map[string]interface{}{
+				"existingKey": "orig",
+				"removeMe":    "toBeGone",
+				"ownerStamp":  ownerStampValue,
+			},
+		},
+		generation:        1,
+		kind:              testKindExample,
+		name:              testNameExample,
+		recordUpdateEvent: true,
+	}
+	r := newFakeRunner(f)
+	snapshot, err := json.Marshal(f.atProvider)
+	if err != nil {
+		t.Fatalf("marshalling snapshot: %v", err)
+	}
+
+	test := manifest.UpdateTest{
+		Field: "extAttrs",
+		Value: map[string]interface{}{
+			"existingKey": "updated", // update
+			"removeMe":    nil,       // null-tombstone removal
+			"newKey":      "added",   // add
+		},
+		Expect: map[string]interface{}{
+			"existingKey": "updated",
+			"newKey":      "added",
+			// removeMe and ownerStamp are both correctly absent: removeMe
+			// because it was removed, ownerStamp because IgnoreMapKeys
+			// exempts it from the comparison entirely.
+		},
+		IgnoreMapKeys: []string{"ownerStamp"},
+	}
+
+	result, _ := r.runFieldTest(test, snapshot, testKindExample, testNameExample, "", "")
+
+	if !result.Passed {
+		t.Fatalf("expected Passed=true, got %+v (error: %v)", result, result.Error)
+	}
+	if result.NoOp {
+		t.Fatal("expected NoOp=false — the patch changes existingKey, removes removeMe and adds newKey")
+	}
+
+	gotExtAttrs, ok := f.atProvider["extAttrs"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("f.atProvider[extAttrs] = %v, want a map", f.atProvider["extAttrs"])
+	}
+	if gotExtAttrs["ownerStamp"] != ownerStampValue {
+		t.Errorf("ownerStamp = %v, want it left untouched at %q — the provider-injected member must survive the patch unmentioned",
+			gotExtAttrs["ownerStamp"], ownerStampValue)
+	}
+	if _, stillPresent := gotExtAttrs["removeMe"]; stillPresent {
+		t.Error("removeMe is still present after a null-tombstone patch")
+	}
+	if gotExtAttrs["existingKey"] != "updated" || gotExtAttrs["newKey"] != "added" {
+		t.Errorf("gotExtAttrs = %v, want existingKey=updated and newKey=added", gotExtAttrs)
+	}
+}
+
+// TestRunFieldTestIgnoreMapKeysAbsentStillRequiresExactMatch is the negative
+// control for TestRunFieldTestIgnoreMapKeysProviderInjectedMember: the exact
+// same expected-vs-actual pair, but without ignoreMapKeys naming the
+// provider-injected key, must NOT compare equal — proving the whole-map
+// comparison really was unsatisfiable before this mechanism, not merely
+// untested.
+//
+// This is checked at the compareFieldValue level rather than through a live
+// runFieldTest: pollField's retry sleep is a fixed real-wall-clock interval
+// unrelated to Runner.timeout, so reproducing a genuine poll-to-timeout
+// failure here would cost several real seconds for no additional coverage —
+// runFieldTest's own comparison is exactly compareFieldValue, exercised
+// directly by TestCompareFieldValue's "EmptyIgnoreKeysMapMismatch" case
+// against this identical expected/actual pair.
+func TestRunFieldTestIgnoreMapKeysAbsentStillRequiresExactMatch(t *testing.T) {
+	expected := map[string]interface{}{"existingKey": "updated"}
+	actual := `{"existingKey":"updated","ownerStamp":"unpredictable-value"}`
+
+	if compareFieldValue(expected, actual, nil) {
+		t.Fatal("expected compareFieldValue to fail without ignoreMapKeys naming ownerStamp")
+	}
+	if !compareFieldValue(expected, actual, []string{"ownerStamp"}) {
+		t.Fatal("expected compareFieldValue to pass once ignoreMapKeys names ownerStamp")
+	}
+}
+
 // outputSpecOf returns the value of a kubectl argv's -o flag, or "" when
 // there is none.
 func outputSpecOf(args []string) string {

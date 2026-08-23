@@ -1373,3 +1373,120 @@ func TestSkipInfoDescribe(t *testing.T) {
 		})
 	}
 }
+
+// TestValidateIgnoreMapKeys pins ValidateIgnoreMapKeys's direct rejections:
+// paired with skip, an empty entry, and a repeated entry — plus the
+// pass-through cases (absent, and a well-formed non-empty list).
+func TestValidateIgnoreMapKeys(t *testing.T) {
+	cases := map[string]struct {
+		reason        string
+		test          UpdateTest
+		wantErrSubstr string // empty means ValidateIgnoreMapKeys must return nil
+	}{
+		"Absent": {
+			reason: "no ignoreMapKeys key at all is the common case and must not error",
+			test:   UpdateTest{Field: "extAttrs", Value: map[string]interface{}{"a": "1"}},
+		},
+		"WellFormed": {
+			reason: "a well-formed, non-empty list on an ordinary entry passes",
+			test: UpdateTest{
+				Field:         "extAttrs",
+				Value:         map[string]interface{}{"a": "1"},
+				IgnoreMapKeys: []string{"ownerStamp"},
+			},
+		},
+		"PairedWithSkip": {
+			reason:        "skip already asserts no comparison exists to write, so ignoreMapKeys has nothing left to affect",
+			test:          UpdateTest{Field: "extAttrs", Skip: LegacySkip("no test written yet"), IgnoreMapKeys: []string{"ownerStamp"}},
+			wantErrSubstr: "ignoreMapKeys is set but skip is also set",
+		},
+		"EmptyEntry": {
+			reason:        "an empty string names no map member key",
+			test:          UpdateTest{Field: "extAttrs", Value: map[string]interface{}{"a": "1"}, IgnoreMapKeys: []string{""}},
+			wantErrSubstr: "ignoreMapKeys entry is empty",
+		},
+		"RepeatedEntry": {
+			reason:        "the same key named twice is not a second exclusion",
+			test:          UpdateTest{Field: "extAttrs", Value: map[string]interface{}{"a": "1"}, IgnoreMapKeys: []string{"ownerStamp", "ownerStamp"}},
+			wantErrSubstr: `ignoreMapKeys entry "ownerStamp" is repeated`,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := ValidateIgnoreMapKeys(tc.test)
+			if tc.wantErrSubstr == "" {
+				if err != nil {
+					t.Fatalf("%s: ValidateIgnoreMapKeys() error = %v, want nil", tc.reason, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("%s: ValidateIgnoreMapKeys() error = nil, want an error containing %q", tc.reason, tc.wantErrSubstr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrSubstr) {
+				t.Errorf("%s: ValidateIgnoreMapKeys() error = %q, want it to contain %q", tc.reason, err.Error(), tc.wantErrSubstr)
+			}
+		})
+	}
+}
+
+// TestParseAnnotationIgnoreMapKeys proves an "ignoreMapKeys:" key on an
+// update-test entry parses onto UpdateTest.IgnoreMapKeys, that an entry with
+// no such key parses with a nil IgnoreMapKeys (the common case every
+// pre-existing fleet entry must keep matching), and that ParseAnnotation
+// rejects the entry-level combination ValidateIgnoreMapKeys itself rejects
+// (skip paired with ignoreMapKeys) at the same entry point every other
+// per-entry validation runs through.
+func TestParseAnnotationIgnoreMapKeys(t *testing.T) {
+	t.Run("Absent", func(t *testing.T) {
+		tests, _, _, _, err := ParseAnnotation(`
+- field: comment
+  value: "updated"
+`)
+		if err != nil {
+			t.Fatalf("ParseAnnotation() error = %v", err)
+		}
+		if len(tests) != 1 {
+			t.Fatalf("len(tests) = %d, want 1", len(tests))
+		}
+		if tests[0].IgnoreMapKeys != nil {
+			t.Errorf("IgnoreMapKeys = %v, want nil", tests[0].IgnoreMapKeys)
+		}
+	})
+
+	t.Run("Present", func(t *testing.T) {
+		tests, _, _, _, err := ParseAnnotation(`
+- field: extAttrs
+  value: {NewKey: "v1", ExistingKey: "updated", RemovedKey: null}
+  expect: {NewKey: "v1", ExistingKey: "updated"}
+  ignoreMapKeys: [OwnerStamp]
+`)
+		if err != nil {
+			t.Fatalf("ParseAnnotation() error = %v", err)
+		}
+		if len(tests) != 1 {
+			t.Fatalf("len(tests) = %d, want 1", len(tests))
+		}
+		want := []string{"OwnerStamp"}
+		got := tests[0].IgnoreMapKeys
+		if len(got) != len(want) || got[0] != want[0] {
+			t.Errorf("IgnoreMapKeys = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("RejectsSkipCombination", func(t *testing.T) {
+		_, _, _, _, err := ParseAnnotation(`
+- field: extAttrs
+  skip: "no test written yet"
+  ignoreMapKeys: [OwnerStamp]
+`)
+		if err == nil {
+			t.Fatal("ParseAnnotation() error = nil, want an error rejecting skip + ignoreMapKeys")
+		}
+		wantErrSubstr := "ignoreMapKeys is set but skip is also set"
+		if !strings.Contains(err.Error(), wantErrSubstr) {
+			t.Errorf("ParseAnnotation() error = %q, want it to contain %q", err.Error(), wantErrSubstr)
+		}
+	})
+}

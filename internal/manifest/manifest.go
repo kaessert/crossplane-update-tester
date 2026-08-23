@@ -80,6 +80,25 @@ type UpdateTest struct {
 	// the next run until someone removes it, rather than rotting silently
 	// the way a stale Skip reason does.
 	KnownDefect string `yaml:"knownDefect"`
+	// IgnoreMapKeys names top-level member keys to exclude, on BOTH sides,
+	// from the equality check `run` performs between Expect (or Value, when
+	// Expect is unset) and the live status.atProvider value — see
+	// runner.compareFieldValue for the comparison itself.
+	//
+	// It exists for a map-typed field whose live value carries a member the
+	// PROVIDER itself writes — an identity stamp, a server-managed marker —
+	// alongside the keys the manifest actually manages. Without it, an
+	// Expect for such a field would have to predict that provider-written
+	// value verbatim, and a value derived from something that does not
+	// exist until the resource is created (e.g. metadata.uid) can never
+	// appear in a static example manifest. Naming the member here lets
+	// Expect describe only the keys the test actually manages — add,
+	// update, and null-tombstone removal are all still expressed exactly
+	// as before; only the comparison ignores the named keys.
+	//
+	// Requires Expect or Value to resolve to a JSON object; see
+	// runner.compareFieldValue for what happens when it does not.
+	IgnoreMapKeys []string `yaml:"ignoreMapKeys"`
 }
 
 // SkipReason is the closed set of reasons a structured "skip:" entry may
@@ -567,6 +586,9 @@ func ParseAnnotation(annotation string) ([]UpdateTest, string, []string, []strin
 		if err := ValidateClear(t.Field, t.Clear); err != nil {
 			return nil, "", nil, nil, fmt.Errorf("entry %d (%s): %w", i, t.Field, err)
 		}
+		if err := ValidateIgnoreMapKeys(t); err != nil {
+			return nil, "", nil, nil, fmt.Errorf("entry %d (%s): %w", i, t.Field, err)
+		}
 		testedFields[t.Field] = true
 	}
 	for _, f := range assertUnchanged {
@@ -696,6 +718,36 @@ func ValidateClear(field string, clear []string) error {
 			return fmt.Errorf(
 				"clear entry %q: clear must name OTHER sibling fields, not the field being patched itself", c)
 		}
+	}
+	return nil
+}
+
+// ValidateIgnoreMapKeys rejects an ignoreMapKeys declaration the runner
+// could not act on, at parse time, before any cluster is touched. See
+// UpdateTest.IgnoreMapKeys for what the mechanism is for.
+//
+// It is exported so both sources of an ignoreMapKeys list share this one
+// check — the "ignoreMapKeys:" key on an update-test annotation entry (via
+// ParseAnnotation above) and any offline validator that wants to check a
+// manifest without running it.
+func ValidateIgnoreMapKeys(t UpdateTest) error {
+	if len(t.IgnoreMapKeys) == 0 {
+		return nil
+	}
+	if t.Skip.Present() {
+		return fmt.Errorf(
+			"ignoreMapKeys is set but skip is also set — skip asserts no test exists to write, " +
+				"so there is no comparison left for ignoreMapKeys to affect; remove one directive")
+	}
+	seen := make(map[string]bool, len(t.IgnoreMapKeys))
+	for _, k := range t.IgnoreMapKeys {
+		if k == "" {
+			return fmt.Errorf("ignoreMapKeys entry is empty — name the map member key to exclude from comparison")
+		}
+		if seen[k] {
+			return fmt.Errorf("ignoreMapKeys entry %q is repeated", k)
+		}
+		seen[k] = true
 	}
 	return nil
 }

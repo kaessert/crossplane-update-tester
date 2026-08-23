@@ -80,7 +80,7 @@ func CheckMergePatchSiblings(m *manifest.Manifest) []MergePatchSiblingFinding {
 			continue
 		}
 
-		bad := survivingSiblingKeys(createObj, patch, effectiveExpectation(t))
+		bad := survivingSiblingKeys(createObj, patch, effectiveExpectation(t), t.IgnoreMapKeys)
 		if len(bad) == 0 {
 			continue
 		}
@@ -108,11 +108,24 @@ func effectiveExpectation(t manifest.UpdateTest) interface{} {
 // back-filled value (the runner compares against status.atProvider, not
 // this function's spec-derived merge simulation), so it has no authority to
 // adjudicate the value; it only confirms the key was accounted for at all.
-func survivingSiblingKeys(createObj, patch map[string]interface{}, effective interface{}) []string {
+//
+// ignoreKeys names the manifest entry's own "ignoreMapKeys:" declaration
+// (manifest.UpdateTest.IgnoreMapKeys): a key listed there is explicitly
+// excluded from the runner's own comparison, so it is not a survivor this
+// check should flag either — the whole point of ignoreMapKeys is that the
+// author never has to name that key anywhere.
+func survivingSiblingKeys(createObj, patch map[string]interface{}, effective interface{}, ignoreKeys []string) []string {
 	effObj, _ := effective.(map[string]interface{})
+	ignored := make(map[string]bool, len(ignoreKeys))
+	for _, k := range ignoreKeys {
+		ignored[k] = true
+	}
 
 	var bad []string
 	for key := range createObj {
+		if ignored[key] {
+			continue
+		}
 		if _, addressed := patch[key]; addressed {
 			// The patch names this key — either a new value or an
 			// explicit null. RFC 7386 overwrites or deletes it; it is

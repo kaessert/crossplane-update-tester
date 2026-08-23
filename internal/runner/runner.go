@@ -567,6 +567,60 @@ func jsonEqual(expected interface{}, actual string) bool {
 	return string(expectedBytes) == actual
 }
 
+// compareFieldValue is jsonEqual, widened to optionally ignore a set of
+// top-level map member keys on both sides before comparing — see
+// manifest.UpdateTest.IgnoreMapKeys for why this exists.
+//
+// With an empty ignoreKeys it is exactly jsonEqual (same signature, same
+// behaviour), so every existing caller and every existing test that never
+// sets ignoreMapKeys is unaffected.
+//
+// With a non-empty ignoreKeys, expected and actual are each normalised
+// through JSON, the named keys are deleted from whichever side is a JSON
+// object, and the (possibly reduced) results are compared with
+// reflect.DeepEqual. Neither side being a JSON object is not a hard error
+// here — deleting a key from something that has no keys is a no-op, so a
+// still-converging field (actual not yet a map) or a genuinely
+// non-map-typed field simply never satisfies the comparison, which surfaces
+// through the ordinary poll-timeout / FAIL path with expected and actual
+// both printed, rather than a separate error channel.
+func compareFieldValue(expected interface{}, actual string, ignoreKeys []string) bool {
+	if len(ignoreKeys) == 0 {
+		return jsonEqual(expected, actual)
+	}
+
+	expectedBytes, err := json.Marshal(expected)
+	if err != nil {
+		return false
+	}
+	var expectedNorm, actualNorm interface{}
+	if json.Unmarshal(expectedBytes, &expectedNorm) != nil {
+		return false
+	}
+	if json.Unmarshal([]byte(actual), &actualNorm) != nil {
+		return false
+	}
+
+	stripKeys(expectedNorm, ignoreKeys)
+	stripKeys(actualNorm, ignoreKeys)
+
+	return reflect.DeepEqual(expectedNorm, actualNorm)
+}
+
+// stripKeys deletes the named keys from val in place when val is a JSON
+// object (map[string]interface{}, the only shape json.Unmarshal produces
+// for a YAML/JSON mapping). Any other shape (scalar, array, nil) is left
+// untouched — there is nothing to strip a top-level map key from.
+func stripKeys(val interface{}, keys []string) {
+	m, ok := val.(map[string]interface{})
+	if !ok {
+		return
+	}
+	for _, k := range keys {
+		delete(m, k)
+	}
+}
+
 // formatExpected converts an expected annotation value to a human-readable
 // display string. For strings, the value is returned directly. For complex
 // types (maps, arrays, numbers), it returns the canonical JSON representation.
@@ -1319,14 +1373,14 @@ func (r *Runner) runFieldTest(t manifest.UpdateTest, snapshot []byte, kind, name
 		return result, snapshot
 	}
 
-	actual, err := r.pollField(t.Field, expectedVal, start)
+	actual, err := r.pollField(t.Field, expectedVal, start, t.IgnoreMapKeys)
 	if err != nil {
 		result.Error = err
 	}
 
 	result.Expected = expected
 	result.Actual = actual
-	result.Passed = jsonEqual(expectedVal, actual)
+	result.Passed = compareFieldValue(expectedVal, actual, t.IgnoreMapKeys)
 	result.Duration = time.Since(start)
 
 	// Evidence check: did the aggregated update-event count actually grow?
@@ -1562,7 +1616,7 @@ func (r *Runner) evidenceOutcome(kind, name, namespace, apiVersion string, event
 // atProvider. Polling covers the gap between the first Ready
 // re-establishment and the subsequent Observe that actually refreshes
 // atProvider.
-func (r *Runner) pollField(field string, expectedVal interface{}, start time.Time) (string, error) {
+func (r *Runner) pollField(field string, expectedVal interface{}, start time.Time, ignoreMapKeys []string) (string, error) {
 	// readRetryInterval is how often THIS TOOL re-reads the resource while
 	// waiting. It is unrelated to the provider's poll interval (see
 	// Runner.pollInterval and slowObserveThreshold), which is how often the
@@ -1580,7 +1634,7 @@ func (r *Runner) pollField(field string, expectedVal interface{}, start time.Tim
 		if err != nil {
 			return actual, err
 		}
-		if jsonEqual(expectedVal, actual) {
+		if compareFieldValue(expectedVal, actual, ignoreMapKeys) {
 			return actual, nil
 		}
 		if time.Now().After(deadline) {

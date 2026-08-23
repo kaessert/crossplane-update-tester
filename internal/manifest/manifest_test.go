@@ -1410,6 +1410,46 @@ func TestValidateIgnoreMapKeys(t *testing.T) {
 			test:          UpdateTest{Field: "extAttrs", Value: map[string]interface{}{"a": "1"}, IgnoreMapKeys: []string{"ownerStamp", "ownerStamp"}},
 			wantErrSubstr: `ignoreMapKeys entry "ownerStamp" is repeated`,
 		},
+		"CollidesWithExpect": {
+			reason: "a key named in both ignoreMapKeys and expect: is stripped from both sides of the comparison " +
+				"before it is ever checked, so the field test passes vacuously regardless of the live value",
+			test: UpdateTest{
+				Field:         "extAttrs",
+				Value:         map[string]interface{}{"existingKey": "updated", "ownerStamp": "x"},
+				Expect:        map[string]interface{}{"existingKey": "updated"},
+				IgnoreMapKeys: []string{"existingKey", "ownerStamp"},
+			},
+			wantErrSubstr: `ignoreMapKeys entry "existingKey" also appears as a key in this entry's own expect:`,
+		},
+		"CollidesWithValueNoExpect": {
+			reason: "with no expect:, value: is the effective expectation the runner compares against, so a " +
+				"collision there is exactly as vacuous as colliding with expect:",
+			test: UpdateTest{
+				Field:         "extAttrs",
+				Value:         map[string]interface{}{"existingKey": "updated"},
+				IgnoreMapKeys: []string{"existingKey"},
+			},
+			wantErrSubstr: `ignoreMapKeys entry "existingKey" also appears as a key in this entry's own value:`,
+		},
+		"NamedOnlyInIgnoreMapKeys": {
+			reason: "the legitimate shape: ignoreMapKeys names the provider-injected member that expect: " +
+				"deliberately never mentions",
+			test: UpdateTest{
+				Field:         "extAttrs",
+				Value:         map[string]interface{}{"existingKey": "updated"},
+				Expect:        map[string]interface{}{"existingKey": "updated"},
+				IgnoreMapKeys: []string{"ownerStamp"},
+			},
+		},
+		"NonObjectExpectation": {
+			reason: "a scalar or list expectation has no keys to collide with, so ignoreMapKeys is accepted " +
+				"even though it will never match anything on that side",
+			test: UpdateTest{
+				Field:         "count",
+				Value:         "5",
+				IgnoreMapKeys: []string{"ownerStamp"},
+			},
+		},
 	}
 
 	for name, tc := range cases {
@@ -1485,6 +1525,27 @@ func TestParseAnnotationIgnoreMapKeys(t *testing.T) {
 			t.Fatal("ParseAnnotation() error = nil, want an error rejecting skip + ignoreMapKeys")
 		}
 		wantErrSubstr := "ignoreMapKeys is set but skip is also set"
+		if !strings.Contains(err.Error(), wantErrSubstr) {
+			t.Errorf("ParseAnnotation() error = %q, want it to contain %q", err.Error(), wantErrSubstr)
+		}
+	})
+
+	// RejectsVacuousSelfCollision reproduces, through the real annotation
+	// parse path, the exact expected/actual pair this check exists to catch:
+	// existingKey is named in both expect: and ignoreMapKeys, so the
+	// comparison would strip it from both sides and report PASS against a
+	// live value ("NOT-updated") that never actually converged.
+	t.Run("RejectsVacuousSelfCollision", func(t *testing.T) {
+		_, _, _, _, err := ParseAnnotation(`
+- field: extAttrs
+  value: {existingKey: "updated", ownerStamp: "x"}
+  expect: {existingKey: "updated"}
+  ignoreMapKeys: [existingKey, ownerStamp]
+`)
+		if err == nil {
+			t.Fatal("ParseAnnotation() error = nil, want an error rejecting the existingKey self-collision")
+		}
+		wantErrSubstr := `ignoreMapKeys entry "existingKey" also appears as a key in this entry's own expect:`
 		if !strings.Contains(err.Error(), wantErrSubstr) {
 			t.Errorf("ParseAnnotation() error = %q, want it to contain %q", err.Error(), wantErrSubstr)
 		}

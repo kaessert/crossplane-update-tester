@@ -749,6 +749,36 @@ func ValidateIgnoreMapKeys(t UpdateTest) error {
 		}
 		seen[k] = true
 	}
+
+	// The comparison strips every ignoreMapKeys key from BOTH the expected
+	// and the actual side (runner.compareFieldValue), so a key named here
+	// that the entry's own effective expectation ALSO names is deleted
+	// before the comparison ever looks at it — the field test then reports
+	// PASS regardless of what the live value actually is. The mechanism's
+	// entire purpose is to let expect: (or value:, when expect: is unset)
+	// omit a provider-injected member it could never predict; naming that
+	// same member inside expect:/value: AND in ignoreMapKeys is always an
+	// authoring error, never a legitimate shape — there is nothing left to
+	// ignore that the author has not also (uselessly) tried to assert.
+	effective := t.Expect
+	source := "expect"
+	if effective == nil {
+		effective = t.Value
+		source = "value"
+	}
+	if effObj, ok := effective.(map[string]interface{}); ok {
+		for _, k := range t.IgnoreMapKeys {
+			if _, present := effObj[k]; present {
+				return fmt.Errorf(
+					"ignoreMapKeys entry %q also appears as a key in this entry's own %s: — "+
+						"the comparison strips ignoreMapKeys keys from BOTH sides before comparing, so this "+
+						"key would be deleted from %s: too and the test would pass without ever checking it; "+
+						"remove the key from ignoreMapKeys (it is redundant — %s: already covers it) or "+
+						"remove it from %s: (if it is really a provider-injected member the manifest cannot predict)",
+					k, source, source, source, source)
+			}
+		}
+	}
 	return nil
 }
 

@@ -335,10 +335,13 @@ overrides discovery.
 - `guarded-assert-unchanged` — the field has no entry of its own, but is named
   (as its own top-level field, or as the first segment of a nested
   `status.atProvider` path) by the annotation's top-level `assert-unchanged:`
-  directive. A field cannot carry both this directive and its own
+  directive. A field the directive names DIRECTLY cannot also carry its own
   `field:`/`skip:` entry — the two are rejected as an overlap at parse time —
   so a manifest choosing this stronger, actively-enforced guard has nothing
-  left to write for the ordinary coverage credit. Counts as coverage, but
+  left to write for the ordinary coverage credit. A field reached only as the
+  first segment of a nested path is not that overlap and may still carry its
+  own entry; where it does, that entry's status wins and this one is never
+  substituted for it. Counts as coverage, but
   reported under its own status: assert-unchanged proves the field never
   drifts, never that a specific new value can be written to it, so it is
   never folded into `tested` or `skipped`.

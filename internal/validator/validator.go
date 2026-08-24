@@ -78,12 +78,13 @@ const clearTargetUnknownStatus = "clear-target-unknown"
 // its ONLY coverage is being named — as its own top-level field, or as the
 // first path segment of a nested status.atProvider path — by the
 // manifest's "assert-unchanged:" directive (see manifest.Manifest.
-// AssertUnchanged). A field cannot carry both this directive and its own
-// update-test entry (manifest.ParseAnnotation rejects the overlap before
-// any cluster is touched), so a manifest author choosing the stronger,
-// actively-enforced guard necessarily has no "field:"/"skip:" entry left to
-// write for it. Without this credit the field reports MISSING, penalising
-// the manifest that guards it more strongly than an ordinary skip: would.
+// AssertUnchanged). A field the directive names DIRECTLY cannot also carry
+// its own update-test entry (manifest.ParseAnnotation rejects that overlap
+// before any cluster is touched), so a manifest author choosing the
+// stronger, actively-enforced guard necessarily has no "field:"/"skip:"
+// entry left to write for it. Without this credit the field reports
+// MISSING, penalising the manifest that guards it more strongly than an
+// ordinary skip: would.
 // Deliberately distinct from "tested" and "skipped": assert-unchanged
 // proves the field never DRIFTS, never that a specific new value can be
 // WRITTEN to it, so folding it into either would overstate what was
@@ -361,10 +362,13 @@ func ValidateManifest(m *manifest.Manifest, fields []FieldInfo) *ValidationResul
 	// names no declared field credits nothing, exactly like an ordinary
 	// MISSING field today. It is credited only when the field has no
 	// stronger direct entry of its own, mirroring the clear: credit
-	// ordering below — direct entries are, by construction, always for a
-	// DIFFERENT field than any assert-unchanged entry, but this keeps the
-	// two credit passes' fallback behaviour identical regardless of which
-	// runs first.
+	// ordering below. That guard is load-bearing, not merely defensive:
+	// the parse-time overlap rejection compares WHOLE names, so only a
+	// directly-named field is barred from also carrying its own entry —
+	// a nested path's first segment may carry one, and f5xc's
+	// secret-policy manifest uses exactly that shape deliberately
+	// ("legacyRuleList.rules" guarding a legacyRuleList that keeps its
+	// own skip: entry). Its own entry wins.
 	for _, a := range m.AssertUnchanged {
 		top := a
 		if idx := strings.Index(a, "."); idx >= 0 {

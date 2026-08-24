@@ -43,7 +43,7 @@ type ValidationResult struct {
 // FieldValidation holds the status of a single field in validation.
 type FieldValidation struct {
 	JSONName string
-	Status   string // "tested", "skipped", "skipped-unstructured", "immutable", "reference-plumbing", "MISSING", "tested-via-switch", "clear-target-unknown"
+	Status   string // "tested", "skipped", "skipped-unstructured", "immutable", "reference-plumbing", "MISSING", "tested-via-switch", "clear-target-unknown", "guarded-assert-unchanged"
 }
 
 // clearCreditStatus is the status a field is credited under when the ONLY
@@ -73,6 +73,22 @@ const legacySkipStatus = "skipped-unstructured"
 // status feeds into the same AllGood/Fields reporting a MISSING field uses
 // rather than passing silently. See ValidateManifest.
 const clearTargetUnknownStatus = "clear-target-unknown"
+
+// assertUnchangedCreditStatus is the status a field is credited under when
+// its ONLY coverage is being named — as its own top-level field, or as the
+// first path segment of a nested status.atProvider path — by the
+// manifest's "assert-unchanged:" directive (see manifest.Manifest.
+// AssertUnchanged). A field cannot carry both this directive and its own
+// update-test entry (manifest.ParseAnnotation rejects the overlap before
+// any cluster is touched), so a manifest author choosing the stronger,
+// actively-enforced guard necessarily has no "field:"/"skip:" entry left to
+// write for it. Without this credit the field reports MISSING, penalising
+// the manifest that guards it more strongly than an ordinary skip: would.
+// Deliberately distinct from "tested" and "skipped": assert-unchanged
+// proves the field never DRIFTS, never that a specific new value can be
+// WRITTEN to it, so folding it into either would overstate what was
+// actually exercised. See ValidateManifest.
+const assertUnchangedCreditStatus = "guarded-assert-unchanged"
 
 // Regexes for parsing Go struct fields.
 var (
@@ -331,6 +347,37 @@ func ValidateManifest(m *manifest.Manifest, fields []FieldInfo) *ValidationResul
 		AllGood: true,
 	}
 
+	// assert-unchanged coverage credit: a field named by the manifest's
+	// "assert-unchanged:" directive (m.AssertUnchanged) can never also
+	// carry its own "field:"/"skip:" entry — manifest.ParseAnnotation
+	// rejects that overlap at parse time — so a manifest author who
+	// chose the stronger, actively-enforced guard has no weaker skip:
+	// entry left to earn the ordinary coverage credit. Crediting it here,
+	// under its own distinct status, stops that choice from reporting
+	// MISSING. Each directive entry is a dot-separated status.atProvider
+	// path (e.g. "legacyRuleList.rules"); only the first segment can ever
+	// name a spec field this validator knows about, so that is what is
+	// checked against fieldSet and credited — a path whose first segment
+	// names no declared field credits nothing, exactly like an ordinary
+	// MISSING field today. It is credited only when the field has no
+	// stronger direct entry of its own, mirroring the clear: credit
+	// ordering below — direct entries are, by construction, always for a
+	// DIFFERENT field than any assert-unchanged entry, but this keeps the
+	// two credit passes' fallback behaviour identical regardless of which
+	// runs first.
+	for _, a := range m.AssertUnchanged {
+		top := a
+		if idx := strings.Index(a, "."); idx >= 0 {
+			top = a[:idx]
+		}
+		if !fieldSet[top] {
+			continue
+		}
+		if _, ok := tested[top]; !ok {
+			tested[top] = assertUnchangedCreditStatus
+		}
+	}
+
 	// Group-aware coverage credit: a non-skipped entry's clear: list names
 	// sibling union-arm fields that this entry's merge patch nulls in the
 	// SAME atomic patch that sets its own field's value. Each named sibling
@@ -404,6 +451,7 @@ var statusOrder = []statusIconDetail{
 	{Status: "immutable", Icon: "✓", Detail: "immutable (excluded)"},
 	{Status: "reference-plumbing", Icon: "✓", Detail: "reference plumbing (excluded)"},
 	{Status: clearCreditStatus, Icon: "✓", Detail: "covered (nulled by a sibling entry's clear: — proven clearable, not independently value-tested)"},
+	{Status: assertUnchangedCreditStatus, Icon: "⊙", Detail: "guarded (assert-unchanged) — proven never to drift, not independently value-tested"},
 	{Status: "MISSING", Icon: "✗", Detail: "MISSING — not covered by update-test annotation"},
 	{Status: clearTargetUnknownStatus, Icon: "✗", Detail: "INVALID — named in a clear: list but not a declared field on this type"},
 }

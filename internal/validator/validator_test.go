@@ -404,6 +404,124 @@ func TestValidateManifestClearTargetUnknownField(t *testing.T) {
 	}
 }
 
+// TestValidateManifestAssertUnchangedCoverage is the acceptance case this
+// ticket implements: a field named only by the manifest's top-level
+// "assert-unchanged:" directive (never by its own "field:"/"skip:" entry —
+// manifest.ParseAnnotation rejects that overlap at parse time) must be
+// credited as covered, under a status distinct from "tested"/"skipped", and
+// a field covered by neither mechanism must still report MISSING — the
+// credit must not widen into "any mention counts".
+func TestValidateManifestAssertUnchangedCoverage(t *testing.T) {
+	fields := []FieldInfo{
+		{GoName: "Comment", JSONName: fieldComment},
+		{GoName: "Region", JSONName: fieldRegion},
+	}
+
+	m := &manifest.Manifest{
+		Kind:            kindWidget,
+		AssertUnchanged: []string{fieldRegion},
+		Tests: []manifest.UpdateTest{
+			{Field: fieldComment, Value: "updated"},
+		},
+	}
+
+	result := ValidateManifest(m, fields)
+
+	if !result.AllGood {
+		t.Fatalf("expected AllGood=true — comment is tested, region is guarded by assert-unchanged; got fields: %+v", result.Fields)
+	}
+	statusByName := statusMap(result)
+	if got := statusByName[fieldRegion]; got != assertUnchangedCreditStatus {
+		t.Errorf("field %q (named only by assert-unchanged): status = %q, want %q", fieldRegion, got, assertUnchangedCreditStatus)
+	}
+	if got := statusByName[fieldComment]; got != statusTested {
+		t.Errorf("field %q: status = %q, want %q", fieldComment, got, statusTested)
+	}
+	if assertUnchangedCreditStatus == statusTested || assertUnchangedCreditStatus == statusSkipped {
+		t.Fatalf("assertUnchangedCreditStatus must be distinct from %q and %q", statusTested, statusSkipped)
+	}
+}
+
+// TestValidateManifestAssertUnchangedNestedPathCreditsTopLevelField proves
+// the credit resolves a dot-separated status.atProvider path (as f5xc's
+// "legacyRuleList.rules" guards a nested member) against the top-level spec
+// field named by its first segment, exactly the shape the directive is
+// documented to carry.
+func TestValidateManifestAssertUnchangedNestedPathCreditsTopLevelField(t *testing.T) {
+	fields := []FieldInfo{
+		{GoName: "LegacyRuleList", JSONName: "legacyRuleList"},
+	}
+
+	m := &manifest.Manifest{
+		Kind:            kindWidget,
+		AssertUnchanged: []string{"legacyRuleList.rules"},
+	}
+
+	result := ValidateManifest(m, fields)
+
+	if !result.AllGood {
+		t.Fatalf("expected AllGood=true; got fields: %+v", result.Fields)
+	}
+	statusByName := statusMap(result)
+	if got := statusByName["legacyRuleList"]; got != assertUnchangedCreditStatus {
+		t.Errorf(`status["legacyRuleList"] = %q, want %q`, got, assertUnchangedCreditStatus)
+	}
+}
+
+// TestValidateManifestAssertUnchangedFieldWithNeitherStillMissing pins the
+// non-widening bound explicitly: a field named by NEITHER a test entry NOR
+// the assert-unchanged directive still reports MISSING.
+func TestValidateManifestAssertUnchangedFieldWithNeitherStillMissing(t *testing.T) {
+	fields := []FieldInfo{
+		{GoName: "Comment", JSONName: fieldComment},
+		{GoName: "Region", JSONName: fieldRegion},
+	}
+
+	m := &manifest.Manifest{
+		Kind:            kindWidget,
+		AssertUnchanged: []string{fieldRegion},
+	}
+
+	result := ValidateManifest(m, fields)
+
+	if result.AllGood {
+		t.Fatal("expected AllGood=false — comment is covered by neither a test entry nor assert-unchanged")
+	}
+	statusByName := statusMap(result)
+	if got := statusByName[fieldComment]; got != statusMissing {
+		t.Errorf("field %q: status = %q, want %q", fieldComment, got, statusMissing)
+	}
+	if got := statusByName[fieldRegion]; got != assertUnchangedCreditStatus {
+		t.Errorf("field %q: status = %q, want %q", fieldRegion, got, assertUnchangedCreditStatus)
+	}
+}
+
+// TestValidateManifestAssertUnchangedNeverDowngradesDirectEntry proves the
+// credit only fills a gap: a field covered by its own direct test entry
+// keeps that entry's status even if some OTHER assert-unchanged path also
+// resolves to it (e.g. a stale directive left after the field's own entry
+// was added) — never overwritten with the weaker assert-unchanged status.
+func TestValidateManifestAssertUnchangedNeverDowngradesDirectEntry(t *testing.T) {
+	fields := []FieldInfo{
+		{GoName: "Comment", JSONName: fieldComment},
+	}
+
+	m := &manifest.Manifest{
+		Kind:            kindWidget,
+		AssertUnchanged: []string{fieldComment},
+		Tests: []manifest.UpdateTest{
+			{Field: fieldComment, Value: "updated"},
+		},
+	}
+
+	result := ValidateManifest(m, fields)
+
+	statusByName := statusMap(result)
+	if got := statusByName[fieldComment]; got != statusTested {
+		t.Errorf("field %q: status = %q, want %q (its own direct entry must win)", fieldComment, got, statusTested)
+	}
+}
+
 // widgetTypesSrc is a synthetic generated-types fixture containing the
 // three-field reference pattern (owner/ownerRef/ownerSelector), an immutable
 // field, and a sibling *Parameters struct that must be skipped.

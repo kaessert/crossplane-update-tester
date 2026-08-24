@@ -332,6 +332,16 @@ overrides discovery.
 - `clear-target-unknown` — a `clear:` list names something that is not a
   declared field on this type (a typo, or a field renamed or removed since the
   entry was written). The command exits non-zero.
+- `guarded-assert-unchanged` — the field has no entry of its own, but is named
+  (as its own top-level field, or as the first segment of a nested
+  `status.atProvider` path) by the annotation's top-level `assert-unchanged:`
+  directive. A field cannot carry both this directive and its own
+  `field:`/`skip:` entry — the two are rejected as an overlap at parse time —
+  so a manifest choosing this stronger, actively-enforced guard has nothing
+  left to write for the ordinary coverage credit. Counts as coverage, but
+  reported under its own status: assert-unchanged proves the field never
+  drifts, never that a specific new value can be written to it, so it is
+  never folded into `tested` or `skipped`.
 - `MISSING` — none of the above; the command exits non-zero.
 
 This is what stops an annotation from quietly falling behind the API type as

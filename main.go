@@ -1249,9 +1249,11 @@ type roundtripVerifyExcludedJSON struct {
 //
 // Backend/Seed/Cells/ContainerClear/Waivers are additive: every field this
 // ticket adds. None of them ever changes anyFindings (see
-// buildRoundtripVerifyReport) — Backend is empty and Cells/ContainerClear/
-// Waivers are simply additional information a reader may act on later, not
-// a new way for this command to fail.
+// buildRoundtripVerifyReport) — Cells/ContainerClear/Waivers are simply
+// additional information a reader may act on later, not a new way for
+// this command to fail, and Backend itself is never read to make that
+// decision either, even though it is now a required, always-populated
+// value.
 type roundtripVerifyReportJSON struct {
 	Kind          string                        `json:"kind"`
 	Name          string                        `json:"name"`
@@ -1381,6 +1383,31 @@ func rotationStatePath(root string) string {
 	return filepath.Join(root, ".update-tester-rotation-state.json")
 }
 
+// manifestScope derives the rotation cursor's scope key for m — see
+// stateKey and roundtrip.GroupCells' own doc comment for why cell
+// membership, and therefore the cursor that credits it, must be scoped per
+// manifest rather than per Kind.
+//
+// The value is m's own Kubernetes object identity: APIVersion, Kind,
+// Namespace and Name together. Kind+Name alone collides for the
+// cluster-scoped/namespaced example pair every resource ships (both
+// carrying the identical metadata.name, distinguished only by apiVersion
+// and namespace) — that collision let the two share one rotation cursor
+// and left a measured 28.7% of one provider's equal-cell members never
+// selected. Namespace is empty for a cluster-scoped manifest and
+// non-empty for its namespaced twin, and APIVersion differs between the
+// two API groups the dual-scope split generates, so this combination is
+// unique per manifest even when Kind and Name coincide.
+//
+// A provider's existing rotation-state file keys its cursors by the old
+// Kind+Name scope; after this change every existing key goes unmatched,
+// so each manifest simply starts a fresh round-robin cursor from zero on
+// its first run post-upgrade. That reconverges within
+// RepresentativesPerRun's own bound and needs no migration.
+func manifestScope(m *manifest.Manifest) string {
+	return m.APIVersion + "|" + m.Kind + "|" + m.Namespace + "|" + m.Name
+}
+
 // buildRoundtripVerifyReport is cmdRoundtripVerify's pure core: every input
 // already resolved (a parsed manifest, a matched CRD, DiffReport's own
 // rows) so the full report shape — including every cell-denominator field
@@ -1411,8 +1438,9 @@ func buildRoundtripVerifyReport(
 	// cursor CreditCells advances is this manifest's own — never shared
 	// with another manifest that happens to produce the same CellKey (see
 	// roundtrip.GroupCells' own doc comment on why cell scope is settled
-	// at per-manifest, and stateKey for the cursor this feeds).
-	scope := m.Kind + "/" + m.Name
+	// at per-manifest, manifestScope for why Kind+Name alone cannot carry
+	// that identity, and stateKey for the cursor this feeds).
+	scope := manifestScope(m)
 	cells := roundtrip.GroupCells(rows)
 	credits, _ := roundtrip.CreditCells(cells, rotation, scope)
 

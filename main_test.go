@@ -1837,6 +1837,77 @@ func TestRotationStatePathIsHiddenAndScopedToRoot(t *testing.T) {
 	}
 }
 
+// clusterScopedManifestFixture and namespacedManifestFixture are the two
+// example manifests every dual-scope resource ships: the SAME Kind and the
+// SAME metadata.name, differing ONLY in apiVersion and metadata.namespace
+// — exactly the pair the fleet's own generator produces for every
+// resource (a cluster-scoped example and its namespaced twin).
+const clusterScopedManifestFixture = `
+apiVersion: widgets.crossplane.io/v1alpha1
+kind: Widget
+metadata:
+  name: crossplane-uptest
+spec:
+  forProvider:
+    name: widget-a
+`
+
+const namespacedManifestFixture = `
+apiVersion: widgets.m.crossplane.io/v1alpha1
+kind: Widget
+metadata:
+  name: crossplane-uptest
+  namespace: default
+spec:
+  forProvider:
+    name: widget-a
+`
+
+// TestManifestScopeDistinguishesClusterAndNamespacedTwins confirms
+// manifestScope — the function buildRoundtripVerifyReport calls to derive
+// a rotation cursor's scope — assigns different scopes to the
+// cluster-scoped/namespaced example pair every resource ships, even
+// though the pair shares both Kind and metadata.name.
+//
+// Both fixtures are parsed with manifest.ParseBytes, the SAME parser
+// cmdRoundtripVerify itself uses (via manifest.Parse), and scope is
+// derived by calling manifestScope directly rather than hand-writing two
+// distinct scope strings — a test built the latter way cannot fail
+// regardless of what the scope expression actually does. Before
+// APIVersion and Namespace were folded into the scope, both fixtures
+// derived the identical "Widget/crossplane-uptest" value and would have
+// silently shared one rotation cursor despite being two distinct live
+// objects.
+func TestManifestScopeDistinguishesClusterAndNamespacedTwins(t *testing.T) {
+	cluster, err := manifest.ParseBytes([]byte(clusterScopedManifestFixture))
+	if err != nil {
+		t.Fatalf("parsing cluster-scoped fixture: %v", err)
+	}
+	namespaced, err := manifest.ParseBytes([]byte(namespacedManifestFixture))
+	if err != nil {
+		t.Fatalf("parsing namespaced fixture: %v", err)
+	}
+
+	// Guard the fixtures themselves: if either drifts to no longer share a
+	// Kind/Name, or to no longer differ in apiVersion/namespace, this test
+	// stops exercising the collision it is named for and must say so
+	// loudly rather than passing vacuously.
+	if cluster.Kind != namespaced.Kind || cluster.Name != namespaced.Name {
+		t.Fatalf("fixtures do not share a Kind and Name — test no longer exercises the collision (cluster=%s/%s namespaced=%s/%s)",
+			cluster.Kind, cluster.Name, namespaced.Kind, namespaced.Name)
+	}
+	if cluster.APIVersion == namespaced.APIVersion && cluster.Namespace == namespaced.Namespace {
+		t.Fatalf("fixtures do not differ in apiVersion or namespace — test no longer exercises the collision")
+	}
+
+	clusterScope := manifestScope(cluster)
+	namespacedScope := manifestScope(namespaced)
+	if clusterScope == namespacedScope {
+		t.Fatalf("manifestScope collided for the cluster-scoped and namespaced twin: both %q — they would share one rotation cursor despite being two distinct live objects",
+			clusterScope)
+	}
+}
+
 func TestVersionFrom(t *testing.T) {
 	tests := []struct {
 		name string

@@ -11,8 +11,10 @@ import "fmt"
 type BackendType string
 
 const (
-	// BackendReal is the default assumption for every provider except the
-	// one declared otherwise: a live, non-simulated backend.
+	// BackendReal marks a provider whose E2E path runs against a live,
+	// non-simulated backend. It is never assumed or defaulted — every
+	// provider, including one that is in fact real, must declare it
+	// explicitly via --backend (see ParseBackendType).
 	BackendReal BackendType = "real"
 	// BackendSimulator marks a provider whose ENTIRE E2E path runs against
 	// a simulator with no real-backend arm at all (e.g. vcsim) — a cell

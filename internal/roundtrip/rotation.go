@@ -90,10 +90,31 @@ type RotationState struct {
 	Sticky map[string][]string `json:"sticky"`
 }
 
-// String renders a CellKey as the stable map key RotationState and every
-// report keyed by cell use.
+// String renders a CellKey as the stable identity every report keyed by
+// cell uses. It carries no manifest identity — see stateKey for the
+// persisted rotation state's own lookup key, which adds one.
 func (k CellKey) String() string {
 	return fmt.Sprintf("%s|%s|%s", k.Classification, k.Shape, k.Direction)
+}
+
+// stateKey combines a manifest scope with a CellKey into the string
+// RotationState persists its cursors and sticky registry under.
+//
+// scope MUST identify the manifest whose own rows produced key and members
+// — the tool settles cell membership at per-manifest scope (see GroupCells'
+// own doc comment for why), so the rotation cursor that credits those
+// members must be scoped identically. Before this, Cursors was keyed by
+// CellKey.String() alone: every manifest sharing a (classification, shape,
+// direction) triple — the overwhelmingly common case, since most equal
+// cells are scalars — advanced the SAME cursor, each modulo its own,
+// different member count. That is not a round robin: it is deterministic
+// starvation, measured at 30-44% of every provider's equal-cell members
+// NEVER selected across 200 replayed runs. Scoping by manifest makes two
+// manifests sharing a CellKey mathematically independent: each owns its
+// own cursor, so neither's arithmetic can ever land on the other's index
+// space.
+func stateKey(scope string, key CellKey) string {
+	return scope + "\x00" + key.String()
 }
 
 // NewRotationState creates a fresh state with a newly generated seed —
@@ -167,17 +188,24 @@ func shuffledOrder(seed int64, key CellKey, n int) []int {
 }
 
 // Select returns this run's chosen representatives for the equal cell
-// identified by key, given its full sorted member list, and advances the
-// cell's cursor by RepresentativesPerRun(len(members)) so the NEXT call
-// (the next run, once persisted and reloaded) continues the round robin
-// rather than repeating this run's picks. Every member ever promoted to
-// sticky is always included, in addition to (never instead of) the
-// rotated budget.
+// identified by key within scope, given its full sorted member list, and
+// advances THAT (scope, key) pair's cursor by
+// RepresentativesPerRun(len(members)) so the NEXT call for the same scope
+// and key (the next run, once persisted and reloaded) continues the round
+// robin rather than repeating this run's picks. Every member ever promoted
+// to sticky within scope is always included, in addition to (never instead
+// of) the rotated budget.
+//
+// scope MUST identify the manifest members was derived from (see stateKey).
+// A second manifest that happens to produce the same CellKey — the common
+// case, since most equal cells are scalars — gets its OWN cursor under a
+// different scope, so its own budget/n arithmetic can never perturb this
+// one's position.
 //
 // members must already be sorted (GroupCells' own callers sort them via
 // sortedPaths) so the shuffled order is reproducible independent of
 // whatever order rows happened to arrive in.
-func (s *RotationState) Select(key CellKey, members []string) (representatives, sticky []string) {
+func (s *RotationState) Select(scope string, key CellKey, members []string) (representatives, sticky []string) {
 	n := len(members)
 	if n == 0 {
 		return nil, nil
@@ -189,10 +217,10 @@ func (s *RotationState) Select(key CellKey, members []string) (representatives, 
 		s.Sticky = map[string][]string{}
 	}
 
-	keyStr := key.String()
+	skey := stateKey(scope, key)
 	order := shuffledOrder(s.Seed, key, n)
 	budget := RepresentativesPerRun(n)
-	cursor := s.Cursors[keyStr]
+	cursor := s.Cursors[skey]
 
 	picked := make(map[string]bool, budget)
 	result := make([]string, 0, budget)
@@ -203,9 +231,9 @@ func (s *RotationState) Select(key CellKey, members []string) (representatives, 
 			result = append(result, m)
 		}
 	}
-	s.Cursors[keyStr] = (cursor + budget) % n
+	s.Cursors[skey] = (cursor + budget) % n
 
-	sticky = append([]string(nil), s.Sticky[keyStr]...)
+	sticky = append([]string(nil), s.Sticky[skey]...)
 	for _, m := range sticky {
 		if !picked[m] {
 			picked[m] = true
@@ -217,21 +245,22 @@ func (s *RotationState) Select(key CellKey, members []string) (representatives, 
 	return result, sticky
 }
 
-// PromoteFailure marks field as permanently sticky within the cell key —
+// PromoteFailure marks field as permanently sticky within scope and key —
 // call this the moment a chosen representative's live test fails, so the
-// SAME field is selected on every future run without depending on the
-// rotation schedule to land on it again by chance. Idempotent: promoting
-// an already-sticky field is a no-op.
-func (s *RotationState) PromoteFailure(key CellKey, field string) {
+// SAME field is selected on every future run of the SAME manifest without
+// depending on the rotation schedule to land on it again by chance.
+// Idempotent: promoting an already-sticky field is a no-op. scope MUST
+// identify the manifest field was observed to fail against — see stateKey.
+func (s *RotationState) PromoteFailure(scope string, key CellKey, field string) {
 	if s.Sticky == nil {
 		s.Sticky = map[string][]string{}
 	}
-	keyStr := key.String()
-	for _, f := range s.Sticky[keyStr] {
+	skey := stateKey(scope, key)
+	for _, f := range s.Sticky[skey] {
 		if f == field {
 			return
 		}
 	}
-	s.Sticky[keyStr] = append(s.Sticky[keyStr], field)
-	sort.Strings(s.Sticky[keyStr])
+	s.Sticky[skey] = append(s.Sticky[skey], field)
+	sort.Strings(s.Sticky[skey])
 }

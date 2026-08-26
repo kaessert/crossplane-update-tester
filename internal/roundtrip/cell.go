@@ -97,6 +97,34 @@ func ShapeOf(r Row) Shape {
 // not a spec field at all (see DiffReport's own doc comment), so grouping
 // it would count read-only atProvider-only surface as testable cell
 // membership.
+//
+// Cell scope is settled at PER-MANIFEST: rows always come from one
+// DiffReport call against one already-live object (see DiffReport's own
+// doc comment), and this function groups only what it is handed — it never
+// reaches across manifests, kinds, or a whole provider to merge rows from
+// more than one live object into a single cell.
+//
+// This was measured against two coarser alternatives before being settled:
+// grouping by CRD kind (merging every manifest that shares a kind — e.g. a
+// cluster-scoped and a namespaced example of the same resource) or by
+// provider (merging everything). Per-kind numerically tracks a prior
+// offline census's own cell count more closely than per-manifest does, and
+// per-provider does not track it at all. That agreement is not adopted
+// here, because it is the wrong thing to optimize for: two manifests of
+// the same kind are two INDEPENDENTLY OBSERVED live objects, and a field
+// classified `equal` against one of them is not evidence about the other —
+// it may hold a different value, exercise a different code path in the
+// provider, or (the case this whole package exists to catch) genuinely
+// behave differently between the two. Merging their rows into one cell
+// would credit a field's coverage in one manifest's context using an
+// observation taken against a DIFFERENT live object — silently inferring
+// a claim from a sibling's evidence rather than the object's own, which is
+// exactly the guessed-value failure this tool is built to refuse elsewhere
+// (see BackendType's declared-never-inferred contract). Per-manifest cell
+// counts therefore run higher than an offline census computed by merging
+// same-kind manifests; that discrepancy belongs to whatever recomputes a
+// fleet-wide target denominator against this tool's actual behavior, not
+// to this function.
 func GroupCells(rows []Row) map[CellKey][]Row {
 	out := make(map[CellKey][]Row)
 	for _, r := range rows {

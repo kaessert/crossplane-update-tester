@@ -23,7 +23,7 @@ func TestCreditCellsAppliesRepresentativeCreditingToEqualCellsOnly(t *testing.T)
 	cells := GroupCells(rows)
 	state := NewRotationState()
 
-	credits, nonEqual := CreditCells(cells, &state)
+	credits, nonEqual := CreditCells(cells, &state, "Widget/example")
 
 	if len(credits) != 1 {
 		t.Fatalf("CreditCells produced %d credits, want 1 (only the equal/scalar cell)", len(credits))
@@ -67,7 +67,7 @@ func TestCreditCellsRepresentativesPlusCreditedCoverEveryMember(t *testing.T) {
 	cells := GroupCells(rows)
 	state := NewRotationState()
 
-	credits, _ := CreditCells(cells, &state)
+	credits, _ := CreditCells(cells, &state, "Widget/example")
 	if len(credits) != 1 {
 		t.Fatalf("got %d credits, want 1", len(credits))
 	}
@@ -101,9 +101,10 @@ func TestCreditCellsStickyMembersSurfaceOnTheCredit(t *testing.T) {
 	cells := GroupCells(rows)
 	state := NewRotationState()
 	key := CellKey{Classification: ClassEqual, Shape: ShapeScalar, Direction: DirectionSet}
-	state.PromoteFailure(key, "b")
+	const scope = "Widget/example"
+	state.PromoteFailure(scope, key, "b")
 
-	credits, _ := CreditCells(cells, &state)
+	credits, _ := CreditCells(cells, &state, scope)
 	if len(credits) != 1 {
 		t.Fatalf("got %d credits, want 1", len(credits))
 	}
@@ -116,8 +117,53 @@ func TestCreditCellsStickyMembersSurfaceOnTheCredit(t *testing.T) {
 // case is handled without panicking.
 func TestCreditCellsEmptyInputProducesNoCredits(t *testing.T) {
 	state := NewRotationState()
-	credits, nonEqual := CreditCells(map[CellKey][]Row{}, &state)
+	credits, nonEqual := CreditCells(map[CellKey][]Row{}, &state, "Widget/example")
 	if len(credits) != 0 || len(nonEqual) != 0 {
 		t.Errorf("CreditCells(empty) = %v, %v, want both empty", credits, nonEqual)
+	}
+}
+
+// TestCreditCellsScopesRotationPerManifest confirms two manifests that
+// produce the SAME CellKey each get their own, independent rotation
+// cursor through CreditCells — the fix threaded from GroupCells' settled
+// per-manifest scope through to RotationState.Select.
+func TestCreditCellsScopesRotationPerManifest(t *testing.T) {
+	rowsA := []Row{
+		{Path: "a", Classification: ClassEqual, SpecFound: true, SpecValue: 1, MirrorFound: true, MirrorValue: 1},
+		{Path: "b", Classification: ClassEqual, SpecFound: true, SpecValue: 2, MirrorFound: true, MirrorValue: 2},
+	}
+	rowsB := []Row{
+		{Path: "x", Classification: ClassEqual, SpecFound: true, SpecValue: 1, MirrorFound: true, MirrorValue: 1},
+		{Path: "y", Classification: ClassEqual, SpecFound: true, SpecValue: 2, MirrorFound: true, MirrorValue: 2},
+		{Path: "z", Classification: ClassEqual, SpecFound: true, SpecValue: 3, MirrorFound: true, MirrorValue: 3},
+	}
+	state := NewRotationState()
+
+	seenA := map[string]bool{}
+	seenB := map[string]bool{}
+	for run := 0; run < 10; run++ {
+		creditsA, _ := CreditCells(GroupCells(rowsA), &state, "Widget/a")
+		for _, c := range creditsA {
+			for _, r := range c.Representatives {
+				seenA[r] = true
+			}
+		}
+		creditsB, _ := CreditCells(GroupCells(rowsB), &state, "Widget/b")
+		for _, c := range creditsB {
+			for _, r := range c.Representatives {
+				seenB[r] = true
+			}
+		}
+	}
+
+	for _, p := range []string{"a", "b"} {
+		if !seenA[p] {
+			t.Errorf("manifest Widget/a: member %q never selected as a representative across 10 runs", p)
+		}
+	}
+	for _, p := range []string{"x", "y", "z"} {
+		if !seenB[p] {
+			t.Errorf("manifest Widget/b: member %q never selected as a representative across 10 runs", p)
+		}
 	}
 }

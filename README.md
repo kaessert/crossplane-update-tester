@@ -40,7 +40,7 @@ update-tester expect-skeleton <types.go> --kind <Kind> --field <field>
 update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
 update-tester resolve-recover <manifest.yaml> [--timeout 120]
 update-tester roundtrip-diff <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30]
-update-tester roundtrip-verify <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30] [--backend real|simulator]
+update-tester roundtrip-verify <m1.yaml,m2.yaml,...> --backend <real|simulator> [--root <dir>] [--timeout 30]
 update-tester hook <invocation-name> [--root <dir>] [--manifest <path>] [--skip-converge]
 update-tester version
 ```
@@ -650,6 +650,12 @@ checks every field the manifest's `crossplane.io/update-test` annotation
 `skip:`s against its own live row. It fails when a "must-test" field's
 waiver does not hold up.
 
+`--backend <real|simulator>` is required on every invocation, declaring
+whether the provider's E2E path runs against a live backend or a simulator
+(e.g. vcsim) with no real-backend arm at all — there is no default and no
+inference from a provider name, endpoint, or URL. See the `backend` /
+`seed` bullet below for how the declaration surfaces in the report.
+
 The must-test set is derived from the classification, not asserted by hand:
 
 - `equal` — the value round-trips faithfully. The only classification a
@@ -734,9 +740,9 @@ decision:
   disproves; the waiver is hiding a real deviation), or `no-row` (nothing
   to test against, or a confirmed legitimate exception — keep the waiver
   as is).
-- `backend` / `seed` — `backend` is empty unless the invocation declares
-  `--backend real` or `--backend simulator`; there is no default and no
-  inference from a provider name or endpoint. Every `cells` entry restates
+- `backend` / `seed` — `backend` restates the run's declared `--backend`
+  (`real` or `simulator`; the flag is required, with no default and no
+  inference from a provider name or endpoint). Every `cells` entry restates
   whether it was satisfied under a `simulator` declaration
   (`simulatorSatisfied`), so a reader never has to cross-reference the
   top-level field. `seed` is the pseudo-random rotation schedule's own

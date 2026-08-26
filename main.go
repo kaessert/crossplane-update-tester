@@ -48,7 +48,7 @@
 //	update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
 //	update-tester resolve-recover <manifest.yaml> [--timeout 120]
 //	update-tester roundtrip-diff <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30]
-//	update-tester roundtrip-verify <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30] [--backend real|simulator]
+//	update-tester roundtrip-verify <m1.yaml,m2.yaml,...> --backend <real|simulator> [--root <dir>] [--timeout 30]
 //	update-tester hook <invocation-name> [--root <dir>] [--manifest <path>] [--skip-converge]
 //	update-tester version
 package main
@@ -154,7 +154,7 @@ update-tester expect-skeleton <types.go> --kind <Kind> --field <field>
 update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
 update-tester resolve-recover <manifest.yaml> [--timeout 120]
 update-tester roundtrip-diff <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30]
-update-tester roundtrip-verify <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30] [--backend real|simulator]
+update-tester roundtrip-verify <m1.yaml,m2.yaml,...> --backend <real|simulator> [--root <dir>] [--timeout 30]
 update-tester hook <invocation-name> [--root <dir>] [--manifest <path>] [--skip-converge]
 update-tester version`
 
@@ -222,7 +222,9 @@ Commands:
              cell-denominator crediting, container-clear coverage (always
              advisory — never affects the exit code) and a waiver-bucket
              classification; --backend declares real or simulator
-             provenance for those additive fields and is optional.
+             provenance for those additive fields and is REQUIRED — there
+             is no default and no inference from a provider name or
+             endpoint.
   hook       Derive a manifest from the name this binary was invoked
              under and run the full post-assert sequence for it
   version    Print the version of the tool in use
@@ -1148,9 +1150,8 @@ type roundtripVerifyOptions struct {
 	root          string
 	timeout       int
 	// backend is the provider's DECLARED backend classification (see
-	// roundtrip.BackendType) — optional and empty by default, since no
-	// provider declares it yet. When set, it must parse against the closed
-	// set; there is no fallback that guesses one.
+	// roundtrip.BackendType) — REQUIRED, with no fallback that guesses
+	// one: omitting --backend is a parse error, never an assumption.
 	backend roundtrip.BackendType
 }
 
@@ -1158,22 +1159,28 @@ func parseRoundtripVerifyArgs(args []string) (roundtripVerifyOptions, error) {
 	fs := flag.NewFlagSet("roundtrip-verify", flag.ContinueOnError)
 	root := fs.String("root", "", "Provider repo root holding package/crds (default: working directory)")
 	timeout := fs.Int("timeout", 30, "Timeout in seconds for kubectl calls")
-	backend := fs.String("backend", "", "Declared backend classification for cell-denominator provenance: real or simulator (default: undeclared)")
+	backend := fs.String("backend", "", "REQUIRED. Declared backend classification for cell-denominator provenance: real or simulator")
 	if err := fs.Parse(cli.ReorderArgs(fs, args)); err != nil {
 		return roundtripVerifyOptions{}, err
 	}
 	if fs.NArg() < 1 {
 		return roundtripVerifyOptions{}, errors.New(
-			"usage: update-tester roundtrip-verify <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30] [--backend real|simulator]")
+			"usage: update-tester roundtrip-verify <m1.yaml,m2.yaml,...> --backend <real|simulator> [--root <dir>] [--timeout 30]")
 	}
 
-	var backendType roundtrip.BackendType
-	if *backend != "" {
-		parsed, err := roundtrip.ParseBackendType(*backend)
-		if err != nil {
-			return roundtripVerifyOptions{}, err
-		}
-		backendType = parsed
+	// --backend is REQUIRED, with no fallback that guesses: an undeclared
+	// provider is an error, never an assumption (roundtrip.ParseBackendType
+	// enforces the same closed set with no default, but this command must
+	// not even reach it with an empty string — that used to leave the
+	// backend silently unset and every cell-denominator report unable to
+	// distinguish a simulator-derived classification from a real one).
+	if *backend == "" {
+		return roundtripVerifyOptions{}, errors.New(
+			"roundtrip-verify: --backend is required (real or simulator) — it is never inferred from a provider name, endpoint, or URL")
+	}
+	backendType, err := roundtrip.ParseBackendType(*backend)
+	if err != nil {
+		return roundtripVerifyOptions{}, err
 	}
 
 	// Accept both a comma-separated list and repeated positional
@@ -1400,8 +1407,14 @@ func buildRoundtripVerifyReport(
 	var mustTestCount int
 	findings, mustTestCount, excluded = roundtrip.DenominatorReport(m, rows)
 
+	// scope identifies the manifest that produced rows, so the rotation
+	// cursor CreditCells advances is this manifest's own — never shared
+	// with another manifest that happens to produce the same CellKey (see
+	// roundtrip.GroupCells' own doc comment on why cell scope is settled
+	// at per-manifest, and stateKey for the cursor this feeds).
+	scope := m.Kind + "/" + m.Name
 	cells := roundtrip.GroupCells(rows)
-	credits, _ := roundtrip.CreditCells(cells, rotation)
+	credits, _ := roundtrip.CreditCells(cells, rotation, scope)
 
 	var clearFindings []roundtrip.ContainerClearFinding
 	if crd != nil {

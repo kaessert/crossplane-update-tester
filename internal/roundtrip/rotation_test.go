@@ -1,6 +1,7 @@
 package roundtrip
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -118,8 +119,10 @@ func TestRotationStateSaveThenLoadRoundTrips(t *testing.T) {
 
 	s := NewRotationState()
 	key := CellKey{Classification: ClassEqual, Shape: ShapeScalar, Direction: DirectionSet}
-	s.Cursors[key.String()] = 3
-	s.PromoteFailure(key, "region")
+	const scope = "Widget/example"
+	skey := stateKey(scope, key)
+	s.Cursors[skey] = 3
+	s.PromoteFailure(scope, key, "region")
 
 	if err := s.Save(path); err != nil {
 		t.Fatalf("Save(%q) = %v", path, err)
@@ -132,11 +135,11 @@ func TestRotationStateSaveThenLoadRoundTrips(t *testing.T) {
 	if loaded.Seed != s.Seed {
 		t.Errorf("loaded Seed = %d, want %d", loaded.Seed, s.Seed)
 	}
-	if loaded.Cursors[key.String()] != 3 {
-		t.Errorf("loaded cursor = %d, want 3", loaded.Cursors[key.String()])
+	if loaded.Cursors[skey] != 3 {
+		t.Errorf("loaded cursor = %d, want 3", loaded.Cursors[skey])
 	}
-	if !reflect.DeepEqual(loaded.Sticky[key.String()], []string{"region"}) {
-		t.Errorf("loaded sticky = %v, want [region]", loaded.Sticky[key.String()])
+	if !reflect.DeepEqual(loaded.Sticky[skey], []string{"region"}) {
+		t.Errorf("loaded sticky = %v, want [region]", loaded.Sticky[skey])
 	}
 }
 
@@ -148,6 +151,7 @@ func TestRotationStateSaveThenLoadRoundTrips(t *testing.T) {
 func TestSelectRotatesAcrossRunsWithoutRepeatingBeforeExhaustion(t *testing.T) {
 	members := []string{"a", "b", "c", "d", "e", "f", "g", "h"}
 	key := CellKey{Classification: ClassEqual, Shape: ShapeScalar, Direction: DirectionSet}
+	const scope = "Widget/example"
 	state := NewRotationState()
 
 	seenBeforeRepeat := map[string]bool{}
@@ -156,7 +160,7 @@ func TestSelectRotatesAcrossRunsWithoutRepeatingBeforeExhaustion(t *testing.T) {
 	runsNeeded := (len(members) + budget - 1) / budget
 
 	for run := 0; run < runsNeeded; run++ {
-		reps, _ := state.Select(key, members)
+		reps, _ := state.Select(scope, key, members)
 		if len(reps) != budget {
 			t.Fatalf("run %d: Select returned %d representatives, want %d", run, len(reps), budget)
 		}
@@ -176,17 +180,129 @@ func TestSelectRotatesAcrossRunsWithoutRepeatingBeforeExhaustion(t *testing.T) {
 	}
 }
 
+// TestSelectCursorsAreIndependentAcrossManifestsSharingACellKey is the
+// ticket's own required regression: this is the exact scenario that used
+// to starve 30-44% of every provider's equal-cell members. Two DIFFERENT
+// manifests (scopeA, scopeB) share one CellKey — the common case, since
+// most equal cells are scalars — with DIFFERENT member counts, so the old
+// single shared cursor advanced by each manifest's own budget modulo its
+// OWN size, corrupting the other's position. After scoping, each manifest
+// converges to full coverage of its OWN members, independent of the
+// other's size or how many times it has run.
+func TestSelectCursorsAreIndependentAcrossManifestsSharingACellKey(t *testing.T) {
+	key := CellKey{Classification: ClassEqual, Shape: ShapeScalar, Direction: DirectionSet}
+	const scopeA = "Widget/cluster-example"
+	const scopeB = "Widget/namespaced-example"
+	membersA := []string{"a0", "a1"}                   // size 2 — the ticket's own minimal case
+	membersB := []string{"b0", "b1", "b2", "b3", "b4"} // size 5, deliberately different
+
+	state := NewRotationState()
+
+	seenA := map[string]bool{}
+	seenB := map[string]bool{}
+	// 50 runs each — far beyond either cell's own convergence bound — to
+	// match the ticket's own >=50-run replay requirement.
+	for run := 0; run < 50; run++ {
+		repsA, _ := state.Select(scopeA, key, membersA)
+		for _, m := range repsA {
+			seenA[m] = true
+		}
+		repsB, _ := state.Select(scopeB, key, membersB)
+		for _, m := range repsB {
+			seenB[m] = true
+		}
+	}
+
+	for _, m := range membersA {
+		if !seenA[m] {
+			t.Errorf("manifest A (scope %q): member %q was never selected across 50 runs — starvation", scopeA, m)
+		}
+	}
+	for _, m := range membersB {
+		if !seenB[m] {
+			t.Errorf("manifest B (scope %q): member %q was never selected across 50 runs — starvation", scopeB, m)
+		}
+	}
+
+	// The two manifests' cursors must be stored under different keys —
+	// asserted directly, not just inferred from coverage above.
+	if stateKey(scopeA, key) == stateKey(scopeB, key) {
+		t.Fatalf("stateKey collided for two different scopes sharing a CellKey: %q", stateKey(scopeA, key))
+	}
+}
+
+// TestSelectManifestScopingReproducesFleetCellSizes replays the rotation
+// against every provider's own largest measured equal-cell size (vultr 72,
+// infobloxnios 64, tailscale 44, f5xc 42, vsphere 24, lambda 12,
+// vclustercli 5), each as its OWN manifest scope sharing one CellKey,
+// simultaneously, across 60 runs — reproducing the reviewer's 200-run
+// replay methodology at a smaller but still-conclusive run count. Before
+// the cursor-scoping fix, this exact configuration is what measured
+// 30-44% of members never selected; after it, every provider's full
+// member set must be covered.
+func TestSelectManifestScopingReproducesFleetCellSizes(t *testing.T) {
+	key := CellKey{Classification: ClassEqual, Shape: ShapeScalar, Direction: DirectionSet}
+	providers := map[string]int{
+		"vultr":        72,
+		"infobloxnios": 64,
+		"tailscale":    44,
+		"f5xc":         42,
+		"vsphere":      24,
+		"lambda":       12,
+		"vclustercli":  5,
+	}
+
+	membersByProvider := map[string][]string{}
+	for provider, size := range providers {
+		members := make([]string, size)
+		for i := range members {
+			members[i] = fmt.Sprintf("%s-field-%d", provider, i)
+		}
+		membersByProvider[provider] = members
+	}
+
+	state := NewRotationState()
+	seen := map[string]map[string]bool{}
+	for provider := range providers {
+		seen[provider] = map[string]bool{}
+	}
+
+	for run := 0; run < 60; run++ {
+		for provider, members := range membersByProvider {
+			scope := provider + "/example"
+			reps, _ := state.Select(scope, key, members)
+			for _, m := range reps {
+				seen[provider][m] = true
+			}
+		}
+	}
+
+	for provider, members := range membersByProvider {
+		var neverSelected []string
+		for _, m := range members {
+			if !seen[provider][m] {
+				neverSelected = append(neverSelected, m)
+			}
+		}
+		if len(neverSelected) != 0 {
+			t.Errorf("provider %s: %d/%d members never selected across 60 runs (want 0): %v",
+				provider, len(neverSelected), len(members), neverSelected)
+		}
+	}
+}
+
 // TestSelectAlwaysIncludesStickyMembers confirms a promoted field is
 // selected on every subsequent call regardless of where the rotation
 // cursor happens to be.
 func TestSelectAlwaysIncludesStickyMembers(t *testing.T) {
 	members := []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
 	key := CellKey{Classification: ClassEqual, Shape: ShapeScalar, Direction: DirectionSet}
+	const scope = "Widget/example"
 	state := NewRotationState()
-	state.PromoteFailure(key, "e")
+	state.PromoteFailure(scope, key, "e")
 
 	for run := 0; run < 5; run++ {
-		reps, sticky := state.Select(key, members)
+		reps, sticky := state.Select(scope, key, members)
 		found := false
 		for _, r := range reps {
 			if r == "e" {
@@ -207,14 +323,31 @@ func TestSelectAlwaysIncludesStickyMembers(t *testing.T) {
 func TestPromoteFailureIsIdempotent(t *testing.T) {
 	state := NewRotationState()
 	key := CellKey{Classification: ClassEqual, Shape: ShapeScalar, Direction: DirectionSet}
-	state.PromoteFailure(key, "region")
-	state.PromoteFailure(key, "region")
-	state.PromoteFailure(key, "az")
+	const scope = "Widget/example"
+	state.PromoteFailure(scope, key, "region")
+	state.PromoteFailure(scope, key, "region")
+	state.PromoteFailure(scope, key, "az")
 
-	got := append([]string(nil), state.Sticky[key.String()]...)
+	got := append([]string(nil), state.Sticky[stateKey(scope, key)]...)
 	sort.Strings(got)
 	if !reflect.DeepEqual(got, []string{"az", "region"}) {
 		t.Errorf("Sticky = %v, want [az region] with no duplicate", got)
+	}
+}
+
+// TestPromoteFailureIsScopedPerManifest confirms a field promoted sticky
+// for one manifest does not leak into another manifest that shares the
+// same CellKey — the same manifest-identity requirement Select carries.
+func TestPromoteFailureIsScopedPerManifest(t *testing.T) {
+	state := NewRotationState()
+	key := CellKey{Classification: ClassEqual, Shape: ShapeScalar, Direction: DirectionSet}
+	state.PromoteFailure("Widget/a", key, "region")
+
+	if got := state.Sticky[stateKey("Widget/b", key)]; len(got) != 0 {
+		t.Errorf("Sticky for scope Widget/b = %v, want empty — a promotion for Widget/a leaked across scopes", got)
+	}
+	if got := state.Sticky[stateKey("Widget/a", key)]; !reflect.DeepEqual(got, []string{"region"}) {
+		t.Errorf("Sticky for scope Widget/a = %v, want [region]", got)
 	}
 }
 
@@ -224,9 +357,9 @@ func TestPromoteFailureIsIdempotent(t *testing.T) {
 func TestSelectOnEmptyMembersReturnsNothing(t *testing.T) {
 	state := NewRotationState()
 	key := CellKey{Classification: ClassEqual, Shape: ShapeScalar, Direction: DirectionSet}
-	reps, sticky := state.Select(key, nil)
+	reps, sticky := state.Select("Widget/example", key, nil)
 	if reps != nil || sticky != nil {
-		t.Errorf("Select(key, nil) = %v, %v, want nil, nil", reps, sticky)
+		t.Errorf("Select(scope, key, nil) = %v, %v, want nil, nil", reps, sticky)
 	}
 }
 

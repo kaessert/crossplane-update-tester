@@ -19,7 +19,7 @@ type CellCredit struct {
 }
 
 // CreditCells applies representative crediting to cells and advances
-// state's rotation cursors. Only an `equal` cell collapses to a
+// state's rotation cursors for scope. Only an `equal` cell collapses to a
 // representative — value-changed, defaulted-by-server and
 // present-in-spec-absent-from-mirror members are returned untouched in
 // nonEqual, because each of those must be tested and reported
@@ -29,7 +29,13 @@ type CellCredit struct {
 // present-in-mirror-absent-from-spec never appears in cells at all (see
 // GroupCells), and no cell here ever has Direction != DirectionSet, since
 // GroupCells never produces one.
-func CreditCells(cells map[CellKey][]Row, state *RotationState) (credits []CellCredit, nonEqual map[CellKey][]Row) {
+//
+// scope MUST identify the manifest cells was grouped from (GroupCells'
+// doc comment settles cell membership at per-manifest scope) — it is
+// threaded straight into state.Select so a second manifest that produces
+// the same CellKey rotates independently rather than sharing state's
+// cursor (see stateKey).
+func CreditCells(cells map[CellKey][]Row, state *RotationState, scope string) (credits []CellCredit, nonEqual map[CellKey][]Row) {
 	nonEqual = make(map[CellKey][]Row)
 	for key, rows := range cells {
 		if key.Classification != ClassEqual {
@@ -38,7 +44,7 @@ func CreditCells(cells map[CellKey][]Row, state *RotationState) (credits []CellC
 		}
 
 		members := sortedPaths(rows)
-		reps, sticky := state.Select(key, members)
+		reps, sticky := state.Select(scope, key, members)
 
 		repSet := make(map[string]bool, len(reps))
 		for _, m := range reps {

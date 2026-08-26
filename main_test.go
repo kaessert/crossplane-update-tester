@@ -892,9 +892,9 @@ func TestFlagAfterPositionalTakesEffect(t *testing.T) {
 
 	t.Run("RoundtripVerify", func(t *testing.T) {
 		for _, args := range [][]string{
-			{"--root", "/repo", "--timeout", "45", path},
-			{path, "--root", "/repo", "--timeout", "45"},
-			{path, "--timeout=45", "--root=/repo"},
+			{"--root", "/repo", "--timeout", "45", "--backend", "real", path},
+			{path, "--root", "/repo", "--timeout", "45", "--backend", "real"},
+			{path, "--timeout=45", "--root=/repo", "--backend=real"},
 		} {
 			got, err := parseRoundtripVerifyArgs(args)
 			if err != nil {
@@ -1548,7 +1548,7 @@ func TestParseRoundtripVerifyArgsDefaultsRootToWorkingDirectory(t *testing.T) {
 		t.Fatalf("os.Getwd: %v", err)
 	}
 
-	got, err := parseRoundtripVerifyArgs([]string{"manifest.yaml"})
+	got, err := parseRoundtripVerifyArgs([]string{"--backend", "real", "manifest.yaml"})
 	if err != nil {
 		t.Fatalf("parseRoundtripVerifyArgs: %v", err)
 	}
@@ -1564,7 +1564,7 @@ func TestParseRoundtripVerifyArgsDefaultsRootToWorkingDirectory(t *testing.T) {
 func TestParseRoundtripVerifyArgsAcceptsCommaSeparatedManifests(t *testing.T) {
 	want := []string{"a.yaml", "b.yaml", "c.yaml"}
 
-	commaJoined, err := parseRoundtripVerifyArgs([]string{"--root", "/repo", "a.yaml,b.yaml,c.yaml"})
+	commaJoined, err := parseRoundtripVerifyArgs([]string{"--root", "/repo", "--backend", "real", "a.yaml,b.yaml,c.yaml"})
 	if err != nil {
 		t.Fatalf("parseRoundtripVerifyArgs (comma-joined): %v", err)
 	}
@@ -1572,7 +1572,7 @@ func TestParseRoundtripVerifyArgsAcceptsCommaSeparatedManifests(t *testing.T) {
 		t.Errorf("manifestPaths (comma-joined) = %#v, want %#v", commaJoined.manifestPaths, want)
 	}
 
-	repeated, err := parseRoundtripVerifyArgs([]string{"--root", "/repo", "a.yaml", "b.yaml", "c.yaml"})
+	repeated, err := parseRoundtripVerifyArgs([]string{"--root", "/repo", "--backend", "real", "a.yaml", "b.yaml", "c.yaml"})
 	if err != nil {
 		t.Fatalf("parseRoundtripVerifyArgs (repeated positional): %v", err)
 	}
@@ -1589,7 +1589,7 @@ func TestParseRoundtripVerifyArgsAcceptsCommaSeparatedManifests(t *testing.T) {
 // "verified, and every waiver held up" — the one outcome this command must
 // never claim without evidence.
 func TestCmdRoundtripVerifyNoResourcesProducedIsAnError(t *testing.T) {
-	err := cmdRoundtripVerify([]string{"--root", "/repo", "/does/not/exist/a.yaml,/does/not/exist/b.yaml"})
+	err := cmdRoundtripVerify([]string{"--root", "/repo", "--backend", "real", "/does/not/exist/a.yaml,/does/not/exist/b.yaml"})
 	if err == nil {
 		t.Fatal("cmdRoundtripVerify with only unparseable manifests returned nil, want an error")
 	}
@@ -1632,16 +1632,12 @@ func TestToRoundtripVerifyRowJSONAndFindingJSON(t *testing.T) {
 	}
 }
 
-// TestParseRoundtripVerifyArgsBackendFlag confirms --backend is optional
-// (omitting it must not error, since no provider declares it yet) and,
+// TestParseRoundtripVerifyArgsBackendFlag confirms --backend is REQUIRED
+// (omitting it is a non-zero-exit parse error, never an assumption) and,
 // when present, is validated against the closed set with no fallback.
 func TestParseRoundtripVerifyArgsBackendFlag(t *testing.T) {
-	withoutFlag, err := parseRoundtripVerifyArgs([]string{"--root", "/repo", "a.yaml"})
-	if err != nil {
-		t.Fatalf("parseRoundtripVerifyArgs without --backend: %v", err)
-	}
-	if withoutFlag.backend != "" {
-		t.Errorf("backend = %q, want empty (undeclared) when --backend is omitted", withoutFlag.backend)
+	if _, err := parseRoundtripVerifyArgs([]string{"--root", "/repo", "a.yaml"}); err == nil {
+		t.Error("parseRoundtripVerifyArgs without --backend accepted, want a non-zero exit — an undeclared provider must be an error, not an assumption")
 	}
 
 	withReal, err := parseRoundtripVerifyArgs([]string{"--root", "/repo", "--backend", "real", "a.yaml"})
@@ -1662,6 +1658,10 @@ func TestParseRoundtripVerifyArgsBackendFlag(t *testing.T) {
 
 	if _, err := parseRoundtripVerifyArgs([]string{"--root", "/repo", "--backend", "vcenter", "a.yaml"}); err == nil {
 		t.Error("parseRoundtripVerifyArgs --backend vcenter accepted an undeclared value, want an error")
+	}
+
+	if _, err := parseRoundtripVerifyArgs([]string{"--root", "/repo", "--backend", "", "a.yaml"}); err == nil {
+		t.Error("parseRoundtripVerifyArgs --backend '' (explicitly empty) accepted, want an error")
 	}
 }
 

@@ -660,7 +660,19 @@ The must-test set is derived from the classification, not asserted by hand:
   the mirror by definition, which already disproves a write-only claim.
 - `present-in-spec-absent-from-mirror` — the client set it, the mirror never
   reports it. Must be tested, or waived `skip: {reason: write-only}` — this
-  is the one row shape that reason's claim is checked against.
+  is the one row shape that reason's claim is checked against. **Exception:**
+  a field the served CRD declares CEL-immutable (an
+  `x-kubernetes-validations` rule matching `self == oldSelf`, on the field's
+  own schema node or inherited from an ancestor object node whose whole
+  subtree is marked immutable) is removed from the must-test set entirely —
+  a write-only-shaped field the backend can never echo back, by
+  construction, forever, so demanding a live update assertion for it would
+  be a false positive. It is reported under its own `immutable (excluded)`
+  status, in both the JSON `excluded` array and the human-readable render,
+  never silently dropped and never counted as a `skip:` waiver. A `skip:`
+  entry against such a field — of ANY reason — is accepted without needing
+  to be `write-only`, because the field was never in the denominator to
+  begin with.
 - `present-in-mirror-absent-from-spec` — not a spec field at all, so it is
   never part of the denominator.
 - **No row at all** (the field was never populated on either side of the
@@ -675,18 +687,25 @@ The must-test set is derived from the classification, not asserted by hand:
   `evidence:` + `ticket:`, or `ticket:`) resolved elsewhere (see `validate`'s
   `skip: reasons` checks below).
 
+CEL-immutability never excuses `value-changed` or `defaulted-by-server`: a
+backend that changes or defaults a field the CRD declares immutable is a
+contradiction the tool exists to catch, not a reason to excuse it, so those
+two classifications stay in the must-test set and stay eligible to become a
+finding — immutable or not.
+
 A field with no `skip:` entry at all is untouched by this command: direct
 testing is already proven by `run`, and a field neither tested nor skipped
 is already reported `MISSING` by `validate`.
 
 Each manifest's report is printed as one JSON object per line — `kind`,
 `name`, every row (`path`, `classification`, `specFound`/`specValue`,
-`mirrorFound`/`mirrorValue`), the must-test set size, and every unresolved
-finding — followed by a human-readable rendering of the same must-test size
-and findings. The report is emitted for every manifest this command can
-reach a live object for, whether or not any finding turns up: the JSON line
-is never conditioned on failure, unlike `converge-all`'s advisory inline
-report.
+`mirrorFound`/`mirrorValue`, and `immutable` when the field is
+CEL-immutable), the must-test set size, every excluded (CEL-immutable)
+field, and every unresolved finding — followed by a human-readable
+rendering of the same must-test size, excluded fields, and findings. The
+report is emitted for every manifest this command can reach a live object
+for, whether or not any finding turns up: the JSON line is never
+conditioned on failure, unlike `converge-all`'s advisory inline report.
 
 Like `roundtrip-diff`, this command is entirely read-only.
 

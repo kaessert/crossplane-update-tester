@@ -109,7 +109,7 @@ func TestDenominatorReportClassificationVerdicts(t *testing.T) {
 					{Field: tc.field, Skip: tc.skip},
 				},
 			}
-			findings, _ := DenominatorReport(m, []Row{tc.row})
+			findings, _, _ := DenominatorReport(m, []Row{tc.row})
 			got := findingsContain(findings, wantFinding{field: tc.field, classification: tc.row.Classification})
 			if got != tc.wantErr {
 				t.Errorf("DenominatorReport finding for %q = %v, want %v (findings: %+v)", tc.field, got, tc.wantErr, findings)
@@ -154,7 +154,7 @@ func TestDenominatorReportNoRow(t *testing.T) {
 				},
 			}
 			// No rows at all — "neverSet" is not observed on either side.
-			findings, mustTestCount := DenominatorReport(m, nil)
+			findings, mustTestCount, _ := DenominatorReport(m, nil)
 			if mustTestCount != 0 {
 				t.Errorf("mustTestCount = %d, want 0 (no rows at all)", mustTestCount)
 			}
@@ -181,7 +181,7 @@ func TestDenominatorReportDirectlyTestedFieldNeverFlagged(t *testing.T) {
 	rows := []Row{
 		{Path: "priority", Classification: ClassValueChanged, SpecFound: true, SpecValue: 5, MirrorFound: true, MirrorValue: 6},
 	}
-	findings, mustTestCount := DenominatorReport(m, rows)
+	findings, mustTestCount, _ := DenominatorReport(m, rows)
 	if len(findings) != 0 {
 		t.Errorf("findings = %+v, want none — a directly-tested field carries no skip: to resolve", findings)
 	}
@@ -203,7 +203,7 @@ func TestDenominatorReportMustTestCount(t *testing.T) {
 		{Path: "e", Classification: ClassPresentInMirrorAbsentFromSpec, MirrorFound: true, MirrorValue: "srv"},
 	}
 	m := &manifest.Manifest{Kind: "Widget", Name: "example"}
-	_, mustTestCount := DenominatorReport(m, rows)
+	_, mustTestCount, _ := DenominatorReport(m, rows)
 	if mustTestCount != 3 {
 		t.Errorf("mustTestCount = %d, want 3 (b, c, d — a is equal, e is mirror-only)", mustTestCount)
 	}
@@ -228,7 +228,7 @@ func TestDenominatorReportFalsePositiveArm(t *testing.T) {
 			{Field: "tags", Skip: manifest.SkipInfo{Reason: manifest.SkipUnionArm, Sibling: "other"}},
 		},
 	}
-	findings, mustTestCount := DenominatorReport(m, rows)
+	findings, mustTestCount, _ := DenominatorReport(m, rows)
 	if len(findings) != 0 {
 		t.Errorf("findings = %+v, want none — every row is a known-good full mirror (equal)", findings)
 	}
@@ -251,7 +251,7 @@ func TestDenominatorReportFindingDetailNamesBothValues(t *testing.T) {
 	rows := []Row{
 		{Path: "priority", Classification: ClassValueChanged, SpecFound: true, SpecValue: 1, MirrorFound: true, MirrorValue: 2},
 	}
-	findings, _ := DenominatorReport(m, rows)
+	findings, _, _ := DenominatorReport(m, rows)
 	if len(findings) != 1 {
 		t.Fatalf("findings = %+v, want exactly 1", findings)
 	}
@@ -270,7 +270,7 @@ func TestPrintDenominatorFindingsStatesTheEqualRule(t *testing.T) {
 	printFn := func(format string, args ...interface{}) {
 		fmt.Fprintf(&out, format, args...)
 	}
-	PrintDenominatorFindings(printFn, 0, nil)
+	PrintDenominatorFindings(printFn, 0, nil, nil)
 	got := out.String()
 	if !strings.Contains(got, "equal is the only classification") {
 		t.Errorf("report = %q, want it to state that equal is the only classification making a waiver cheap", got)
@@ -291,7 +291,7 @@ func TestPrintDenominatorFindingsListsEveryFinding(t *testing.T) {
 		{Field: "priority", Classification: ClassValueChanged, Detail: "must be tested"},
 		{Field: "privateKey", Classification: ClassPresentInSpecAbsentFromMirror, Detail: "must be tested, or waived write-only"},
 	}
-	PrintDenominatorFindings(printFn, 2, findings)
+	PrintDenominatorFindings(printFn, 2, findings, nil)
 	got := out.String()
 	for _, f := range findings {
 		if !strings.Contains(got, f.Field) {
@@ -327,7 +327,7 @@ func TestDenominatorReportAgainstRealF5xcFixtures(t *testing.T) {
 		m := &manifest.Manifest{Tests: []manifest.UpdateTest{
 			{Field: "allowAllResponseCodes", Skip: manifest.SkipInfo{Reason: manifest.SkipWriteOnly}},
 		}}
-		findings, _ := DenominatorReport(m, rows)
+		findings, _, _ := DenominatorReport(m, rows)
 		if len(findings) != 0 {
 			t.Errorf("findings = %+v, want none — write-only is confirmed by this real present-in-spec-absent-from-mirror row", findings)
 		}
@@ -337,7 +337,7 @@ func TestDenominatorReportAgainstRealF5xcFixtures(t *testing.T) {
 		m := &manifest.Manifest{Tests: []manifest.UpdateTest{
 			{Field: "allowAllResponseCodes", Skip: manifest.LegacySkip("assumed write-only")},
 		}}
-		findings, _ := DenominatorReport(m, rows)
+		findings, _, _ := DenominatorReport(m, rows)
 		if !findingsContain(findings, wantFinding{field: "allowAllResponseCodes", classification: ClassPresentInSpecAbsentFromMirror}) {
 			t.Errorf("findings = %+v, want a finding for allowAllResponseCodes — a free-prose skip: is not write-only", findings)
 		}
@@ -347,14 +347,14 @@ func TestDenominatorReportAgainstRealF5xcFixtures(t *testing.T) {
 		m := &manifest.Manifest{Tests: []manifest.UpdateTest{
 			{Field: "description", Skip: manifest.LegacySkip("low value")},
 		}}
-		findings, _ := DenominatorReport(m, rows)
+		findings, _, _ := DenominatorReport(m, rows)
 		if len(findings) != 0 {
 			t.Errorf("findings = %+v, want none — description is a real equal row", findings)
 		}
 	})
 
 	t.Run("MustTestSetSizeMatchesTheMeasuredFigure", func(t *testing.T) {
-		_, mustTestCount := DenominatorReport(&manifest.Manifest{}, rows)
+		_, mustTestCount, _ := DenominatorReport(&manifest.Manifest{}, rows)
 		if mustTestCount != 4 {
 			t.Errorf("mustTestCount = %d, want 4 (this fixture's measured must-test set: 4 present-in-spec-absent-from-mirror, 0 value-changed/defaulted-by-server)", mustTestCount)
 		}
@@ -378,7 +378,7 @@ func TestDenominatorReportAgainstRealHttpLoadbalancerFixture(t *testing.T) {
 	}
 
 	t.Run("MustTestSetSizeMatchesTheMeasuredFigure", func(t *testing.T) {
-		_, mustTestCount := DenominatorReport(&manifest.Manifest{}, rows)
+		_, mustTestCount, _ := DenominatorReport(&manifest.Manifest{}, rows)
 		if mustTestCount != 4 {
 			t.Errorf("mustTestCount = %d, want 4 (this fixture's measured must-test set: 3 defaulted-by-server, 1 value-changed)", mustTestCount)
 		}
@@ -391,7 +391,7 @@ func TestDenominatorReportAgainstRealHttpLoadbalancerFixture(t *testing.T) {
 		m := &manifest.Manifest{Tests: []manifest.UpdateTest{
 			{Field: "corsPolicy.allowHeaders", Skip: manifest.SkipInfo{Reason: manifest.SkipWriteOnly}},
 		}}
-		findings, _ := DenominatorReport(m, rows)
+		findings, _, _ := DenominatorReport(m, rows)
 		if !findingsContain(findings, wantFinding{field: "corsPolicy.allowHeaders", classification: ClassDefaultedByServer}) {
 			t.Errorf("findings = %+v, want a REJECTED finding for corsPolicy.allowHeaders — this field IS mirrored, write-only cannot rescue defaulted-by-server", findings)
 		}
@@ -404,9 +404,202 @@ func TestDenominatorReportAgainstRealHttpLoadbalancerFixture(t *testing.T) {
 		m := &manifest.Manifest{Tests: []manifest.UpdateTest{
 			{Field: "protectedCookies", Skip: manifest.SkipInfo{Reason: manifest.SkipWriteOnly}},
 		}}
-		findings, _ := DenominatorReport(m, rows)
+		findings, _, _ := DenominatorReport(m, rows)
 		if !findingsContain(findings, wantFinding{field: "protectedCookies", classification: ClassValueChanged}) {
 			t.Errorf("findings = %+v, want a REJECTED finding for protectedCookies — this field IS mirrored, write-only cannot rescue value-changed", findings)
 		}
 	})
+}
+
+// ─── immutable-field exclusion (UTV-TOOL-IMMUT) ────────────────────────────
+//
+// The tests below cross every must-test classification with Row.Immutable,
+// confirming: (1) an immutable present-in-spec-absent-from-mirror row is
+// excluded from mustTestCount, produces no MustTestFinding regardless of
+// skip: reason, and is reported once via excluded; (2) an immutable
+// value-changed/defaulted-by-server row is NEVER excluded — the
+// contradiction stays in mustTestCount and stays a finding, exactly as the
+// mutable case behaves; and (3) an ordinary MUTABLE row (Row.Immutable
+// false, the zero value every pre-existing test in this file already uses)
+// is completely unaffected, proving the exclusion is opt-in per row and not
+// a behavior change for the fleet's non-immutable fields.
+
+// TestDenominatorReportImmutableClassificationVerdicts is
+// TestDenominatorReportClassificationVerdicts' own table, crossed with
+// Row.Immutable, so every (classification, immutable) combination this
+// ticket's Test Plan calls for is exercised in one place.
+func TestDenominatorReportImmutableClassificationVerdicts(t *testing.T) {
+	cases := map[string]struct {
+		field       string
+		row         Row
+		skip        manifest.SkipInfo
+		wantFinding bool
+		wantExclude bool
+	}{
+		"immutable present-in-spec-absent-from-mirror with write-only skip is excluded, not merely confirmed": {
+			field:       "reusable",
+			row:         Row{Path: "reusable", Classification: ClassPresentInSpecAbsentFromMirror, SpecFound: true, SpecValue: true, Immutable: true},
+			skip:        manifest.SkipInfo{Reason: manifest.SkipWriteOnly},
+			wantFinding: false,
+			wantExclude: true,
+		},
+		"immutable present-in-spec-absent-from-mirror with legacy skip is ALSO excluded — immutability needs no waiver at all": {
+			field:       "reusable",
+			row:         Row{Path: "reusable", Classification: ClassPresentInSpecAbsentFromMirror, SpecFound: true, SpecValue: true, Immutable: true},
+			skip:        manifest.LegacySkip("no update API endpoint; changing requires ForceNew (recreation)"),
+			wantFinding: false,
+			wantExclude: true,
+		},
+		"immutable present-in-spec-absent-from-mirror with vendor-defect skip is STILL excluded — the exclusion does not depend on the skip: reason at all": {
+			field:       "reusable",
+			row:         Row{Path: "reusable", Classification: ClassPresentInSpecAbsentFromMirror, SpecFound: true, SpecValue: true, Immutable: true},
+			skip:        manifest.SkipInfo{Reason: manifest.SkipVendorDefect, Evidence: "e", Ticket: "t"},
+			wantFinding: false,
+			wantExclude: true,
+		},
+		"immutable value-changed with legacy skip is a finding — the contradiction arm, immutability excuses nothing here": {
+			field:       "priority",
+			row:         Row{Path: "priority", Classification: ClassValueChanged, SpecFound: true, SpecValue: 1, MirrorFound: true, MirrorValue: 2, Immutable: true},
+			skip:        manifest.LegacySkip("looked stable in manual testing"),
+			wantFinding: true,
+			wantExclude: false,
+		},
+		"immutable value-changed with write-only skip is REJECTED — same contradiction arm, write-only cannot rescue it either": {
+			field:       "priority",
+			row:         Row{Path: "priority", Classification: ClassValueChanged, SpecFound: true, SpecValue: 1, MirrorFound: true, MirrorValue: 2, Immutable: true},
+			skip:        manifest.SkipInfo{Reason: manifest.SkipWriteOnly},
+			wantFinding: true,
+			wantExclude: false,
+		},
+		"immutable defaulted-by-server with vendor-defect skip is a finding — the contradiction arm": {
+			field:       "region",
+			row:         Row{Path: "region", Classification: ClassDefaultedByServer, SpecFound: false, MirrorFound: true, MirrorValue: "us-east", Immutable: true},
+			skip:        manifest.SkipInfo{Reason: manifest.SkipVendorDefect, Evidence: "backend always defaults it", Ticket: "TICK-1"},
+			wantFinding: true,
+			wantExclude: false,
+		},
+		"immutable equal with legacy skip is still the cheap path — immutability is irrelevant once the row is equal": {
+			field:       "description",
+			row:         Row{Path: "description", Classification: ClassEqual, SpecFound: true, SpecValue: "x", MirrorFound: true, MirrorValue: "x", Immutable: true},
+			skip:        manifest.LegacySkip("low value"),
+			wantFinding: false,
+			wantExclude: false,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			m := &manifest.Manifest{
+				Kind: "TailnetKey",
+				Name: "example",
+				Tests: []manifest.UpdateTest{
+					{Field: tc.field, Skip: tc.skip},
+				},
+			}
+			findings, _, excluded := DenominatorReport(m, []Row{tc.row})
+			gotFinding := findingsContain(findings, wantFinding{field: tc.field, classification: tc.row.Classification})
+			if gotFinding != tc.wantFinding {
+				t.Errorf("finding for %q = %v, want %v (findings: %+v)", tc.field, gotFinding, tc.wantFinding, findings)
+			}
+			gotExclude := false
+			for _, e := range excluded {
+				if e.Field == tc.field {
+					gotExclude = true
+				}
+			}
+			if gotExclude != tc.wantExclude {
+				t.Errorf("excluded for %q = %v, want %v (excluded: %+v)", tc.field, gotExclude, tc.wantExclude, excluded)
+			}
+		})
+	}
+}
+
+// TestDenominatorReportImmutableMustTestCountExcludesOnlyPresentInSpecAbsentFromMirror
+// mirrors TestDenominatorReportMustTestCount but marks every row immutable,
+// confirming ONLY the present-in-spec-absent-from-mirror row (b) drops out
+// of mustTestCount — the value-changed and defaulted-by-server rows (c, d)
+// stay counted exactly as they would on a mutable field, per the ticket's
+// "two arms, not one" requirement.
+func TestDenominatorReportImmutableMustTestCountExcludesOnlyPresentInSpecAbsentFromMirror(t *testing.T) {
+	rows := []Row{
+		{Path: "a", Classification: ClassEqual, SpecFound: true, SpecValue: 1, MirrorFound: true, MirrorValue: 1, Immutable: true},
+		{Path: "b", Classification: ClassValueChanged, SpecFound: true, SpecValue: 1, MirrorFound: true, MirrorValue: 2, Immutable: true},
+		{Path: "c", Classification: ClassDefaultedByServer, MirrorFound: true, MirrorValue: "x", Immutable: true},
+		{Path: "d", Classification: ClassPresentInSpecAbsentFromMirror, SpecFound: true, SpecValue: "secret", Immutable: true},
+		{Path: "e", Classification: ClassPresentInMirrorAbsentFromSpec, MirrorFound: true, MirrorValue: "srv"},
+	}
+	m := &manifest.Manifest{Kind: "Widget", Name: "example"}
+	_, mustTestCount, excluded := DenominatorReport(m, rows)
+	if mustTestCount != 2 {
+		t.Errorf("mustTestCount = %d, want 2 (b, c stay counted — value-changed/defaulted-by-server are never excluded by immutability; d is excluded, a is equal, e is mirror-only)", mustTestCount)
+	}
+	if len(excluded) != 1 || excluded[0].Field != "d" {
+		t.Errorf("excluded = %+v, want exactly one entry for field \"d\"", excluded)
+	}
+}
+
+// TestDenominatorReportMutableFieldsUnaffectedByImmutableLogic confirms
+// Row.Immutable false (the zero value, and what every fixture-derived row
+// in TestDenominatorReportAgainstRealF5xcFixtures/HttpLoadbalancer already
+// carries, since neither fixture has a CEL marker) behaves identically to
+// this file's pre-existing assertions — the immutable exclusion is strictly
+// additive for a mutable field, never a behavior change.
+func TestDenominatorReportMutableFieldsUnaffectedByImmutableLogic(t *testing.T) {
+	row := Row{Path: "privateKey", Classification: ClassPresentInSpecAbsentFromMirror, SpecFound: true, SpecValue: "secret"}
+	if row.Immutable {
+		t.Fatal("test setup: row.Immutable must be false (the zero value) for this test to prove anything")
+	}
+	m := &manifest.Manifest{Tests: []manifest.UpdateTest{
+		{Field: "privateKey", Skip: manifest.LegacySkip("assumed write-only")},
+	}}
+	findings, mustTestCount, excluded := DenominatorReport(m, []Row{row})
+	if !findingsContain(findings, wantFinding{field: "privateKey", classification: ClassPresentInSpecAbsentFromMirror}) {
+		t.Errorf("findings = %+v, want a finding — a mutable field's legacy skip: is not write-only, immutable or not", findings)
+	}
+	if mustTestCount != 1 {
+		t.Errorf("mustTestCount = %d, want 1 — a mutable present-in-spec-absent-from-mirror row is never excluded", mustTestCount)
+	}
+	if len(excluded) != 0 {
+		t.Errorf("excluded = %+v, want none — exclusion only ever applies to an immutable row", excluded)
+	}
+}
+
+// TestDenominatorReportExcludedDetailNamesTheImmutableStatus confirms an
+// ExcludedFinding's Detail carries the same "immutable (excluded)"
+// vocabulary validator.statusOrder already uses for the Go-types side of
+// this concept, per AC3's requirement that the exclusion be visibly
+// distinct, not silently dropped.
+func TestDenominatorReportExcludedDetailNamesTheImmutableStatus(t *testing.T) {
+	row := Row{Path: "reusable", Classification: ClassPresentInSpecAbsentFromMirror, SpecFound: true, SpecValue: true, Immutable: true}
+	m := &manifest.Manifest{Tests: []manifest.UpdateTest{
+		{Field: "reusable", Skip: manifest.SkipInfo{Reason: manifest.SkipWriteOnly}},
+	}}
+	_, _, excluded := DenominatorReport(m, []Row{row})
+	if len(excluded) != 1 {
+		t.Fatalf("excluded = %+v, want exactly 1", excluded)
+	}
+	if !strings.Contains(excluded[0].Detail, immutableExcludedStatus) {
+		t.Errorf("excluded[0].Detail = %q, want it to contain %q", excluded[0].Detail, immutableExcludedStatus)
+	}
+}
+
+// TestPrintDenominatorFindingsListsExcludedFields confirms an excluded
+// field reaches the printed report AND never triggers the FAIL line —
+// excluded is advisory, unlike findings.
+func TestPrintDenominatorFindingsListsExcludedFields(t *testing.T) {
+	var out strings.Builder
+	printFn := func(format string, args ...interface{}) {
+		fmt.Fprintf(&out, format, args...)
+	}
+	excluded := []ExcludedFinding{
+		{Field: "reusable", Classification: ClassPresentInSpecAbsentFromMirror, Detail: "immutable (excluded): spec=true mirror=<absent>"},
+	}
+	PrintDenominatorFindings(printFn, 0, nil, excluded)
+	got := out.String()
+	if !strings.Contains(got, "reusable") {
+		t.Errorf("report = %q, missing the excluded field's name", got)
+	}
+	if strings.Contains(got, "FAIL") {
+		t.Errorf("report = %q, an excluded-only report must not FAIL — excluded never gates the exit code", got)
+	}
 }

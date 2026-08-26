@@ -1602,11 +1602,15 @@ func TestCmdRoundtripVerifyNoResourcesProducedIsAnError(t *testing.T) {
 func TestToRoundtripVerifyRowJSONAndFindingJSON(t *testing.T) {
 	rows := []roundtrip.Row{
 		{Path: "a.b", Classification: roundtrip.ClassValueChanged, SpecFound: true, SpecValue: 1, MirrorFound: true, MirrorValue: 2},
+		{Path: "c", Classification: roundtrip.ClassPresentInSpecAbsentFromMirror, SpecFound: true, SpecValue: true, Immutable: true},
 	}
 	gotRows := toRoundtripVerifyRowJSON(rows)
-	if len(gotRows) != 1 || gotRows[0].Path != "a.b" || gotRows[0].Classification != roundtrip.ClassValueChanged ||
-		!gotRows[0].SpecFound || gotRows[0].SpecValue != 1 || !gotRows[0].MirrorFound || gotRows[0].MirrorValue != 2 {
+	if len(gotRows) != 2 || gotRows[0].Path != "a.b" || gotRows[0].Classification != roundtrip.ClassValueChanged ||
+		!gotRows[0].SpecFound || gotRows[0].SpecValue != 1 || !gotRows[0].MirrorFound || gotRows[0].MirrorValue != 2 || gotRows[0].Immutable {
 		t.Errorf("toRoundtripVerifyRowJSON(%+v) = %+v, fields did not carry through unchanged", rows, gotRows)
+	}
+	if !gotRows[1].Immutable {
+		t.Errorf("toRoundtripVerifyRowJSON(%+v) = %+v, want Immutable carried through as true", rows, gotRows)
 	}
 
 	findings := []roundtrip.MustTestFinding{
@@ -1615,6 +1619,14 @@ func TestToRoundtripVerifyRowJSONAndFindingJSON(t *testing.T) {
 	gotFindings := toRoundtripVerifyFindingJSON(findings)
 	if len(gotFindings) != 1 || gotFindings[0].Field != "a.b" || gotFindings[0].Classification != roundtrip.ClassValueChanged || gotFindings[0].Detail != "must be tested" {
 		t.Errorf("toRoundtripVerifyFindingJSON(%+v) = %+v, fields did not carry through unchanged", findings, gotFindings)
+	}
+
+	excluded := []roundtrip.ExcludedFinding{
+		{Field: "c", Classification: roundtrip.ClassPresentInSpecAbsentFromMirror, Detail: "immutable (excluded)"},
+	}
+	gotExcluded := toRoundtripVerifyExcludedJSON(excluded)
+	if len(gotExcluded) != 1 || gotExcluded[0].Field != "c" || gotExcluded[0].Classification != roundtrip.ClassPresentInSpecAbsentFromMirror || gotExcluded[0].Detail != "immutable (excluded)" {
+		t.Errorf("toRoundtripVerifyExcludedJSON(%+v) = %+v, fields did not carry through unchanged", excluded, gotExcluded)
 	}
 }
 

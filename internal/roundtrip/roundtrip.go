@@ -57,6 +57,13 @@ type Row struct {
 	SpecFound      bool
 	MirrorValue    interface{}
 	MirrorFound    bool
+	// Immutable reports whether Path carries a CEL "self == oldSelf"
+	// validation marker — on its own schema node, or inherited from an
+	// ancestor object node whose whole subtree is marked immutable — in the
+	// served CRD's spec.forProvider schema. Always false for a
+	// present-in-mirror-absent-from-spec row: that classification has no
+	// forProvider counterpart to carry a marker at all. See immutablePaths.
+	Immutable bool
 }
 
 // DiffReport classifies every declared spec.forProvider field of crd against
@@ -87,6 +94,7 @@ func DiffReport(crd map[string]interface{}, obj map[string]interface{}) ([]Row, 
 	fpPaths := leafPaths(fpSchema, "")
 	sort.Strings(fpPaths)
 	apPaths := leafPaths(apSchema, "")
+	immutable := immutablePaths(fpSchema)
 
 	specForProvider, _ := getValue(obj, "spec.forProvider")
 	mirrorAtProvider, _ := getValue(obj, "status.atProvider")
@@ -109,7 +117,10 @@ func DiffReport(crd map[string]interface{}, obj map[string]interface{}) ([]Row, 
 		if !ok {
 			continue
 		}
-		rows = append(rows, Row{Path: path, Classification: cls, SpecValue: sv, SpecFound: sf, MirrorValue: mv, MirrorFound: mf})
+		rows = append(rows, Row{
+			Path: path, Classification: cls, SpecValue: sv, SpecFound: sf, MirrorValue: mv, MirrorFound: mf,
+			Immutable: immutable[path],
+		})
 	}
 
 	// Fields that exist only in the atProvider schema — no forProvider

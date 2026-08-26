@@ -1189,11 +1189,27 @@ type roundtripVerifyRowJSON struct {
 	SpecValue      interface{} `json:"specValue,omitempty"`
 	MirrorFound    bool        `json:"mirrorFound"`
 	MirrorValue    interface{} `json:"mirrorValue,omitempty"`
+	// Immutable mirrors roundtrip.Row.Immutable — present here so a reader
+	// of the raw JSON can see WHY a present-in-spec-absent-from-mirror row
+	// was removed from mustTestCount without cross-referencing excluded by
+	// field name.
+	Immutable bool `json:"immutable,omitempty"`
 }
 
 // roundtripVerifyFindingJSON is the machine-readable shape one
 // roundtrip.MustTestFinding renders as.
 type roundtripVerifyFindingJSON struct {
+	Field          string `json:"field"`
+	Classification string `json:"classification"`
+	Detail         string `json:"detail"`
+}
+
+// roundtripVerifyExcludedJSON is the machine-readable shape one
+// roundtrip.ExcludedFinding renders as — a field removed from mustTestCount
+// because it is CEL-immutable, distinct from roundtripVerifyFindingJSON:
+// this never contributed to anyFindings and never gates the command's exit
+// code.
+type roundtripVerifyExcludedJSON struct {
 	Field          string `json:"field"`
 	Classification string `json:"classification"`
 	Detail         string `json:"detail"`
@@ -1205,11 +1221,12 @@ type roundtripVerifyFindingJSON struct {
 // up, so a caller never has to infer "were rows even computed?" from the
 // exit code the way converge-all's advisory inline report requires.
 type roundtripVerifyReportJSON struct {
-	Kind          string                       `json:"kind"`
-	Name          string                       `json:"name"`
-	Rows          []roundtripVerifyRowJSON     `json:"rows"`
-	MustTestCount int                          `json:"mustTestCount"`
-	Findings      []roundtripVerifyFindingJSON `json:"findings"`
+	Kind          string                        `json:"kind"`
+	Name          string                        `json:"name"`
+	Rows          []roundtripVerifyRowJSON      `json:"rows"`
+	MustTestCount int                           `json:"mustTestCount"`
+	Findings      []roundtripVerifyFindingJSON  `json:"findings"`
+	Excluded      []roundtripVerifyExcludedJSON `json:"excluded"`
 }
 
 func toRoundtripVerifyRowJSON(rows []roundtrip.Row) []roundtripVerifyRowJSON {
@@ -1222,6 +1239,7 @@ func toRoundtripVerifyRowJSON(rows []roundtrip.Row) []roundtripVerifyRowJSON {
 			SpecValue:      r.SpecValue,
 			MirrorFound:    r.MirrorFound,
 			MirrorValue:    r.MirrorValue,
+			Immutable:      r.Immutable,
 		}
 	}
 	return out
@@ -1231,6 +1249,14 @@ func toRoundtripVerifyFindingJSON(findings []roundtrip.MustTestFinding) []roundt
 	out := make([]roundtripVerifyFindingJSON, len(findings))
 	for i, f := range findings {
 		out[i] = roundtripVerifyFindingJSON{Field: f.Field, Classification: f.Classification, Detail: f.Detail}
+	}
+	return out
+}
+
+func toRoundtripVerifyExcludedJSON(excluded []roundtrip.ExcludedFinding) []roundtripVerifyExcludedJSON {
+	out := make([]roundtripVerifyExcludedJSON, len(excluded))
+	for i, e := range excluded {
+		out[i] = roundtripVerifyExcludedJSON{Field: e.Field, Classification: e.Classification, Detail: e.Detail}
 	}
 	return out
 }
@@ -1285,7 +1311,7 @@ func cmdRoundtripVerify(args []string) error {
 			continue
 		}
 
-		findings, mustTestCount := roundtrip.DenominatorReport(m, rows)
+		findings, mustTestCount, excluded := roundtrip.DenominatorReport(m, rows)
 
 		report := roundtripVerifyReportJSON{
 			Kind:          m.Kind,
@@ -1293,6 +1319,7 @@ func cmdRoundtripVerify(args []string) error {
 			Rows:          toRoundtripVerifyRowJSON(rows),
 			MustTestCount: mustTestCount,
 			Findings:      toRoundtripVerifyFindingJSON(findings),
+			Excluded:      toRoundtripVerifyExcludedJSON(excluded),
 		}
 		encoded, err := json.Marshal(report)
 		if err != nil {
@@ -1303,7 +1330,7 @@ func cmdRoundtripVerify(args []string) error {
 		printfTo(os.Stdout, "roundtrip-verify: %s/%s\n", m.Kind, m.Name)
 		roundtrip.PrintDenominatorFindings(func(format string, args ...interface{}) {
 			printfTo(os.Stdout, format, args...)
-		}, mustTestCount, findings)
+		}, mustTestCount, findings, excluded)
 
 		produced++
 		if len(findings) > 0 {

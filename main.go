@@ -48,7 +48,7 @@
 //	update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
 //	update-tester resolve-recover <manifest.yaml> [--timeout 120]
 //	update-tester roundtrip-diff <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30]
-//	update-tester roundtrip-verify <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30]
+//	update-tester roundtrip-verify <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30] [--backend real|simulator]
 //	update-tester hook <invocation-name> [--root <dir>] [--manifest <path>] [--skip-converge]
 //	update-tester version
 package main
@@ -154,7 +154,7 @@ update-tester expect-skeleton <types.go> --kind <Kind> --field <field>
 update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
 update-tester resolve-recover <manifest.yaml> [--timeout 120]
 update-tester roundtrip-diff <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30]
-update-tester roundtrip-verify <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30]
+update-tester roundtrip-verify <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30] [--backend real|simulator]
 update-tester hook <invocation-name> [--root <dir>] [--manifest <path>] [--skip-converge]
 update-tester version`
 
@@ -218,7 +218,11 @@ Commands:
              must-test denominator from the SAME live classification and
              fails when a must-test field's skip: waiver does not hold up
              against its own live row. Emits one JSON report per manifest
-             on every invocation, pass or fail.
+             on every invocation, pass or fail. Additionally reports
+             cell-denominator crediting, container-clear coverage (always
+             advisory — never affects the exit code) and a waiver-bucket
+             classification; --backend declares real or simulator
+             provenance for those additive fields and is optional.
   hook       Derive a manifest from the name this binary was invoked
              under and run the full post-assert sequence for it
   version    Print the version of the tool in use
@@ -1143,18 +1147,33 @@ type roundtripVerifyOptions struct {
 	manifestPaths []string
 	root          string
 	timeout       int
+	// backend is the provider's DECLARED backend classification (see
+	// roundtrip.BackendType) — optional and empty by default, since no
+	// provider declares it yet. When set, it must parse against the closed
+	// set; there is no fallback that guesses one.
+	backend roundtrip.BackendType
 }
 
 func parseRoundtripVerifyArgs(args []string) (roundtripVerifyOptions, error) {
 	fs := flag.NewFlagSet("roundtrip-verify", flag.ContinueOnError)
 	root := fs.String("root", "", "Provider repo root holding package/crds (default: working directory)")
 	timeout := fs.Int("timeout", 30, "Timeout in seconds for kubectl calls")
+	backend := fs.String("backend", "", "Declared backend classification for cell-denominator provenance: real or simulator (default: undeclared)")
 	if err := fs.Parse(cli.ReorderArgs(fs, args)); err != nil {
 		return roundtripVerifyOptions{}, err
 	}
 	if fs.NArg() < 1 {
 		return roundtripVerifyOptions{}, errors.New(
-			"usage: update-tester roundtrip-verify <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30]")
+			"usage: update-tester roundtrip-verify <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30] [--backend real|simulator]")
+	}
+
+	var backendType roundtrip.BackendType
+	if *backend != "" {
+		parsed, err := roundtrip.ParseBackendType(*backend)
+		if err != nil {
+			return roundtripVerifyOptions{}, err
+		}
+		backendType = parsed
 	}
 
 	// Accept both a comma-separated list and repeated positional
@@ -1177,7 +1196,7 @@ func parseRoundtripVerifyArgs(args []string) (roundtripVerifyOptions, error) {
 		resolvedRoot = wd
 	}
 
-	return roundtripVerifyOptions{manifestPaths: paths, root: resolvedRoot, timeout: *timeout}, nil
+	return roundtripVerifyOptions{manifestPaths: paths, root: resolvedRoot, timeout: *timeout, backend: backendType}, nil
 }
 
 // roundtripVerifyRowJSON is the machine-readable shape one roundtrip.Row
@@ -1220,6 +1239,12 @@ type roundtripVerifyExcludedJSON struct {
 // live object for — pass or fail — never gated on whether a finding turned
 // up, so a caller never has to infer "were rows even computed?" from the
 // exit code the way converge-all's advisory inline report requires.
+//
+// Backend/Seed/Cells/ContainerClear/Waivers are additive: every field this
+// ticket adds. None of them ever changes anyFindings (see
+// buildRoundtripVerifyReport) — Backend is empty and Cells/ContainerClear/
+// Waivers are simply additional information a reader may act on later, not
+// a new way for this command to fail.
 type roundtripVerifyReportJSON struct {
 	Kind          string                        `json:"kind"`
 	Name          string                        `json:"name"`
@@ -1227,6 +1252,85 @@ type roundtripVerifyReportJSON struct {
 	MustTestCount int                           `json:"mustTestCount"`
 	Findings      []roundtripVerifyFindingJSON  `json:"findings"`
 	Excluded      []roundtripVerifyExcludedJSON `json:"excluded"`
+	// Backend is empty when undeclared (the default for every provider
+	// today) — never guessed.
+	Backend string `json:"backend,omitempty"`
+	// Seed is the rotation schedule's own seed for this run — recorded and
+	// reported so a reader can reproduce exactly which members were chosen.
+	Seed           int64                `json:"seed"`
+	Cells          []cellCreditJSON     `json:"cells,omitempty"`
+	ContainerClear []containerClearJSON `json:"containerClear,omitempty"`
+	Waivers        []waiverFindingJSON  `json:"waivers,omitempty"`
+}
+
+// cellCreditJSON is the machine-readable shape one roundtrip.CellCredit
+// renders as — an `equal` cell's representative crediting outcome for one
+// run. SimulatorSatisfied restates the report's own Backend declaration on
+// every cell line, per the provenance requirement: a reader filtering or
+// grepping cell lines never has to cross-reference a separate top-level
+// field to see whether a cell was satisfied by a simulator-derived
+// classification.
+type cellCreditJSON struct {
+	Classification     string   `json:"classification"`
+	Shape              string   `json:"shape"`
+	Direction          string   `json:"direction"`
+	Members            []string `json:"members"`
+	Representatives    []string `json:"representatives"`
+	Credited           []string `json:"credited"`
+	Sticky             []string `json:"sticky,omitempty"`
+	SimulatorSatisfied bool     `json:"simulatorSatisfied,omitempty"`
+}
+
+// containerClearJSON is the machine-readable shape one
+// roundtrip.ContainerClearFinding renders as. REPORT-ONLY: nothing reads
+// this slice to decide anyFindings — see buildRoundtripVerifyReport.
+type containerClearJSON struct {
+	Path    string `json:"path"`
+	Shape   string `json:"shape"`
+	Covered bool   `json:"covered"`
+	Detail  string `json:"detail"`
+}
+
+// waiverFindingJSON is the machine-readable shape one
+// roundtrip.WaiverFinding (the waiver bucket classification) renders as.
+type waiverFindingJSON struct {
+	Field  string `json:"field"`
+	Bucket string `json:"bucket"`
+	Detail string `json:"detail"`
+}
+
+func toCellCreditJSON(credits []roundtrip.CellCredit, backend roundtrip.BackendType) []cellCreditJSON {
+	provenance := roundtrip.NewProvenance(backend)
+	out := make([]cellCreditJSON, len(credits))
+	for i, c := range credits {
+		out[i] = cellCreditJSON{
+			Classification:     c.Key.Classification,
+			Shape:              string(c.Key.Shape),
+			Direction:          string(c.Key.Direction),
+			Members:            c.Members,
+			Representatives:    c.Representatives,
+			Credited:           c.Credited,
+			Sticky:             c.Sticky,
+			SimulatorSatisfied: provenance.SimulatorSatisfied,
+		}
+	}
+	return out
+}
+
+func toContainerClearJSON(findings []roundtrip.ContainerClearFinding) []containerClearJSON {
+	out := make([]containerClearJSON, len(findings))
+	for i, f := range findings {
+		out[i] = containerClearJSON{Path: f.Path, Shape: string(f.Shape), Covered: f.Covered, Detail: f.Detail}
+	}
+	return out
+}
+
+func toWaiverFindingJSON(findings []roundtrip.WaiverFinding) []waiverFindingJSON {
+	out := make([]waiverFindingJSON, len(findings))
+	for i, f := range findings {
+		out[i] = waiverFindingJSON{Field: f.Field, Bucket: string(f.Bucket), Detail: f.Detail}
+	}
+	return out
 }
 
 func toRoundtripVerifyRowJSON(rows []roundtrip.Row) []roundtripVerifyRowJSON {
@@ -1261,6 +1365,71 @@ func toRoundtripVerifyExcludedJSON(excluded []roundtrip.ExcludedFinding) []round
 	return out
 }
 
+// rotationStatePath returns the path roundtrip-verify persists its
+// RotationState at for root — a hidden file at the provider repo root, one
+// per provider, so the round-robin schedule (see roundtrip.RotationState)
+// survives across separate invocations/runs rather than resetting every
+// time.
+func rotationStatePath(root string) string {
+	return filepath.Join(root, ".update-tester-rotation-state.json")
+}
+
+// buildRoundtripVerifyReport is cmdRoundtripVerify's pure core: every input
+// already resolved (a parsed manifest, a matched CRD, DiffReport's own
+// rows) so the full report shape — including every cell-denominator field
+// this ticket adds — is unit-testable without a live cluster. See
+// CheckExternalNamePrefix's own doc comment for why this carve-out exists:
+// the edge cases need proving without kubectl.
+//
+// anyFindings mirrors cmdRoundtripVerify's own exit-code decision and is
+// derived SOLELY from findings (roundtrip.DenominatorReport's own
+// must-test violations, unchanged since before this ticket) — never from
+// containerClear or waivers, which are additive, report-only fields. A
+// provider with ZERO clear-direction coverage anywhere never causes
+// anyFindings to become true on that basis alone. findings/excluded are
+// returned alongside the JSON report so a caller can feed
+// roundtrip.PrintDenominatorFindings without re-deriving them from the
+// report's own JSON DTOs.
+func buildRoundtripVerifyReport(
+	m *manifest.Manifest,
+	crd map[string]interface{},
+	rows []roundtrip.Row,
+	backend roundtrip.BackendType,
+	rotation *roundtrip.RotationState,
+) (report roundtripVerifyReportJSON, findings []roundtrip.MustTestFinding, excluded []roundtrip.ExcludedFinding, anyFindings bool) {
+	var mustTestCount int
+	findings, mustTestCount, excluded = roundtrip.DenominatorReport(m, rows)
+
+	cells := roundtrip.GroupCells(rows)
+	credits, _ := roundtrip.CreditCells(cells, rotation)
+
+	var clearFindings []roundtrip.ContainerClearFinding
+	if crd != nil {
+		// Error ignored: a schema-shape problem here would already have
+		// surfaced via DiffReport above, which ran against the same CRD;
+		// this call cannot fail independently of that one in practice, and
+		// container-clear coverage is report-only regardless (see
+		// ContainerClearFinding's own doc comment).
+		clearFindings, _ = roundtrip.ContainerClearCoverage(crd, m)
+	}
+	waivers := roundtrip.ClassifyWaivers(m, rows)
+
+	report = roundtripVerifyReportJSON{
+		Kind:           m.Kind,
+		Name:           m.Name,
+		Rows:           toRoundtripVerifyRowJSON(rows),
+		MustTestCount:  mustTestCount,
+		Findings:       toRoundtripVerifyFindingJSON(findings),
+		Excluded:       toRoundtripVerifyExcludedJSON(excluded),
+		Backend:        string(backend),
+		Seed:           rotation.Seed,
+		Cells:          toCellCreditJSON(credits, backend),
+		ContainerClear: toContainerClearJSON(clearFindings),
+		Waivers:        toWaiverFindingJSON(waivers),
+	}
+	return report, findings, excluded, len(findings) > 0
+}
+
 // cmdRoundtripVerify is the enforcing counterpart to roundtrip-diff: where
 // that command is purely advisory and never fails on what it finds, this
 // one derives the must-test denominator from the SAME live classification
@@ -1277,6 +1446,12 @@ func cmdRoundtripVerify(args []string) error {
 	opts, err := parseRoundtripVerifyArgs(args)
 	if err != nil {
 		return err
+	}
+
+	rotationPath := rotationStatePath(opts.root)
+	rotation, err := roundtrip.LoadRotationState(rotationPath)
+	if err != nil {
+		return fmt.Errorf("loading rotation state: %w", err)
 	}
 
 	produced := 0
@@ -1311,16 +1486,7 @@ func cmdRoundtripVerify(args []string) error {
 			continue
 		}
 
-		findings, mustTestCount, excluded := roundtrip.DenominatorReport(m, rows)
-
-		report := roundtripVerifyReportJSON{
-			Kind:          m.Kind,
-			Name:          m.Name,
-			Rows:          toRoundtripVerifyRowJSON(rows),
-			MustTestCount: mustTestCount,
-			Findings:      toRoundtripVerifyFindingJSON(findings),
-			Excluded:      toRoundtripVerifyExcludedJSON(excluded),
-		}
+		report, manifestFindings, manifestExcluded, findingsForManifest := buildRoundtripVerifyReport(m, crd, rows, opts.backend, &rotation)
 		encoded, err := json.Marshal(report)
 		if err != nil {
 			return fmt.Errorf("encoding roundtrip-verify report for %s/%s: %w", m.Kind, m.Name, err)
@@ -1330,11 +1496,17 @@ func cmdRoundtripVerify(args []string) error {
 		printfTo(os.Stdout, "roundtrip-verify: %s/%s\n", m.Kind, m.Name)
 		roundtrip.PrintDenominatorFindings(func(format string, args ...interface{}) {
 			printfTo(os.Stdout, format, args...)
-		}, mustTestCount, findings, excluded)
+		}, report.MustTestCount, manifestFindings, manifestExcluded)
 
 		produced++
-		if len(findings) > 0 {
+		if findingsForManifest {
 			anyFindings = true
+		}
+	}
+
+	if produced > 0 {
+		if err := rotation.Save(rotationPath); err != nil {
+			fmt.Fprintf(os.Stderr, "roundtrip-verify: WARNING could not persist rotation state to %s: %v\n", rotationPath, err)
 		}
 	}
 

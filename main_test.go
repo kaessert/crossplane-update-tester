@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/kaessert/crossplane-update-tester/internal/differ"
 	"github.com/kaessert/crossplane-update-tester/internal/manifest"
 	"github.com/kaessert/crossplane-update-tester/internal/roundtrip"
@@ -1627,6 +1629,211 @@ func TestToRoundtripVerifyRowJSONAndFindingJSON(t *testing.T) {
 	gotExcluded := toRoundtripVerifyExcludedJSON(excluded)
 	if len(gotExcluded) != 1 || gotExcluded[0].Field != "c" || gotExcluded[0].Classification != roundtrip.ClassPresentInSpecAbsentFromMirror || gotExcluded[0].Detail != "immutable (excluded)" {
 		t.Errorf("toRoundtripVerifyExcludedJSON(%+v) = %+v, fields did not carry through unchanged", excluded, gotExcluded)
+	}
+}
+
+// TestParseRoundtripVerifyArgsBackendFlag confirms --backend is optional
+// (omitting it must not error, since no provider declares it yet) and,
+// when present, is validated against the closed set with no fallback.
+func TestParseRoundtripVerifyArgsBackendFlag(t *testing.T) {
+	withoutFlag, err := parseRoundtripVerifyArgs([]string{"--root", "/repo", "a.yaml"})
+	if err != nil {
+		t.Fatalf("parseRoundtripVerifyArgs without --backend: %v", err)
+	}
+	if withoutFlag.backend != "" {
+		t.Errorf("backend = %q, want empty (undeclared) when --backend is omitted", withoutFlag.backend)
+	}
+
+	withReal, err := parseRoundtripVerifyArgs([]string{"--root", "/repo", "--backend", "real", "a.yaml"})
+	if err != nil {
+		t.Fatalf("parseRoundtripVerifyArgs --backend real: %v", err)
+	}
+	if withReal.backend != roundtrip.BackendReal {
+		t.Errorf("backend = %q, want %q", withReal.backend, roundtrip.BackendReal)
+	}
+
+	withSimulator, err := parseRoundtripVerifyArgs([]string{"--root", "/repo", "--backend", "simulator", "a.yaml"})
+	if err != nil {
+		t.Fatalf("parseRoundtripVerifyArgs --backend simulator: %v", err)
+	}
+	if withSimulator.backend != roundtrip.BackendSimulator {
+		t.Errorf("backend = %q, want %q", withSimulator.backend, roundtrip.BackendSimulator)
+	}
+
+	if _, err := parseRoundtripVerifyArgs([]string{"--root", "/repo", "--backend", "vcenter", "a.yaml"}); err == nil {
+		t.Error("parseRoundtripVerifyArgs --backend vcenter accepted an undeclared value, want an error")
+	}
+}
+
+// containerClearFixtureCRDForMain mirrors the roundtrip package's own
+// fixture shape (one scalar, one list, one map leaf) so
+// buildRoundtripVerifyReport can be tested end to end without a live
+// cluster — see CheckExternalNamePrefix's own doc comment for why this
+// carve-out exists.
+const containerClearFixtureCRDForMain = `apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+spec:
+  group: widgets.crossplane.io
+  names:
+    kind: Widget
+    plural: widgets
+  versions:
+  - name: v1alpha1
+    served: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            properties:
+              forProvider:
+                type: object
+                properties:
+                  name:
+                    type: string
+                  tags:
+                    type: array
+                    items:
+                      type: string
+                  labels:
+                    type: object
+                    additionalProperties:
+                      type: string
+          status:
+            type: object
+            properties:
+              atProvider:
+                type: object
+                properties:
+                  name:
+                    type: string
+`
+
+func decodeCRDForMain(t *testing.T, y string) map[string]interface{} {
+	t.Helper()
+	var crd map[string]interface{}
+	if err := yaml.Unmarshal([]byte(y), &crd); err != nil {
+		t.Fatalf("decoding fixture CRD: %v", err)
+	}
+	return crd
+}
+
+// TestBuildRoundtripVerifyReportContainerClearNeverAffectsExitCode is the
+// ticket's own required pin: a manifest with ZERO clear-direction
+// coverage anywhere — the measured state of most of the fleet — still
+// produces anyFindings == false, as long as no must-test field's waiver
+// actually fails. Container-clear coverage is informational only; it must
+// never contribute to the exit-code decision.
+func TestBuildRoundtripVerifyReportContainerClearNeverAffectsExitCode(t *testing.T) {
+	crd := decodeCRDForMain(t, containerClearFixtureCRDForMain)
+	m := &manifest.Manifest{
+		Kind: "Widget", Name: "example",
+		Tests: []manifest.UpdateTest{
+			{Field: "name", Value: "new-name"},
+		},
+	}
+	rows := []roundtrip.Row{
+		{Path: "name", Classification: roundtrip.ClassEqual, SpecFound: true, SpecValue: "new-name", MirrorFound: true, MirrorValue: "new-name"},
+	}
+	rotation := roundtrip.NewRotationState()
+
+	report, findings, excluded, anyFindings := buildRoundtripVerifyReport(m, crd, rows, "", &rotation)
+	if anyFindings {
+		t.Fatalf("anyFindings = true with zero clear-direction coverage and no must-test violations; findings=%+v excluded=%+v", findings, excluded)
+	}
+	if len(report.ContainerClear) == 0 {
+		t.Fatal("report.ContainerClear is empty — the fixture declares tags and labels as container leaves")
+	}
+	for _, c := range report.ContainerClear {
+		if c.Covered {
+			t.Errorf("finding %+v is Covered=true; this test's manifest carries no clear:, tombstone or per-key removal at all", c)
+		}
+	}
+}
+
+// TestBuildRoundtripVerifyReportMustTestFindingStillFailsRegardlessOfCells
+// confirms the cell/container-clear/waiver additions do not accidentally
+// suppress a genuine must-test finding — the ORIGINAL exit-code contract
+// from before this ticket must be unchanged.
+func TestBuildRoundtripVerifyReportMustTestFindingStillFailsRegardlessOfCells(t *testing.T) {
+	crd := decodeCRDForMain(t, containerClearFixtureCRDForMain)
+	m := &manifest.Manifest{
+		Kind: "Widget", Name: "example",
+		Tests: []manifest.UpdateTest{
+			{Field: "name", Skip: manifest.LegacySkip("assumed stable")},
+		},
+	}
+	rows := []roundtrip.Row{
+		{Path: "name", Classification: roundtrip.ClassValueChanged, SpecFound: true, SpecValue: "us", MirrorFound: true, MirrorValue: "eu"},
+	}
+	rotation := roundtrip.NewRotationState()
+
+	_, findings, _, anyFindings := buildRoundtripVerifyReport(m, crd, rows, "", &rotation)
+	if !anyFindings {
+		t.Fatalf("anyFindings = false, want true — a legacy skip: on a value-changed field must still fail (findings=%+v)", findings)
+	}
+}
+
+// TestBuildRoundtripVerifyReportBackendProvenanceNeverInferred confirms an
+// undeclared backend renders as empty (never guessed) and, when declared
+// simulator, marks every cell's SimulatorSatisfied bit.
+func TestBuildRoundtripVerifyReportBackendProvenanceNeverInferred(t *testing.T) {
+	crd := decodeCRDForMain(t, containerClearFixtureCRDForMain)
+	m := &manifest.Manifest{Kind: "Widget", Name: "example"}
+	rows := []roundtrip.Row{
+		{Path: "name", Classification: roundtrip.ClassEqual, SpecFound: true, SpecValue: "x", MirrorFound: true, MirrorValue: "x"},
+	}
+
+	undeclaredRotation := roundtrip.NewRotationState()
+	undeclared, _, _, _ := buildRoundtripVerifyReport(m, crd, rows, "", &undeclaredRotation)
+	if undeclared.Backend != "" {
+		t.Errorf("Backend = %q with no declaration, want empty", undeclared.Backend)
+	}
+	for _, c := range undeclared.Cells {
+		if c.SimulatorSatisfied {
+			t.Errorf("cell %+v reports SimulatorSatisfied with an undeclared backend", c)
+		}
+	}
+
+	simRotation := roundtrip.NewRotationState()
+	sim, _, _, _ := buildRoundtripVerifyReport(m, crd, rows, roundtrip.BackendSimulator, &simRotation)
+	if sim.Backend != string(roundtrip.BackendSimulator) {
+		t.Errorf("Backend = %q, want %q", sim.Backend, roundtrip.BackendSimulator)
+	}
+	if len(sim.Cells) == 0 {
+		t.Fatal("no cells reported for a simulator-backed run with an equal row present")
+	}
+	for _, c := range sim.Cells {
+		if !c.SimulatorSatisfied {
+			t.Errorf("cell %+v does not report SimulatorSatisfied with a declared simulator backend", c)
+		}
+	}
+}
+
+// TestBuildRoundtripVerifyReportSeedIsRecordedAndReported confirms the
+// rotation seed a run actually used is surfaced on the report, not only
+// held internally — the "recorded and reported" requirement.
+func TestBuildRoundtripVerifyReportSeedIsRecordedAndReported(t *testing.T) {
+	crd := decodeCRDForMain(t, containerClearFixtureCRDForMain)
+	m := &manifest.Manifest{Kind: "Widget", Name: "example"}
+	rotation := roundtrip.NewRotationState()
+	rotation.Seed = 987654321
+
+	report, _, _, _ := buildRoundtripVerifyReport(m, crd, nil, "", &rotation)
+	if report.Seed != 987654321 {
+		t.Errorf("report.Seed = %d, want 987654321", report.Seed)
+	}
+}
+
+// TestRotationStatePathIsHiddenAndScopedToRoot confirms the persisted
+// rotation-state file lives at a stable, discoverable path under the
+// provider root rather than the working directory or a temp location.
+func TestRotationStatePathIsHiddenAndScopedToRoot(t *testing.T) {
+	got := rotationStatePath("/repo/provider-widget")
+	want := filepath.Join("/repo/provider-widget", ".update-tester-rotation-state.json")
+	if got != want {
+		t.Errorf("rotationStatePath(...) = %q, want %q", got, want)
 	}
 }
 

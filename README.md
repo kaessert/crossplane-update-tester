@@ -40,7 +40,7 @@ update-tester expect-skeleton <types.go> --kind <Kind> --field <field>
 update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
 update-tester resolve-recover <manifest.yaml> [--timeout 120]
 update-tester roundtrip-diff <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30]
-update-tester roundtrip-verify <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30]
+update-tester roundtrip-verify <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30] [--backend real|simulator]
 update-tester hook <invocation-name> [--root <dir>] [--manifest <path>] [--skip-converge]
 update-tester version
 ```
@@ -706,6 +706,42 @@ rendering of the same must-test size, excluded fields, and findings. The
 report is emitted for every manifest this command can reach a live object
 for, whether or not any finding turns up: the JSON line is never
 conditioned on failure, unlike `converge-all`'s advisory inline report.
+
+The report additionally carries a cell-denominator breakdown, entirely
+additive to everything above and NEVER part of the command's exit-code
+decision:
+
+- `cells` — every `equal` cell (one `(classification, container shape,
+  direction)` grouping) this run observed, its full member list, which
+  members this run chose as representatives (a size-scaled rotation:
+  small cells reach full coverage in a couple of runs, large ones within
+  about ten), which members were credited by cell membership instead of
+  tested, and which members are permanently promoted (`sticky`) because a
+  past run's representative failed. `value-changed`, `defaulted-by-server`
+  and `present-in-spec-absent-from-mirror` never collapse into a cell this
+  way — each of those stays individually tested and individually
+  reported, exactly as the must-test findings above already require.
+- `containerClear` — for every declared container-typed (list or free-form
+  map) `spec.forProvider` leaf, whether ANY test entry actually exercises
+  its removal direction (a `clear:` list naming it, or a directly-tested
+  map value that nulls one of its own member keys) as opposed to only ever
+  adding to it. This is advisory ONLY: it is informational in every report
+  and never turns the command's exit code non-zero, regardless of how much
+  or how little of a manifest's container-typed surface is covered.
+- `waivers` — every `skip:`-carrying entry, bucketed against its own live
+  row as `redundant` (the row is `equal`; the waiver is unnecessary),
+  `false` (the row is a must-test classification the tool already
+  disproves; the waiver is hiding a real deviation), or `no-row` (nothing
+  to test against, or a confirmed legitimate exception — keep the waiver
+  as is).
+- `backend` / `seed` — `backend` is empty unless the invocation declares
+  `--backend real` or `--backend simulator`; there is no default and no
+  inference from a provider name or endpoint. Every `cells` entry restates
+  whether it was satisfied under a `simulator` declaration
+  (`simulatorSatisfied`), so a reader never has to cross-reference the
+  top-level field. `seed` is the pseudo-random rotation schedule's own
+  seed for this run, so a past run's exact representative choice can be
+  reproduced.
 
 Like `roundtrip-diff`, this command is entirely read-only.
 

@@ -106,13 +106,20 @@ func (k CellKey) String() string {
 // members must be scoped identically. Before this, Cursors was keyed by
 // CellKey.String() alone: every manifest sharing a (classification, shape,
 // direction) triple — the overwhelmingly common case, since most equal
-// cells are scalars — advanced the SAME cursor, each modulo its own,
-// different member count. That is not a round robin: it is deterministic
-// starvation, measured at 30-44% of every provider's equal-cell members
-// NEVER selected across 200 replayed runs. Scoping by manifest makes two
-// manifests sharing a CellKey mathematically independent: each owns its
-// own cursor, so neither's arithmetic can ever land on the other's index
-// space.
+// cells are scalars — advanced the SAME cursor. That is not a round
+// robin: each manifest resumes the shared cursor from wherever the other
+// left it, so each only ever revisits its own stride through the
+// permutation and the members sitting in the other's positions are never
+// selected against its OWN live object. The two do NOT have to differ in
+// member count for this: replaying the real GroupCells/CreditCells/Select
+// pipeline over a retained per-manifest census for 200 runs measured 78 of
+// vultr's 272 equal-cell members (28.7%) never selected, with all 31 of
+// its colliding Kind/Name pairs carrying IDENTICAL cell sizes. It is
+// conditional on the collision, not universal — providers whose census
+// holds no Kind/Name collision at all measured 0. Scoping by manifest
+// makes two manifests sharing a CellKey mathematically independent: each
+// owns its own cursor, so neither's arithmetic can ever land on the
+// other's index space.
 func stateKey(scope string, key CellKey) string {
 	return scope + "\x00" + key.String()
 }

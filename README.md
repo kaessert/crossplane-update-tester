@@ -729,11 +729,14 @@ decision:
   reported, exactly as the must-test findings above already require.
 - `containerClear` — for every declared container-typed (list or free-form
   map) `spec.forProvider` leaf, whether ANY test entry actually exercises
-  its removal direction (a `clear:` list naming it, or a directly-tested
-  map value that nulls one of its own member keys) as opposed to only ever
-  adding to it. This is advisory ONLY: it is informational in every report
-  and never turns the command's exit code non-zero, regardless of how much
-  or how little of a manifest's container-typed surface is covered.
+  its removal direction (a `clear:` list naming it exactly, a `clear:`
+  list naming an ANCESTOR of its dotted path — an RFC-7386 merge-patch
+  null removes the whole subtree beneath that ancestor, this leaf
+  included — or a directly-tested map value that nulls one of its own
+  member keys) as opposed to only ever adding to it. This is advisory
+  ONLY: it is informational in every report and never turns the command's
+  exit code non-zero, regardless of how much or how little of a manifest's
+  container-typed surface is covered.
 - `waivers` — every `skip:`-carrying entry, bucketed against its own live
   row as `redundant` (the row is `equal`; the waiver is unnecessary),
   `false` (the row is a must-test classification the tool already

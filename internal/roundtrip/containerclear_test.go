@@ -13,10 +13,14 @@ import (
 // containerClearFixtureCRD declares one of each shape under
 // spec.forProvider: a scalar (name), a list (tags), a free-form map
 // (labels), a bare empty-object marker with no additionalProperties
-// (selector — must NOT be reported, it has no keys to ever clear), and a
+// (selector — must NOT be reported, it has no keys to ever clear), a
 // nested object WITH declared properties (network.cidr, network.subnets)
 // — the subnets leaf beneath it is a container leaf in its own right, but
-// network itself is never a leaf (DiffReport descends into it).
+// network itself is never a leaf (DiffReport descends into it) — and a
+// free-form map declared via x-kubernetes-preserve-unknown-fields: true
+// with NO additionalProperties key at all (helmValues — the raw-passthrough
+// shape Crossplane/upjet-style codegen emits, e.g. provider-helm's `values`
+// or provider-vclustercli's `helmValues`).
 const containerClearFixtureCRD = `apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 spec:
@@ -58,6 +62,9 @@ spec:
                         type: object
                         additionalProperties:
                           type: string
+                  helmValues:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
           status:
             type: object
             properties:
@@ -80,7 +87,9 @@ func decodeCRD(t *testing.T, y string) map[string]interface{} {
 // TestDeclaredContainerLeaves confirms exactly the container-typed leaves
 // are reported — no scalars, no bare empty-object markers, no
 // object-with-properties ancestor — and that a nested container leaf
-// (network.subnets) is found at its own leaf path.
+// (network.subnets) is found at its own leaf path, alongside a leaf
+// declared via x-kubernetes-preserve-unknown-fields: true instead of
+// additionalProperties (helmValues).
 func TestDeclaredContainerLeaves(t *testing.T) {
 	crd := decodeCRD(t, containerClearFixtureCRD)
 
@@ -97,9 +106,40 @@ func TestDeclaredContainerLeaves(t *testing.T) {
 		"tags":            ShapeList,
 		"labels":          ShapeMap,
 		"network.subnets": ShapeMap,
+		"helmValues":      ShapeMap,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("DeclaredContainerLeaves = %+v, want %+v", got, want)
+	}
+}
+
+// TestDeclaredContainerLeavesPreserveUnknownFieldsWithNoAdditionalProperties
+// is the dedicated regression pin for the gap this fix closes: a
+// "type: object" node carrying x-kubernetes-preserve-unknown-fields: true
+// and NO additionalProperties key at all — the shape Crossplane/upjet-style
+// codegen emits for a raw-passthrough field (provider-helm's `values`,
+// provider-vclustercli's `helmValues`) — must be reported as a free-form
+// map leaf, exactly like an additionalProperties-shaped node.
+func TestDeclaredContainerLeavesPreserveUnknownFieldsWithNoAdditionalProperties(t *testing.T) {
+	crd := decodeCRD(t, containerClearFixtureCRD)
+
+	leaves, err := DeclaredContainerLeaves(crd)
+	if err != nil {
+		t.Fatalf("DeclaredContainerLeaves: %v", err)
+	}
+
+	var found *ContainerLeaf
+	for i := range leaves {
+		if leaves[i].Path == "helmValues" {
+			found = &leaves[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("helmValues (x-kubernetes-preserve-unknown-fields: true, no additionalProperties) not found in %+v", leaves)
+	}
+	if found.Shape != ShapeMap {
+		t.Errorf("helmValues.Shape = %v, want ShapeMap", found.Shape)
 	}
 }
 
@@ -250,16 +290,16 @@ func TestContainerClearCoverageZeroCoverageStillProducesFindingsNoError(t *testi
 	if err != nil {
 		t.Fatalf("ContainerClearCoverage with zero coverage returned an error: %v — this must be report-only", err)
 	}
-	if len(findings) != 3 {
-		t.Fatalf("got %d findings, want 3 (one per declared container leaf)", len(findings))
+	if len(findings) != 4 {
+		t.Fatalf("got %d findings, want 4 (one per declared container leaf)", len(findings))
 	}
 	for _, f := range findings {
 		if f.Covered {
 			t.Errorf("finding %+v is Covered=true with no test entries at all", f)
 		}
 	}
-	if got := containerLeafSummary(findings); got != "0/3 container leaves carry clear-direction coverage" {
-		t.Errorf("containerLeafSummary = %q, want the 0/3 tally", got)
+	if got := containerLeafSummary(findings); got != "0/4 container leaves carry clear-direction coverage" {
+		t.Errorf("containerLeafSummary = %q, want the 0/4 tally", got)
 	}
 }
 

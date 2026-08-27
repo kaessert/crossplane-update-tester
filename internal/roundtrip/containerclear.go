@@ -130,13 +130,15 @@ type ContainerClearFinding struct {
 //     same merge patch as that entry's own field (see
 //     manifest.UpdateTest.Clear and runner.buildMergePatch); or
 //   - some entry's WithValues map names it EXACTLY with an empty LIST
-//     literal ({"spec":{"forProvider":{"<leaf>":[]}}}) — a leaf can never
-//     be nulled through WithValues (manifest.ValidateWithValues requires a
-//     real, non-null value), but RFC-7386 still treats an empty list as a
-//     wholesale replacement at that key, identical in effect to the
-//     value: [] self-tombstone case below; only the LIST shape qualifies —
-//     a Map-shaped leaf can never be emptied this way, see the empty-MAP
-//     note on selfTombstoned; or
+//     literal ({"spec":{"forProvider":{"<leaf>":[]}}}) — RFC-7386 treats an
+//     empty list as a wholesale replacement at that key, identical in
+//     effect to the value: [] self-tombstone case below; only the LIST
+//     shape qualifies — a Map-shaped leaf can never be emptied this way,
+//     see the empty-MAP note on selfTombstoned. A null literal is NOT a
+//     credit route here: WithValues is documented to carry a real,
+//     non-null value (manifest.UpdateTest.WithValues), but nothing
+//     currently rejects a null one, and such an entry is credited by
+//     neither this route nor the Clear route above; or
 //   - some entry's Clear list names an ANCESTOR of the leaf's dotted path
 //     — the same whole-field tombstone shape, but applied to an object
 //     several levels above the leaf ({"spec":{"forProvider":{"<ancestor>":null}}}).

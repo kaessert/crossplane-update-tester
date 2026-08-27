@@ -132,6 +132,63 @@ func TestContainerClearCoverageWholeFieldTombstoneViaClearList(t *testing.T) {
 	}
 }
 
+// TestContainerClearCoverageAncestorTombstoneClearsNestedLeaf confirms the
+// ancestor-walk case: an entry whose Clear list names an OBJECT ancestor
+// several levels above a container leaf (never the leaf's own exact path)
+// still credits that leaf as covered, because an RFC-7386 merge-patch null
+// on the ancestor removes the whole subtree beneath it — the
+// ServicePolicy/allowList shape measured live on provider-f5xc. Regression
+// guard for the exact-path case (network.subnets is NOT named directly,
+// only "network" is) plus a control leaf (tags) that stays uncovered since
+// nothing names it or any of its ancestors.
+func TestContainerClearCoverageAncestorTombstoneClearsNestedLeaf(t *testing.T) {
+	crd := decodeCRD(t, containerClearFixtureCRD)
+	m := &manifest.Manifest{
+		Tests: []manifest.UpdateTest{
+			{Field: "name", Value: "new-name", Clear: []string{"network"}},
+		},
+	}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+
+	byPath := findingsByPath(findings)
+	if !byPath["network.subnets"].Covered {
+		t.Errorf("network.subnets not covered by ancestor tombstone on network, findings = %+v", findings)
+	}
+	if byPath["tags"].Covered {
+		t.Errorf("tags reported covered with no entry naming it or any ancestor: %+v", byPath["tags"])
+	}
+	if byPath["labels"].Covered {
+		t.Errorf("labels reported covered with no entry naming it or any ancestor: %+v", byPath["labels"])
+	}
+}
+
+// TestContainerClearCoverageAncestorWalkIsSegmentExact confirms the
+// ancestor walk matches whole dotted-path SEGMENTS only, never a bare
+// string prefix: a Clear entry naming "net" must NOT be treated as an
+// ancestor of "network.subnets" just because "net" is a textual prefix of
+// "network".
+func TestContainerClearCoverageAncestorWalkIsSegmentExact(t *testing.T) {
+	crd := decodeCRD(t, containerClearFixtureCRD)
+	m := &manifest.Manifest{
+		Tests: []manifest.UpdateTest{
+			{Field: "name", Value: "new-name", Clear: []string{"net"}},
+		},
+	}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+
+	if byPath := findingsByPath(findings); byPath["network.subnets"].Covered {
+		t.Errorf("network.subnets reported covered by a bare string-prefix match on \"net\": %+v", byPath["network.subnets"])
+	}
+}
+
 // TestContainerClearCoveragePerKeyRemoval confirms an entry directly
 // testing a map-typed leaf, whose own Value nulls one of its member keys,
 // credits that leaf as covered via the per-key removal shape.

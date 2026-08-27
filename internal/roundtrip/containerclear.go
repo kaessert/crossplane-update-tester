@@ -3,6 +3,7 @@ package roundtrip
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/kaessert/crossplane-update-tester/internal/manifest"
 )
@@ -103,20 +104,34 @@ type ContainerClearFinding struct {
 
 // ContainerClearCoverage checks every declared container-typed leaf under
 // crd's spec.forProvider schema against m's own Tests. A leaf is covered
-// when EITHER:
+// when ANY of:
 //
-//   - some entry's Clear list names it — the whole-field tombstone shape
-//     ({"spec":{"forProvider":{"<leaf>":null}}}), folded into the same
-//     merge patch as that entry's own field (see
+//   - some entry's Clear list names it EXACTLY — the whole-field tombstone
+//     shape ({"spec":{"forProvider":{"<leaf>":null}}}), folded into the
+//     same merge patch as that entry's own field (see
 //     manifest.UpdateTest.Clear and runner.buildMergePatch); or
+//   - some entry's Clear list names an ANCESTOR of the leaf's dotted path
+//     — the same whole-field tombstone shape, but applied to an object
+//     several levels above the leaf ({"spec":{"forProvider":{"<ancestor>":null}}}).
+//     RFC-7386 merge-patch semantics remove the ENTIRE subtree under a
+//     nulled object member, so a tombstone on "allowList" genuinely clears
+//     "allowList.ipPrefixSet" beneath it even though no entry ever names
+//     that nested path directly; or
 //   - the entry directly testing the leaf itself carries a Value whose
 //     top-level member map contains at least one explicit null — the
 //     per-key removal shape ({"spec":{"forProvider":{"<leaf>":{"a":"1","b":null}}}}).
 //
-// Neither case is inferred: a leaf with no entry at all, or an entry whose
-// Value simply omits a key rather than nulling it, is NOT covered — an
-// RFC-7386 merge patch treats an omitted key as "leave alone", never as
-// "remove", which is exactly the blind spot this check exists to close.
+// The per-key-removal check stays exact-path-only by construction: a
+// per-key null only ever targets the field whose own Value carries it, and
+// has no ancestor-walk analogue — nulling a member of some OTHER field's
+// map value cannot remove a descendant of a different leaf.
+//
+// Neither the exact-path nor the ancestor-tombstone case is inferred
+// beyond ordinary merge-patch semantics: a leaf with no entry at all, and
+// no ancestor entry, or an entry whose Value simply omits a key rather
+// than nulling it, is NOT covered — an RFC-7386 merge patch treats an
+// omitted key as "leave alone", never as "remove", which is exactly the
+// blind spot this check exists to close.
 func ContainerClearCoverage(crd map[string]interface{}, m *manifest.Manifest) ([]ContainerClearFinding, error) {
 	leaves, err := DeclaredContainerLeaves(crd)
 	if err != nil {
@@ -136,11 +151,17 @@ func ContainerClearCoverage(crd map[string]interface{}, m *manifest.Manifest) ([
 
 	findings := make([]ContainerClearFinding, 0, len(leaves))
 	for _, leaf := range leaves {
+		ancestor, ancestorCleared := clearedAncestor(leaf.Path, clearedSiblings)
 		switch {
 		case clearedSiblings[leaf.Path]:
 			findings = append(findings, ContainerClearFinding{
 				Path: leaf.Path, Shape: leaf.Shape, Covered: true,
 				Detail: "whole-field tombstone: named in a sibling entry's clear: list",
+			})
+		case ancestorCleared:
+			findings = append(findings, ContainerClearFinding{
+				Path: leaf.Path, Shape: leaf.Shape, Covered: true,
+				Detail: fmt.Sprintf("whole-subtree tombstone: ancestor %q named in a sibling entry's clear: list removes this leaf too", ancestor),
 			})
 		case perKeyNulled[leaf.Path]:
 			findings = append(findings, ContainerClearFinding{
@@ -150,11 +171,30 @@ func ContainerClearCoverage(crd map[string]interface{}, m *manifest.Manifest) ([
 		default:
 			findings = append(findings, ContainerClearFinding{
 				Path: leaf.Path, Shape: leaf.Shape, Covered: false,
-				Detail: "no clear:, whole-field tombstone, or per-key removal exercises this container leaf's removal direction",
+				Detail: "no clear:, whole-field tombstone, whole-subtree tombstone, or per-key removal exercises this container leaf's removal direction",
 			})
 		}
 	}
 	return findings, nil
+}
+
+// clearedAncestor reports whether some strict ancestor of the dotted path
+// leafPath is a member of cleared — i.e. some entry's Clear list names an
+// object several levels above leafPath, whose merge-patch null tombstone
+// (RFC 7386) removes the whole subtree beneath it, leafPath included. It
+// walks from leafPath's immediate parent up to its top-level segment,
+// returning the first (deepest) ancestor found in cleared. leafPath itself
+// is never checked here — the exact-path case is handled by the caller
+// before this is reached.
+func clearedAncestor(leafPath string, cleared map[string]bool) (string, bool) {
+	segments := strings.Split(leafPath, ".")
+	for i := len(segments) - 1; i > 0; i-- {
+		candidate := strings.Join(segments[:i], ".")
+		if cleared[candidate] {
+			return candidate, true
+		}
+	}
+	return "", false
 }
 
 // hasNestedNullMember reports whether v is a top-level member map (the

@@ -54,6 +54,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -1374,13 +1375,47 @@ func toRoundtripVerifyExcludedJSON(excluded []roundtrip.ExcludedFinding) []round
 	return out
 }
 
+// rotationStateDir returns the directory roundtrip-verify persists rotation
+// state files under. It follows the XDG Base Directory "state" home
+// (data that should survive across restarts but is not worth backing up
+// or syncing — an exact fit for a round-robin cursor): $XDG_STATE_HOME
+// when set, else $HOME/.local/state, else a temp-dir fallback for a
+// HOME-less environment (e.g. some CI runners) so the function never
+// fails outright. Living outside any provider's git tree is deliberate:
+// see rotationStatePath.
+func rotationStateDir() string {
+	if dir := os.Getenv("XDG_STATE_HOME"); dir != "" {
+		return filepath.Join(dir, "update-tester", "rotation")
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return filepath.Join(home, ".local", "state", "update-tester", "rotation")
+	}
+	return filepath.Join(os.TempDir(), "update-tester", "rotation")
+}
+
 // rotationStatePath returns the path roundtrip-verify persists its
-// RotationState at for root — a hidden file at the provider repo root, one
-// per provider, so the round-robin schedule (see roundtrip.RotationState)
-// survives across separate invocations/runs rather than resetting every
-// time.
+// RotationState at for root — one file per provider, named by a hash of
+// root's absolute path, living under rotationStateDir rather than inside
+// root itself. The round-robin schedule (see roundtrip.RotationState)
+// still survives across separate invocations/runs exactly as before; what
+// changed is WHERE it survives.
+//
+// root previously named a hidden file inside the provider repository, and
+// no provider's .gitignore is guaranteed to cover it — a state file
+// dropped into a git-controlled tree becomes untracked noise one
+// `git add`-with-a-wildcard away from being committed, on every provider,
+// forever. Hashing root's absolute path rather than embedding it verbatim
+// avoids building a filename out of arbitrary path characters (Windows
+// drive letters, unusual bytes) while still keeping one provider's
+// rotation state from colliding with another's — the same root always
+// hashes to the same name, so the schedule keeps resuming across runs.
 func rotationStatePath(root string) string {
-	return filepath.Join(root, ".update-tester-rotation-state.json")
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		abs = root
+	}
+	sum := sha256.Sum256([]byte(abs))
+	return filepath.Join(rotationStateDir(), fmt.Sprintf("%x.json", sum))
 }
 
 // manifestScope derives the rotation cursor's scope key for m — see

@@ -1826,14 +1826,100 @@ func TestBuildRoundtripVerifyReportSeedIsRecordedAndReported(t *testing.T) {
 	}
 }
 
-// TestRotationStatePathIsHiddenAndScopedToRoot confirms the persisted
-// rotation-state file lives at a stable, discoverable path under the
-// provider root rather than the working directory or a temp location.
-func TestRotationStatePathIsHiddenAndScopedToRoot(t *testing.T) {
-	got := rotationStatePath("/repo/provider-widget")
-	want := filepath.Join("/repo/provider-widget", ".update-tester-rotation-state.json")
+// TestRotationStatePathLivesOutsideProviderRoot confirms the persisted
+// rotation-state file is NOT written inside root — root is a provider's
+// own git-controlled tree, and no provider's .gitignore is guaranteed to
+// cover a file dropped there (see rotationStatePath's own doc comment).
+func TestRotationStatePathLivesOutsideProviderRoot(t *testing.T) {
+	root := "/repo/provider-widget"
+	got := rotationStatePath(root)
+	if strings.HasPrefix(got, root) {
+		t.Errorf("rotationStatePath(%q) = %q, want a path outside root", root, got)
+	}
+	if filepath.Base(filepath.Dir(got)) != "rotation" {
+		t.Errorf("rotationStatePath(%q) = %q, want it under a %q directory", root, got, "rotation")
+	}
+}
+
+// TestRotationStatePathIsStableAcrossCalls confirms the same root always
+// maps to the same path — required for the round-robin schedule to keep
+// resuming across separate invocations now that the path is derived from
+// a hash rather than the root string itself.
+func TestRotationStatePathIsStableAcrossCalls(t *testing.T) {
+	first := rotationStatePath("/repo/provider-widget")
+	second := rotationStatePath("/repo/provider-widget")
+	if first != second {
+		t.Errorf("rotationStatePath called twice with the same root produced different paths: %q vs %q", first, second)
+	}
+}
+
+// TestRotationStatePathIsScopedPerRoot confirms two different provider
+// roots never collide on the same state file — each provider's rotation
+// schedule must stay independent of every other's.
+func TestRotationStatePathIsScopedPerRoot(t *testing.T) {
+	widget := rotationStatePath("/repo/provider-widget")
+	gadget := rotationStatePath("/repo/provider-gadget")
+	if widget == gadget {
+		t.Errorf("rotationStatePath produced the same path for two different roots: %q", widget)
+	}
+}
+
+// TestRotationStateDirHonoursXDGStateHome confirms the persisted state
+// directory follows $XDG_STATE_HOME when set, so a caller can redirect it
+// (e.g. an isolated test or CI sandbox) without touching any provider
+// tree.
+func TestRotationStateDirHonoursXDGStateHome(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", "/custom/state/home")
+	got := rotationStateDir()
+	want := filepath.Join("/custom/state/home", "update-tester", "rotation")
 	if got != want {
-		t.Errorf("rotationStatePath(...) = %q, want %q", got, want)
+		t.Errorf("rotationStateDir() = %q, want %q", got, want)
+	}
+}
+
+// TestRotationStatePersistsAcrossInvocationsWithoutTouchingProviderRoot is
+// the end-to-end proof the fix needs: a provider root stays completely
+// clean across two separate Load/Save cycles (simulating two separate
+// roundtrip-verify invocations), yet the rotation cursor a first
+// "invocation" advances is still there for a second one to resume from —
+// persistence survives moving the file outside the provider tree.
+func TestRotationStatePersistsAcrossInvocationsWithoutTouchingProviderRoot(t *testing.T) {
+	stateHome := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", stateHome)
+	providerRoot := t.TempDir()
+
+	path := rotationStatePath(providerRoot)
+
+	// Invocation 1: load (first run, no state yet), advance a cursor, save.
+	first, err := roundtrip.LoadRotationState(path)
+	if err != nil {
+		t.Fatalf("LoadRotationState (invocation 1): %v", err)
+	}
+	first.Cursors["scope\x00equal|scalar|clear"] = 3
+	if err := first.Save(path); err != nil {
+		t.Fatalf("Save (invocation 1): %v", err)
+	}
+
+	// The provider root itself must carry nothing new: this is the whole
+	// point of the fix.
+	entries, err := os.ReadDir(providerRoot)
+	if err != nil {
+		t.Fatalf("reading provider root: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("provider root has %d entries after a rotation-state save, want 0: %v", len(entries), entries)
+	}
+
+	// Invocation 2: a fresh Load call must see invocation 1's cursor.
+	second, err := roundtrip.LoadRotationState(path)
+	if err != nil {
+		t.Fatalf("LoadRotationState (invocation 2): %v", err)
+	}
+	if got := second.Cursors["scope\x00equal|scalar|clear"]; got != 3 {
+		t.Errorf("invocation 2 sees cursor %d, want 3 (invocation 1's cursor did not survive)", got)
+	}
+	if second.Seed != first.Seed {
+		t.Errorf("invocation 2 seed %d != invocation 1 seed %d, want the persisted seed to stay stable across invocations", second.Seed, first.Seed)
 	}
 }
 

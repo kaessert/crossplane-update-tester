@@ -21,9 +21,9 @@ type ContainerLeaf struct {
 
 // DeclaredContainerLeaves walks crd's served spec.forProvider schema and
 // returns every container-typed leaf: a "type: array" node, or a
-// "type: object" node with NO declared properties (a free-form map —
-// additionalProperties-shaped, x-kubernetes-preserve-unknown-fields-shaped,
-// or a bare `{type: object}` marker). A "type: object" node that DOES
+// "type: object" node with NO declared properties that declares arbitrary
+// member keys are allowed — additionalProperties-shaped or
+// x-kubernetes-preserve-unknown-fields-shaped. A "type: object" node that DOES
 // declare properties is never itself a leaf (DiffReport descends into it
 // instead, exactly as leafPaths does), so it is correctly excluded here
 // too. A bare object marker with neither an additionalProperties key nor

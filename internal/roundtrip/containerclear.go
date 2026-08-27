@@ -164,8 +164,14 @@ type ContainerClearFinding struct {
 // A leaf classified INELIGIBLE (see IneligibilityReason and
 // classifyIneligibility) skips all of the above: its removal direction can
 // never be exercised at all, so it is reported with Ineligible set and
-// Covered always false — see this function's own contradiction check
-// below for what happens when an existing manifest entry disagrees.
+// Covered always false — see this function's own contradiction check below
+// for what happens when an existing manifest entry disagrees. The
+// reference-resolution reason is exempt from that error (see the check's
+// own comment): closing a leaf ANOTHER field's ancestor tombstone
+// incidentally sweeps up is never rejected by admission — there is no CEL
+// rule guarding a reference-resolution field — so it is not evidence the
+// predicate is wrong, only that crossplane-runtime already discarded a
+// field the manifest happened to also mention.
 func ContainerClearCoverage(crd map[string]interface{}, m *manifest.Manifest) ([]ContainerClearFinding, error) {
 	leaves, err := DeclaredContainerLeaves(crd)
 	if err != nil {
@@ -194,18 +200,22 @@ func ContainerClearCoverage(crd map[string]interface{}, m *manifest.Manifest) ([
 	for _, leaf := range leaves {
 		covered, detail := coverageFor(leaf, clearedSiblings, perKeyNulled, selfByField)
 
-		if reason, isIneligible := ineligible[leaf.Path]; isIneligible {
-			if covered {
-				// A leaf can never be both ineligible and covered — an
-				// existing manifest entry exercising a removal direction
-				// this run's schema-derived predicate says cannot be
-				// exercised is a contradiction in the predicate itself, not
-				// something to silently resolve one way or the other.
-				return nil, fmt.Errorf(
-					"container leaf %q is classified BOTH ineligible (%s) and covered (%s) — "+
-						"the ineligibility predicate and the manifest's own coverage disagree; fix the predicate or the manifest, do not silently prefer one",
-					leaf.Path, reason, detail)
-			}
+		reason, isIneligible := ineligible[leaf.Path]
+		if !isIneligible {
+			findings = append(findings, ContainerClearFinding{Path: leaf.Path, Shape: leaf.Shape, Covered: covered, Detail: detail})
+			continue
+		}
+
+		if reason == ReasonReferenceResolution {
+			// Never a contradiction, covered or not: a reference-resolution
+			// field carries no CEL rule guarding it, so nothing a manifest
+			// entry does to it — including an ancestor tombstone that
+			// incidentally sweeps this leaf up along with a genuinely
+			// tested sibling — is ever rejected by admission, and none of
+			// it is ever observable at the backend either way. A "covered"
+			// signal here is not evidence the predicate disagrees with the
+			// manifest; it is crossplane-runtime having already discarded
+			// this field regardless of what the merge patch says.
 			findings = append(findings, ContainerClearFinding{
 				Path: leaf.Path, Shape: leaf.Shape, Ineligible: true, Reason: reason,
 				Detail: string(reason),
@@ -213,7 +223,22 @@ func ContainerClearCoverage(crd map[string]interface{}, m *manifest.Manifest) ([
 			continue
 		}
 
-		findings = append(findings, ContainerClearFinding{Path: leaf.Path, Shape: leaf.Shape, Covered: covered, Detail: detail})
+		// ReasonRequiredByCELMap, or a LIST leaf whose empty-list route is
+		// ALSO closed: the same x-kubernetes-validations rule that makes
+		// has() fail on a null patch would reject the EXACT merge patch a
+		// "covered" signal here claims succeeded, so a manifest entry
+		// disagreeing with this is a contradiction in the predicate
+		// itself, not something to silently resolve one way or the other.
+		if covered {
+			return nil, fmt.Errorf(
+				"container leaf %q is classified BOTH ineligible (%s) and covered (%s) — "+
+					"the ineligibility predicate and the manifest's own coverage disagree; fix the predicate or the manifest, do not silently prefer one",
+				leaf.Path, reason, detail)
+		}
+		findings = append(findings, ContainerClearFinding{
+			Path: leaf.Path, Shape: leaf.Shape, Ineligible: true, Reason: reason,
+			Detail: string(reason),
+		})
 	}
 	return findings, nil
 }

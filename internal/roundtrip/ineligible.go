@@ -1,17 +1,25 @@
 package roundtrip
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 )
 
-// IneligibilityReason names one of the two structural reasons a declared
-// container leaf's removal direction can never be exercised at all — see
-// classifyIneligibility's own doc comment for what each is derived from.
-// There are deliberately only two: "no eligible sibling to hang clear: on"
-// is NOT a third reason (see ContainerClearFinding's own doc comment) —
-// that is a tooling gap the self-tombstone routes already close, not a
-// structural impossibility.
+// IneligibilityReason names why a declared container leaf's removal
+// direction can never be exercised at all — see classifyIneligibility's own
+// doc comment for what each is derived from. Two structural causes produce
+// it: crossplane-runtime's own reference-resolution plumbing
+// (ReasonReferenceResolution), and an x-kubernetes-validations rule
+// requiring the leaf under the object's default managementPolicies. The
+// second cause renders as one of three concrete reasons depending on the
+// leaf's own shape and schema, because a LIST leaf has a removal route a
+// MAP leaf does not: `value: []` is RFC-7386 wholesale replacement (the
+// same route selfTombstoned already credits), so a CEL-required LIST leaf
+// is ineligible ONLY when its own schema also blocks the empty-list route —
+// via `minItems > 0` or a second CEL rule requiring `<path>.size() > 0`. A
+// CEL-required LIST leaf with neither guard is not ineligible at all: it is
+// left out of the map entirely, exactly like any other eligible leaf.
 type IneligibilityReason string
 
 const (
@@ -24,13 +32,30 @@ const (
 	// against it would only ever exercise kube-apiserver's own
 	// merge-patch handling, never anything the provider does.
 	ReasonReferenceResolution IneligibilityReason = "reference-resolution field: resolved by crossplane-runtime before the request reaches the provider; never mirrored in status.atProvider"
-	// ReasonRequiredByCEL reports that an x-kubernetes-validations rule
-	// requires this leaf whenever the object's managementPolicies is at
-	// its schema default. Nulling the leaf is rejected by admission
-	// before the provider ever sees the patch, so no clear-direction test
-	// can ever reach the backend.
-	ReasonRequiredByCEL IneligibilityReason = "required by a CEL validation rule under the default managementPolicies; admission rejects nulling it"
+
+	// ReasonRequiredByCELMap reports that a free-form MAP leaf is required
+	// by an x-kubernetes-validations rule under the default
+	// managementPolicies. Nulling it is rejected by that rule's has()
+	// guard, and `value: {}` is an RFC-7386 no-op — RFC 7396 recurses into
+	// an object-valued patch member and merges it key-by-key against the
+	// live object, so an empty map names no member to remove and the live
+	// map survives the patch completely unchanged. With both routes
+	// closed, no clear-direction test can ever reach the backend.
+	ReasonRequiredByCELMap IneligibilityReason = "required by a CEL validation rule under the default managementPolicies; nulling it is rejected by that rule's has() guard, and `value: {}` is an RFC-7386 no-op that leaves every existing member untouched — no clear-direction test can ever reach the backend"
 )
+
+// listRequiredByCELReason builds the ineligibility reason for a LIST leaf
+// required by an x-kubernetes-validations rule whose own empty-list route
+// is ALSO closed. blocker names the actual thing closing it — "minItems: N"
+// or a size() CEL rule's own text — so the reason a reader sees is never
+// the generic "admission rejects nulling it": nulling was never the only
+// route for a list, and it is not what makes THIS leaf different from every
+// other CEL-required list leaf that stays eligible.
+func listRequiredByCELReason(blocker string) IneligibilityReason {
+	return IneligibilityReason(fmt.Sprintf(
+		"required by a CEL validation rule under the default managementPolicies; nulling it is rejected by that rule's has() guard, and %s also rejects emptying it to `value: []` — %s, not the has() guard alone, is why this leaf (unlike an ordinary CEL-required list) stays ineligible",
+		blocker, blocker))
+}
 
 // classifyIneligibility derives, for every leaf in leaves, whether its
 // removal direction can ever be exercised against crd's schema at all.
@@ -39,9 +64,8 @@ const (
 // update, so a CRD change that removes the shape or the rule puts the leaf
 // back in the denominator automatically on the very next run.
 //
-// Only two reasons are ever produced (see IneligibilityReason); a leaf
-// matching neither is left out of the returned map entirely; it is not
-// ineligible.
+// A leaf matching none of the reasons in IneligibilityReason's own doc
+// comment is left out of the returned map entirely; it is not ineligible.
 func classifyIneligibility(crd map[string]interface{}, leaves []ContainerLeaf) (map[string]IneligibilityReason, error) {
 	schema, err := servedSchema(crd)
 	if err != nil {
@@ -68,11 +92,105 @@ func classifyIneligibility(crd map[string]interface{}, leaves []ContainerLeaf) (
 			out[leaf.Path] = ReasonReferenceResolution
 			continue
 		}
-		if hasDefault && requiredByManagementPolicies(schema, leaf.Path, mpDefault) {
-			out[leaf.Path] = ReasonRequiredByCEL
+		if !hasDefault || !requiredByManagementPolicies(schema, leaf.Path, mpDefault) {
+			continue
+		}
+		if leaf.Shape == ShapeMap {
+			out[leaf.Path] = ReasonRequiredByCELMap
+			continue
+		}
+		// ShapeList: required by CEL is not, on its own, enough — a list
+		// leaf's `value: []` is an admissible wholesale-replacement clear
+		// under RFC-7386 (selfTombstoned already credits it) unless the
+		// leaf's own schema ALSO blocks the empty-list route.
+		if blocker, blocked := listEmptyRouteBlocked(fpSchema, schema, leaf.Path); blocked {
+			out[leaf.Path] = listRequiredByCELReason(blocker)
 		}
 	}
 	return out, nil
+}
+
+// listEmptyRouteBlocked reports whether leafPath's OWN `value: []` clear
+// route is closed — by its schema declaring `minItems > 0`, or by a second
+// x-kubernetes-validations rule requiring `<path>.size() > 0` — and, when
+// closed, names the actual blocker for the reason string. Checked
+// independently of requiredByManagementPolicies: this is a SEPARATE
+// question (can the list be emptied at all) from whether it is required to
+// be present in the first place.
+func listEmptyRouteBlocked(fpSchema, schema map[string]interface{}, leafPath string) (string, bool) {
+	if leafSchema, ok := schemaAtPath(fpSchema, leafPath); ok {
+		if n, hasMinItems := minItemsGuard(leafSchema); hasMinItems && n > 0 {
+			return fmt.Sprintf("minItems: %d", n), true
+		}
+	}
+	if rule, ok := sizeNonEmptyGuard(schema, leafPath); ok {
+		return fmt.Sprintf("a CEL rule requiring %s", rule), true
+	}
+	return "", false
+}
+
+// minItemsGuard reads m's own "minItems" — tolerating both the float64
+// gojson/yaml.v3 ordinarily decodes JSON numbers to, and a plain int, so
+// this works identically whether the schema arrived via encoding/json or
+// gopkg.in/yaml.v3.
+func minItemsGuard(m map[string]interface{}) (int, bool) {
+	switch v := m["minItems"].(type) {
+	case float64:
+		return int(v), true
+	case int:
+		return v, true
+	case int64:
+		return int(v), true
+	default:
+		return 0, false
+	}
+}
+
+// sizeGuardPattern matches a CEL rule's OWN "<dotted path>.size() > 0" or
+// "<dotted path>.size() >= 1" clause — the two ordinary spellings of "this
+// list must not be empty" — anchored to wantPath so a size() guard on a
+// DIFFERENT field is never mistaken for one guarding this leaf.
+func sizeGuardPattern(wantPath string) *regexp.Regexp {
+	return regexp.MustCompile(regexp.QuoteMeta(wantPath) + `\.size\(\)\s*(?:>\s*0|>=\s*1)\b`)
+}
+
+// sizeNonEmptyGuard mirrors requiredByManagementPolicies's own anchor pair
+// (CRD root, and the "spec" node) to find a CEL rule requiring leafPath's
+// own list to be non-empty via size() — a SEPARATE rule from the one
+// requiredByManagementPolicies matches, which only ever checks has().
+func sizeNonEmptyGuard(schema map[string]interface{}, leafPath string) (string, bool) {
+	if rootValidations, ok := schema["x-kubernetes-validations"].([]interface{}); ok {
+		if rule, ok := sizeGuardRule(rootValidations, "self.spec.forProvider."+leafPath); ok {
+			return rule, true
+		}
+	}
+	specSchema, err := fieldSchema(schema, "spec")
+	if err == nil {
+		if specValidations, ok := specSchema["x-kubernetes-validations"].([]interface{}); ok {
+			if rule, ok := sizeGuardRule(specValidations, "self.forProvider."+leafPath); ok {
+				return rule, true
+			}
+		}
+	}
+	return "", false
+}
+
+// sizeGuardRule scans validations for a rule whose text contains a
+// wantPath+".size() > 0" (or ">= 1") clause, returning that clause verbatim
+// for the reason string.
+func sizeGuardRule(validations []interface{}, wantPath string) (string, bool) {
+	pattern := sizeGuardPattern(wantPath)
+	for _, v := range validations {
+		vm, ok := v.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		rule, _ := vm["rule"].(string)
+		if m := pattern.FindString(rule); m != "" {
+			return m, true
+		}
+	}
+	return "", false
 }
 
 // referenceResolutionShape reports whether leaf is, by its SCHEMA SHAPE

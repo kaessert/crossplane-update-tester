@@ -44,7 +44,9 @@ import (
 //   - subscriptions: a plain list REQUIRED by a ROOT x-kubernetes-validations
 //     rule whenever managementPolicies intersects its own schema default
 //     — measured verbatim against provider-tailscale's Webhook CRD
-//     (its "subscriptions is required..." rule).
+//     (its "subscriptions is required..." rule) — but with NO minItems and
+//     no size() guard of its own, so `value: []` still clears it: this
+//     must stay ELIGIBLE, the over-exclusion this fixture pins.
 //   - deleteOnlyList: a plain list gated ONLY on the literal 'Delete',
 //     which is NOT a member of managementPolicies' own default (['*'])
 //     — must stay ELIGIBLE, because under the object's resting state the
@@ -55,7 +57,21 @@ import (
 //   - specAnchoredRequired: schema-identical obligation to subscriptions,
 //     but declared on the "spec" schema node instead of the CRD root
 //     (self refers to spec, not the whole object) — the second anchor
-//     requiredByManagementPolicies must also recognise.
+//     requiredByManagementPolicies must also recognise. Also has no
+//     minItems, so it too stays ELIGIBLE.
+//   - requiredMinItemsList: CEL-required exactly like subscriptions, but
+//     its own schema ALSO declares minItems: 1 — measured verbatim against
+//     provider-f5xc's BgpAsnSet.asNumbers. `value: []` is rejected by
+//     minItems itself, so this is the genuine ineligible case.
+//   - requiredSizeGuardList: CEL-required like subscriptions, with no
+//     minItems, but a SECOND root CEL rule independently requires
+//     `.size() > 0` on it — the other route to closing the `value: []`
+//     clear, with no minItems fleet example measured (kept as a unit-only
+//     control since the fleet has none today).
+//   - requiredMap: a free-form MAP leaf required by a root CEL rule — the
+//     fleet has zero such leaves today, but the case is unit-tested
+//     anyway: `value: {}` is an RFC-7386 no-op, so a MAP leaf has no
+//     escape route the way a LIST leaf's `value: []` does.
 const ineligibleFixtureCRD = `apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 spec:
@@ -74,6 +90,14 @@ spec:
           rule: "!has(self.spec) || !has(self.spec.managementPolicies) || !('*' in self.spec.managementPolicies || 'Create' in self.spec.managementPolicies || 'Update' in self.spec.managementPolicies) || has(self.spec.forProvider.subscriptions)"
         - message: deleteOnlyList is required only while managementPolicies includes 'Delete'
           rule: "!has(self.spec) || !has(self.spec.managementPolicies) || !('Delete' in self.spec.managementPolicies) || has(self.spec.forProvider.deleteOnlyList)"
+        - message: requiredMinItemsList is required once managementPolicies includes '*', 'Create', or 'Update'
+          rule: "!has(self.spec) || !has(self.spec.managementPolicies) || !('*' in self.spec.managementPolicies || 'Create' in self.spec.managementPolicies || 'Update' in self.spec.managementPolicies) || has(self.spec.forProvider.requiredMinItemsList)"
+        - message: requiredSizeGuardList is required once managementPolicies includes '*', 'Create', or 'Update'
+          rule: "!has(self.spec) || !has(self.spec.managementPolicies) || !('*' in self.spec.managementPolicies || 'Create' in self.spec.managementPolicies || 'Update' in self.spec.managementPolicies) || has(self.spec.forProvider.requiredSizeGuardList)"
+        - message: requiredSizeGuardList must never be emptied, independent of managementPolicies
+          rule: "self.spec.forProvider.requiredSizeGuardList.size() > 0"
+        - message: requiredMap is required once managementPolicies includes '*', 'Create', or 'Update'
+          rule: "!has(self.spec) || !has(self.spec.managementPolicies) || !('*' in self.spec.managementPolicies || 'Create' in self.spec.managementPolicies || 'Update' in self.spec.managementPolicies) || has(self.spec.forProvider.requiredMap)"
         properties:
           spec:
             type: object
@@ -121,6 +145,19 @@ spec:
                   specAnchoredRequired:
                     type: array
                     items:
+                      type: string
+                  requiredMinItemsList:
+                    type: array
+                    minItems: 1
+                    items:
+                      type: string
+                  requiredSizeGuardList:
+                    type: array
+                    items:
+                      type: string
+                  requiredMap:
+                    type: object
+                    additionalProperties:
                       type: string
                   vpcSelector:
                     type: object
@@ -298,10 +335,13 @@ func TestContainerClearCoverageOverExclusionSelectorNameMatchButShapeMismatch(t 
 	}
 }
 
-// TestContainerClearCoverageRequiredByManagementPoliciesRootAnchored
-// confirms REASON 2 at the CRD root anchor (self.spec.forProvider.<leaf>) —
-// the shape measured verbatim against provider-tailscale.
-func TestContainerClearCoverageRequiredByManagementPoliciesRootAnchored(t *testing.T) {
+// TestContainerClearCoverageRequiredByManagementPoliciesRootAnchoredListStaysEligible
+// confirms the fix this ticket exists to make: a LIST leaf required by a
+// ROOT x-kubernetes-validations rule, with no minItems and no size() guard
+// of its own, stays ELIGIBLE — `value: []` still clears it even though
+// `value: null` would be rejected by the rule's has() guard. This is the
+// exact shape measured against provider-tailscale's Webhook.subscriptions.
+func TestContainerClearCoverageRequiredByManagementPoliciesRootAnchoredListStaysEligible(t *testing.T) {
 	crd := decodeCRD(t, ineligibleFixtureCRD)
 	byPath := ineligibleFindingsByPath(t, crd)
 
@@ -309,14 +349,15 @@ func TestContainerClearCoverageRequiredByManagementPoliciesRootAnchored(t *testi
 	if !ok {
 		t.Fatalf("subscriptions not found in findings: %+v", byPath)
 	}
-	if !f.Ineligible || f.Reason != ReasonRequiredByCEL {
-		t.Errorf("subscriptions = %+v, want Ineligible=true Reason=%q", f, ReasonRequiredByCEL)
+	if f.Ineligible {
+		t.Errorf("subscriptions marked Ineligible, want ELIGIBLE: value: [] still clears a CEL-required list with no minItems: %+v", f)
 	}
 }
 
-// TestContainerClearCoverageRequiredByManagementPoliciesSpecAnchored
-// confirms REASON 2 at the "spec" node anchor (self.forProvider.<leaf>).
-func TestContainerClearCoverageRequiredByManagementPoliciesSpecAnchored(t *testing.T) {
+// TestContainerClearCoverageRequiredByManagementPoliciesSpecAnchoredListStaysEligible
+// is the spec-anchor analogue: a LIST leaf required via the "spec" node
+// anchor, with no minItems, also stays ELIGIBLE.
+func TestContainerClearCoverageRequiredByManagementPoliciesSpecAnchoredListStaysEligible(t *testing.T) {
 	crd := decodeCRD(t, ineligibleFixtureCRD)
 	byPath := ineligibleFindingsByPath(t, crd)
 
@@ -324,8 +365,75 @@ func TestContainerClearCoverageRequiredByManagementPoliciesSpecAnchored(t *testi
 	if !ok {
 		t.Fatalf("specAnchoredRequired not found in findings: %+v", byPath)
 	}
-	if !f.Ineligible || f.Reason != ReasonRequiredByCEL {
-		t.Errorf("specAnchoredRequired = %+v, want Ineligible=true Reason=%q", f, ReasonRequiredByCEL)
+	if f.Ineligible {
+		t.Errorf("specAnchoredRequired marked Ineligible, want ELIGIBLE: value: [] still clears a CEL-required list with no minItems: %+v", f)
+	}
+}
+
+// TestContainerClearCoverageRequiredListWithMinItemsStaysIneligible confirms
+// the genuine ineligible case: a LIST leaf required by a CEL rule AND
+// carrying its own minItems: 1 has BOTH clear routes closed — nulling by
+// the CEL rule's has() guard, emptying by minItems itself — and the reason
+// names minItems as the actual blocker, not "admission rejects nulling it".
+// Measured verbatim against provider-f5xc's BgpAsnSet.asNumbers.
+func TestContainerClearCoverageRequiredListWithMinItemsStaysIneligible(t *testing.T) {
+	crd := decodeCRD(t, ineligibleFixtureCRD)
+	byPath := ineligibleFindingsByPath(t, crd)
+
+	f, ok := byPath["requiredMinItemsList"]
+	if !ok {
+		t.Fatalf("requiredMinItemsList not found in findings: %+v", byPath)
+	}
+	if !f.Ineligible {
+		t.Fatalf("requiredMinItemsList not marked Ineligible, want it blocked by minItems: %+v", f)
+	}
+	if strings.Contains(string(f.Reason), "admission rejects nulling it") {
+		t.Errorf("requiredMinItemsList.Reason = %q, must not use the generic pre-fix wording", f.Reason)
+	}
+	if !strings.Contains(string(f.Reason), "minItems: 1") {
+		t.Errorf("requiredMinItemsList.Reason = %q, want it to name minItems: 1 as the actual blocker", f.Reason)
+	}
+}
+
+// TestContainerClearCoverageRequiredListWithSizeGuardStaysIneligible confirms
+// the second blocking route: a LIST leaf required by CEL, with no minItems
+// of its own, but a SECOND CEL rule independently requiring `.size() > 0`
+// on it. No fleet example exists today (unit-only control per the ticket),
+// but the predicate must still recognise it and name the size() guard as
+// the actual blocker.
+func TestContainerClearCoverageRequiredListWithSizeGuardStaysIneligible(t *testing.T) {
+	crd := decodeCRD(t, ineligibleFixtureCRD)
+	byPath := ineligibleFindingsByPath(t, crd)
+
+	f, ok := byPath["requiredSizeGuardList"]
+	if !ok {
+		t.Fatalf("requiredSizeGuardList not found in findings: %+v", byPath)
+	}
+	if !f.Ineligible {
+		t.Fatalf("requiredSizeGuardList not marked Ineligible, want it blocked by its size() guard: %+v", f)
+	}
+	if strings.Contains(string(f.Reason), "admission rejects nulling it") {
+		t.Errorf("requiredSizeGuardList.Reason = %q, must not use the generic pre-fix wording", f.Reason)
+	}
+	if !strings.Contains(string(f.Reason), "size()") {
+		t.Errorf("requiredSizeGuardList.Reason = %q, want it to name the size() guard as the actual blocker", f.Reason)
+	}
+}
+
+// TestContainerClearCoverageRequiredMapStaysIneligible confirms a MAP leaf
+// required by CEL stays ineligible even though the fleet carries zero such
+// leaves today: `value: {}` is an RFC-7386 no-op (de02d9df), so a MAP leaf
+// has no analogue to a LIST leaf's `value: []` escape route.
+func TestContainerClearCoverageRequiredMapStaysIneligible(t *testing.T) {
+	crd := decodeCRD(t, ineligibleFixtureCRD)
+	byPath := ineligibleFindingsByPath(t, crd)
+
+	f, ok := byPath["requiredMap"]
+	if !ok {
+		t.Fatalf("requiredMap not found in findings: %+v", byPath)
+	}
+	if !f.Ineligible || f.Reason != ReasonRequiredByCELMap {
+		t.Errorf("requiredMap = %+v, want Ineligible=true Reason=%q", f, ReasonRequiredByCELMap)
 	}
 }
 
@@ -401,19 +509,56 @@ func TestContainerClearCoverageEveryIneligibleFindingCarriesAReason(t *testing.T
 // covered: an existing manifest entry that (incorrectly, or because the
 // predicate is wrong) exercises removal on a leaf this run's schema-derived
 // predicate says can never be exercised must surface as an error, never be
-// silently resolved one way or the other.
+// silently resolved one way or the other. Uses requiredMinItemsList, not
+// subscriptions: subscriptions is ELIGIBLE now (no minItems), so it can no
+// longer produce this contradiction at all — requiredMinItemsList is a
+// leaf that stays genuinely ineligible after this ticket's fix.
 func TestContainerClearCoverageContradictionBetweenIneligibleAndCovered(t *testing.T) {
 	crd := decodeCRD(t, ineligibleFixtureCRD)
 	m := &manifest.Manifest{
 		Tests: []manifest.UpdateTest{
-			// subscriptions is REQUIRED by REASON 2 above, but this entry
-			// claims to have exercised its removal direction anyway.
-			{Field: "subscriptions", Value: nil, ValueExplicit: true},
+			// requiredMinItemsList is REQUIRED by REASON 2 above (and
+			// blocked from the value: [] route by its own minItems: 1),
+			// but this entry claims to have exercised its removal anyway.
+			{Field: "requiredMinItemsList", Value: nil, ValueExplicit: true},
 		},
 	}
 
 	if _, err := ContainerClearCoverage(crd, m); err == nil {
 		t.Error("ContainerClearCoverage returned nil error for a leaf classified both ineligible and covered, want a contradiction error")
+	}
+}
+
+// TestContainerClearCoverageReferenceResolutionAncestorSweepNotAContradiction
+// is the f5xc ServicePolicy.allowList.ipPrefixSetRefs regression pin: an
+// ancestor clear: tombstone that incidentally sweeps up a REASON-1
+// (reference-resolution) descendant is NOT a contradiction, decided
+// explicitly by this ticket. A reference-resolution field carries no CEL
+// rule guarding it, so nothing about the combined merge patch is ever
+// rejected by admission — the descendant being swept up is inert collateral,
+// not evidence the predicate disagrees with the manifest.
+func TestContainerClearCoverageReferenceResolutionAncestorSweepNotAContradiction(t *testing.T) {
+	crd := decodeCRD(t, ineligibleFixtureCRD)
+	m := &manifest.Manifest{
+		Tests: []manifest.UpdateTest{
+			// vpcSelector is not itself a container leaf, but nulling it as
+			// an ancestor tombstone sweeps up vpcSelector.matchLabels — a
+			// REASON-1 (reference-resolution) descendant.
+			{Field: "tags", Value: []interface{}{"a"}, Clear: []string{"vpcSelector"}},
+		},
+	}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage returned an error for an ancestor tombstone incidentally sweeping up a reference-resolution descendant, want no error: %v", err)
+	}
+	byPath := findingsByPath(findings)
+	f, ok := byPath["vpcSelector.matchLabels"]
+	if !ok {
+		t.Fatalf("vpcSelector.matchLabels not found in findings: %+v", byPath)
+	}
+	if !f.Ineligible || f.Covered {
+		t.Errorf("vpcSelector.matchLabels = %+v, want Ineligible=true Covered=false even though an ancestor tombstone swept it up", f)
 	}
 }
 

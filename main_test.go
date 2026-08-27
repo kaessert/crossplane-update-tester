@@ -1828,10 +1828,14 @@ func TestBuildRoundtripVerifyReportSeedIsRecordedAndReported(t *testing.T) {
 
 // ineligibleContradictionFixtureCRDForMain declares a single list leaf
 // ("subscriptions") required by a root x-kubernetes-validations rule under
-// managementPolicies' own default (['*']) — the exact shape measured live
-// on provider-tailscale — so a manifest entry claiming clear-direction
-// coverage of it collides with roundtrip.ContainerClearCoverage's own
-// ineligible-and-covered contradiction guard.
+// managementPolicies' own default (['*']), AND carrying its own
+// minItems: 1 — the genuinely-ineligible shape after this ticket's fix
+// (measured verbatim against provider-f5xc's BgpAsnSet.asNumbers; a
+// CEL-required list with NO minItems, like provider-tailscale's
+// Webhook.subscriptions, is ELIGIBLE now because `value: []` still clears
+// it) — so a manifest entry claiming clear-direction coverage of it
+// collides with roundtrip.ContainerClearCoverage's own ineligible-and-covered
+// contradiction guard.
 const ineligibleContradictionFixtureCRDForMain = `apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 spec:
@@ -1862,6 +1866,7 @@ spec:
                 properties:
                   subscriptions:
                     type: array
+                    minItems: 1
                     items:
                       type: string
           status:
@@ -1872,12 +1877,57 @@ spec:
                 properties: {}
 `
 
+// referenceResolutionAncestorSweepFixtureCRDForMain declares a Selector
+// field (vpcSelector) whose nested matchLabels leaf is a REASON-1
+// (reference-resolution) container leaf, alongside a sibling top-level
+// field (name) that can host a clear: tombstone naming vpcSelector as an
+// ancestor — the exact provider-f5xc ServicePolicy.allowList.ipPrefixSetRefs
+// shape: an ancestor tombstone that incidentally sweeps up a
+// reference-resolution descendant.
+const referenceResolutionAncestorSweepFixtureCRDForMain = `apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+spec:
+  group: widgets.crossplane.io
+  names:
+    kind: Widget
+    plural: widgets
+  versions:
+  - name: v1alpha1
+    served: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            properties:
+              forProvider:
+                type: object
+                properties:
+                  name:
+                    type: string
+                  vpcSelector:
+                    type: object
+                    properties:
+                      matchLabels:
+                        type: object
+                        additionalProperties:
+                          type: string
+          status:
+            type: object
+            properties:
+              atProvider:
+                type: object
+                properties: {}
+`
+
 // TestBuildRoundtripVerifyReportContainerClearContradictionSurfacedNotSwallowed
 // is the regression pin for the fleet defect this ticket's own measurement
-// found live (provider-lambda's GlobalFirewallRuleset.rules,
-// provider-f5xc's ServicePolicy allowList.ipPrefixSetRefs): when an
+// found live (provider-lambda's GlobalFirewallRuleset.rules): when an
 // existing manifest entry's clear-direction coverage collides with the
-// schema-derived ineligibility predicate,
+// schema-derived ineligibility predicate on a CEL-required leaf whose
+// empty-clear route is ALSO closed (subscriptions here carries minItems: 1
+// for that reason — see the fixture's own doc comment),
 // roundtrip.ContainerClearCoverage errors rather than silently preferring
 // one side, and buildRoundtripVerifyReport must surface that error on the
 // report (ContainerClearError) rather than discarding it — collapsing
@@ -1891,8 +1941,9 @@ func TestBuildRoundtripVerifyReportContainerClearContradictionSurfacedNotSwallow
 	m := &manifest.Manifest{
 		Kind: "Widget", Name: "example",
 		Tests: []manifest.UpdateTest{
-			// subscriptions is required by the CEL rule above (REASON 2),
-			// yet this entry claims to have exercised its removal.
+			// subscriptions is required by the CEL rule above (REASON 2)
+			// AND its own minItems: 1 blocks the value: [] route too, yet
+			// this entry claims to have exercised its removal.
 			{Field: "subscriptions", Value: nil, ValueExplicit: true},
 		},
 	}
@@ -1907,6 +1958,50 @@ func TestBuildRoundtripVerifyReportContainerClearContradictionSurfacedNotSwallow
 	}
 	if anyFindings {
 		t.Error("anyFindings = true; a container-clear contradiction must never gate this command's exit code")
+	}
+}
+
+// TestBuildRoundtripVerifyReportReferenceResolutionAncestorSweepNotAContradiction
+// is the regression pin for the OTHER live fleet instance this ticket's own
+// measurement found (provider-f5xc's ServicePolicy allowList.ipPrefixSetRefs):
+// an ancestor clear: tombstone that incidentally sweeps up a REASON-1
+// (reference-resolution) descendant is decided, explicitly, NOT to be a
+// contradiction — a reference-resolution field carries no CEL rule guarding
+// it, so nothing about the combined merge patch is ever rejected by
+// admission. report.ContainerClearError must stay empty and the swept-up
+// leaf must still be reported Ineligible.
+func TestBuildRoundtripVerifyReportReferenceResolutionAncestorSweepNotAContradiction(t *testing.T) {
+	crd := decodeCRDForMain(t, referenceResolutionAncestorSweepFixtureCRDForMain)
+	m := &manifest.Manifest{
+		Kind: "Widget", Name: "example",
+		Tests: []manifest.UpdateTest{
+			// vpcSelector is nulled as an ancestor tombstone alongside the
+			// "name" field's own update — sweeping up
+			// vpcSelector.matchLabels (REASON-1) in the same merge patch.
+			{Field: "name", Value: "updated", Clear: []string{"vpcSelector"}},
+		},
+	}
+	rotation := roundtrip.NewRotationState()
+
+	report, _, _, anyFindings := buildRoundtripVerifyReport(m, crd, nil, "", &rotation)
+	if report.ContainerClearError != "" {
+		t.Fatalf("report.ContainerClearError = %q, want empty: an ancestor sweep of a reference-resolution descendant is not a contradiction", report.ContainerClearError)
+	}
+	var found bool
+	for _, c := range report.ContainerClear {
+		if c.Path != "vpcSelector.matchLabels" {
+			continue
+		}
+		found = true
+		if !c.Ineligible || c.Covered {
+			t.Errorf("vpcSelector.matchLabels = %+v, want Ineligible=true Covered=false", c)
+		}
+	}
+	if !found {
+		t.Fatalf("vpcSelector.matchLabels not found in report.ContainerClear: %+v", report.ContainerClear)
+	}
+	if anyFindings {
+		t.Error("anyFindings = true; container-clear reporting must never gate this command's exit code")
 	}
 }
 

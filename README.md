@@ -745,9 +745,19 @@ decision:
       a field that genuinely IS echoed back is never excluded on shape
       alone;
     - a field an `x-kubernetes-validations` rule requires whenever the
-      object's `managementPolicies` is at its own schema default — nulling
-      it is rejected by admission before this tool's patch ever reaches
-      the provider.
+      object's `managementPolicies` is at its own schema default. For a
+      free-form MAP leaf this alone is enough: nulling it is rejected by
+      admission, and `value: {}` is an RFC-7386 no-op that leaves every
+      existing member untouched, so no clear-direction test can ever reach
+      the backend. For a LIST leaf, `value: []` is itself an admissible
+      wholesale-replacement clear under RFC-7386 (the same route "covered"
+      below credits), so a CEL-required list stays ELIGIBLE unless its own
+      schema ALSO declares `minItems > 0`, or a second CEL rule requires
+      `<path>.size() > 0` — either one closes the `value: []` route the same
+      way the CEL rule's `has()` guard closes nulling, and only then is the
+      leaf ineligible. The reported `reason` always names the actual
+      blocker (`minItems: N`, the `size()` rule's own text, or the map's
+      RFC-7386 no-op) rather than a generic "admission rejects nulling it".
   - **covered** — ANY test entry actually exercises its removal direction:
     a `clear:` list naming it exactly, a `clear:` list naming an ANCESTOR
     of its dotted path (an RFC-7386 merge-patch null removes the whole
@@ -760,11 +770,17 @@ decision:
     qualify.
   - **uncovered** — neither of the above; a gap this manifest could close.
 
-  A leaf is never reported as both ineligible and covered — that
-  combination means an existing manifest entry disagrees with the
-  ineligibility predicate, and the report surfaces that disagreement
-  explicitly (`containerClearError`) rather than silently preferring one
-  side.
+  A leaf is never reported as both ineligible and covered for the
+  CEL-required reason (map, or a list whose empty-clear route is also
+  closed) — that combination means an existing manifest entry disagrees
+  with the ineligibility predicate, and the report surfaces that
+  disagreement explicitly (`containerClearError`) rather than silently
+  preferring one side. The reference-resolution reason is exempt from that
+  error: a reference-resolution field carries no CEL rule guarding it, so
+  an ancestor `clear:` tombstone that incidentally sweeps up a
+  reference-resolution descendant alongside a genuinely tested sibling is
+  never rejected by admission and is not evidence the predicate is wrong —
+  it is simply reported `ineligible`, `covered: false`, with no error.
 
   This whole breakdown is advisory ONLY: it is informational in every
   report and never turns the command's exit code non-zero, regardless of

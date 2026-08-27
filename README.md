@@ -94,18 +94,6 @@ For each entry in the manifest's `crossplane.io/update-test` annotation, `run`:
    fails the whole `run` invocation the moment it drifts, wherever in the
    run that happens. See "`crossplane.io/update-test`" below for the
    annotation syntax and what this exists to catch.
-9. **Inverts the verdict for a `knownDefect:` entry.** Steps 1–7 run exactly
-   as above, but the pass/fail reading is flipped: non-convergence is this
-   entry's EXPECTED outcome and is reported as `KNOWN-DEFECT`, neither a
-   pass nor a failure. If the field actually converges with positive
-   evidence, that is reported as `KNOWN-DEFECT CONVERGED` and FAILS the run
-   hard, naming the ticket ID and instructing the reader to delete the token
-   — see "`crossplane.io/update-test`" below. A field whose value converges
-   but whose `Update()` Event is never recorded (point 6's `NOT-EVIDENCED`)
-   is **not** credited as the entry's expected non-convergence either: the
-   value reaching its target is itself evidence against "still broken", so
-   that case is reported through its own `NOT-EVIDENCED` verdict — which
-   also fails the run — rather than as a confirmed `KNOWN-DEFECT`.
 
 Point 6 is the reason this tool exists rather than a `kubectl patch` followed by
 a value assertion. A value match alone cannot distinguish "the controller
@@ -127,19 +115,6 @@ Two secondary behaviours follow from that design:
   false failure. Every field tested after a failed reset is reported as
   `UNTRUSTED` and counted as a failure, so a run can never print a clean
   "0 not-evidenced" summary on evidence it cannot vouch for.
-- **Shortened window for `knownDefect` entries.** An unfixed `knownDefect`
-  entry is, by construction, expected to spend its ENTIRE convergence window
-  failing to converge on every single run — unlike an ordinary entry, which
-  typically converges and returns early. Running it at `--timeout`'s full
-  value would tax every invocation that carries one for no benefit, so `run`
-  narrows the window to a quarter of `--timeout` (floored at 15s, so a short
-  `--timeout` still leaves room for the two forced reconciles every field
-  test drives) for a `knownDefect` entry only. The trade-off: a defect that
-  would genuinely converge only in the last quarter of the full window is
-  misreported as `KNOWN-DEFECT` rather than caught as fixed on that
-  particular run — an acceptable false negative, since the entry is
-  re-evaluated on every subsequent run and the ticket, not this tool, is
-  what proves the fix.
 
 A passing, evidenced field that took at least **half the provider's poll
 interval** to converge is annotated `slow-observe`. It is still a pass — the
@@ -871,10 +846,9 @@ three top-level directive lines: `converge-skip:`, `assert-unchanged:` and
 | `field` | Required. Field name under `spec.forProvider`; dot-separated for nested fields. |
 | `value` | The value to patch in. Required unless `skip` is set — but "required" means the `value:` key must be PRESENT, not non-null: an explicit `value: null` (or a bare `value:` with nothing after the colon) is accepted as a deliberate whole-field tombstone in its own right, distinct from the key being absent entirely — see "Whole-field tombstones without a sibling field" below. |
 | `expect` | Optional. The value expected in `status.atProvider` when the backend normalises what it stores. Defaults to `value`. |
-| `skip` | Optional. Either a free-prose string (the legacy form, reported as `SKIPPED` and credited under `validate`'s `skipped-unstructured` status) or a structured mapping with a `reason:` from a closed set (reported as `SKIPPED` and credited under `validate`'s `skipped` status — see "`skip:` reasons" below). Either way the entry still counts as coverage for `validate` and is mutually exclusive with `knownDefect`. |
+| `skip` | Optional. Either a free-prose string (the legacy form, reported as `SKIPPED` and credited under `validate`'s `skipped-unstructured` status) or a structured mapping with a `reason:` from a closed set (reported as `SKIPPED` and credited under `validate`'s `skipped` status — see "`skip:` reasons" below). Either way the entry still counts as coverage for `validate`. |
 | `clear` | Optional. A list of OTHER top-level `spec.forProvider` field names nulled in the SAME merge patch that sets `field`'s value, so a union modeled as separate top-level fields switches arms atomically. Only valid when `field` itself is top-level (not dotted); a dotted entry, or one naming `field` itself, is rejected at parse time — even for a `field` with no other sibling to name; see "Whole-field tombstones without a sibling field" for that case's own route. |
 | `withValues` | Optional. A mapping of OTHER top-level `spec.forProvider` field names to an explicit, non-null literal value set in the SAME merge patch that sets `field`'s value — see "Backend-coupled fields: converging a source field and its derived field in one patch" below. Only valid when `field` itself is top-level (not dotted); a dotted key, a key naming `field` itself, or a key also present in this entry's own `clear` list is rejected at parse time. |
-| `knownDefect` | Optional. The ID of the ticket tracking a real defect that keeps this field's update path from converging. Unlike `skip`, the entry RUNS: `value` is required, the patch is applied exactly as normal, and non-convergence is reported as `KNOWN-DEFECT` — expected, not a failure. If the field DOES converge, that FAILS the run hard as `KNOWN-DEFECT CONVERGED`, naming the ticket and telling the reader to delete the token. A field that converges in value but has no `Update()` Event to prove it (`NOT-EVIDENCED`) is likewise never credited as `KNOWN-DEFECT` — it fails the run through its own `NOT-EVIDENCED` verdict instead, since a value match is evidence the defect may already be fixed. Mutually exclusive with `skip`. The value must be non-empty, contain no whitespace, not be a placeholder (`TODO`, `TBD`, `n/a`, etc.), and be at least 6 characters — reject anything that cannot be followed back to an actual ticket. Also rejected if the same top-level field name appears in this manifest's own `ignore-fields:` set (dead config — see `ignore-fields:` below). |
 | `ignoreMapKeys` | Optional. A list of top-level member keys excluded, on BOTH sides, from `run`'s equality check between `expect` (or `value`, when `expect` is unset) and the live `status.atProvider` value — see "`ignoreMapKeys:` — excluding a provider-injected map member" below. Mutually exclusive with `skip` (there is no comparison left for it to affect). |
 | `ignoreListElementKeys` | Optional. A list of per-element member keys excluded, on BOTH sides and from EVERY element, from `run`'s equality check between `expect` (or `value`, when `expect` is unset) and the live `status.atProvider` value, for a list-of-objects field — see "`ignoreListElementKeys:` — excluding a provider-injected per-element member" below. Mutually exclusive with `skip` (there is no comparison left for it to affect). |
 

@@ -54,18 +54,6 @@
 #                                is the measured live failure the log
 #                                instrument exists for, and the one every
 #                                other instrument reports as stable.
-#                            "unevidenced" — status.atProvider DOES pick up
-#                                the new value (unlike "stuck"), but no
-#                                UpdatedExternalResource event is ever
-#                                recorded (unlike the default). This is
-#                                "stuck" turned inside out: the value
-#                                genuinely converges with no proof Update()
-#                                produced it, the exact middle case between
-#                                "well-behaved" and "stuck" that a
-#                                `knownDefect:` entry must not credit as
-#                                confirmed non-convergence — see `run`'s
-#                                NOT-EVIDENCED verdict and its interaction
-#                                with `knownDefect:`.
 #   SMOKE_UPPERCASE_FIELDS   space-separated forProvider field names the
 #                            "backend" normalises to upper case when storing
 #                            them, so a manifest entry's `expect:` differing
@@ -440,14 +428,9 @@ cmd_patch() {
 
       printf '%s' "$value" >"$dir/spec/$field"
       # A spec change bumps metadata.generation, and the reconcile it
-      # triggers calls Update() — one UpdatedExternalResource event. Except
-      # in FAIL_MODE=unevidenced, which models a reconciler whose Update()
-      # call silently drops its event: the value still converges below, but
-      # no event ever proves it.
+      # triggers calls Update() — one UpdatedExternalResource event.
       printf '%s' "$(($(cat "$dir/generation") + 1))" >"$dir/generation"
-      if [ "$FAIL_MODE" != "unevidenced" ]; then
-        printf '%s' "$(($(cat "$dir/ev_update") + 1))" >"$dir/ev_update"
-      fi
+      printf '%s' "$(($(cat "$dir/ev_update") + 1))" >"$dir/ev_update"
 
       if [ "$FAIL_MODE" != "stuck" ]; then
         local stored=$value w

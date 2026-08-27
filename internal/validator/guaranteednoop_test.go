@@ -98,16 +98,6 @@ func TestCheckGuaranteedNoOp(t *testing.T) {
 			},
 			wantFields: nil,
 		},
-		"KnownDefectEntryAlsoFlagged": {
-			reason: "runner.go's pre-patch no-op guard runs unconditionally for a knownDefect entry too — runFieldTest knows nothing about KnownDefect",
-			forProvider: map[string]interface{}{
-				"description": "original",
-			},
-			tests: []manifest.UpdateTest{
-				{Field: "description", Value: "original", KnownDefect: "TICKET-1234"},
-			},
-			wantFields: []string{"description"},
-		},
 		"DottedFieldPathResolves": {
 			reason: "a nested field path navigates m.ForProvider the same way navigateForProvider does elsewhere in this package",
 			forProvider: map[string]interface{}{

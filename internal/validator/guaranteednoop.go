@@ -29,11 +29,8 @@ type GuaranteedNoOpFinding struct {
 	Value interface{}
 }
 
-// CheckGuaranteedNoOp scans m.Tests for a non-skipped entry — ordinary or
-// knownDefect alike, since runner.go's pre-patch no-op guard runs
-// unconditionally for both (runFieldTest, called for every non-skip entry
-// regardless of KnownDefect, knows nothing about that field) — whose
-// "value:" is the same shape already present at the entry's field path in
+// CheckGuaranteedNoOp scans m.Tests for a non-skipped entry whose "value:"
+// is the same shape already present at the entry's field path in
 // m.ForProvider, the manifest's own create-time spec.forProvider.
 //
 // It compares t.Value — never the effective expectation ("expect:" when

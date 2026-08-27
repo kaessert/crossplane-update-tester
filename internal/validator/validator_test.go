@@ -220,35 +220,6 @@ func TestValidateManifestMissingField(t *testing.T) {
 	}
 }
 
-// TestValidateManifestKnownDefectCountsAsCovered pins the coverage-gate
-// proof cc2f1edb's test plan asked for and never implemented: a manifest
-// whose only entry for a mutable field is a knownDefect entry (value: set,
-// no skip:) reports that field as fully covered, exactly like an ordinary
-// entry — update-test.validate must not demand a separate value: entry on
-// top of the one the knownDefect entry already carries, and a provider
-// adopting the token must not red-line on validate.
-func TestValidateManifestKnownDefectCountsAsCovered(t *testing.T) {
-	fields := []FieldInfo{
-		{GoName: "Comment", JSONName: fieldComment},
-	}
-	m := &manifest.Manifest{
-		Kind: kindWidget,
-		Tests: []manifest.UpdateTest{
-			{Field: fieldComment, Value: "Updated by update-tester", KnownDefect: "e9ce03ee-920d-46f5-9aa3-120228b196fb"},
-		},
-	}
-
-	result := ValidateManifest(m, fields)
-
-	if !result.AllGood {
-		t.Fatalf("expected AllGood=true — a knownDefect entry with a value: still runs the test and covers the field; got fields: %+v", result.Fields)
-	}
-	statusByName := statusMap(result)
-	if got := statusByName[fieldComment]; got != statusTested {
-		t.Errorf("field %q: status = %q, want %q — a knownDefect entry is credited the same way an ordinary entry is", fieldComment, got, statusTested)
-	}
-}
-
 // TestValidateManifestClearCreditsSwitchSiblings proves (AC a): a
 // non-skipped entry's clear: list credits every named sibling, in addition
 // to its own field, under a status distinct from "tested" — never folded

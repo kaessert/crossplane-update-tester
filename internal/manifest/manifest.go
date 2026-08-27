@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -57,6 +58,30 @@ type UpdateTest struct {
 	// the one arm being switched away from — see ValidateClear and
 	// runner.buildMergePatch for how this list is consumed.
 	Clear []string `yaml:"clear"`
+	// WithValues names OTHER top-level spec.forProvider fields that must
+	// carry an explicit, non-null literal value in the SAME merge patch
+	// that sets Field's own Value.
+	//
+	// It exists for two fields that are coupled on the BACKEND rather than
+	// merely in the CRD schema: a derived field cannot be set to a target
+	// value unless the field it derives from is ALSO given a real value in
+	// the same patch, because the backend re-derives the former from
+	// whatever the latter currently holds on every write that does not
+	// also carry an explicit value for it. Clear cannot express this: it
+	// only ever writes a literal JSON null for a sibling, and a null on an
+	// optional field is dropped from the outgoing request by omitempty
+	// rather than read as "set this to its zero value" — exactly the "no
+	// change" outcome a genuine backend-level clear must avoid. WithValues
+	// is the additive route for a sibling that needs a real, non-null
+	// value (including the empty string or an empty list) instead.
+	//
+	// A field named in WithValues must not also appear in Clear — the two
+	// disagree about what the same sibling should end up holding in the
+	// same patch, so combining them is rejected at parse time rather than
+	// left to whichever key a map happens to iterate last — see
+	// ValidateWithValues and runner.buildMergePatch for how this map is
+	// consumed.
+	WithValues map[string]interface{} `yaml:"withValues"`
 	// KnownDefect names the ticket ID tracking a real provider defect that
 	// makes this field's update path fail. Unlike Skip, a KnownDefect entry
 	// IS expressible and IS run: it exists for the field between "the test
@@ -655,6 +680,9 @@ func ParseAnnotation(annotation string) ([]UpdateTest, string, []string, []strin
 		if err := ValidateClear(t.Field, t.Clear); err != nil {
 			return nil, "", nil, nil, fmt.Errorf("entry %d (%s): %w", i, t.Field, err)
 		}
+		if err := ValidateWithValues(t.Field, t.WithValues, t.Clear); err != nil {
+			return nil, "", nil, nil, fmt.Errorf("entry %d (%s): %w", i, t.Field, err)
+		}
 		if err := ValidateIgnoreMapKeys(t); err != nil {
 			return nil, "", nil, nil, fmt.Errorf("entry %d (%s): %w", i, t.Field, err)
 		}
@@ -797,6 +825,70 @@ func ValidateClear(field string, clear []string) error {
 		if c == field {
 			return fmt.Errorf(
 				"clear entry %q: clear must name OTHER sibling fields, not the field being patched itself", c)
+		}
+	}
+	return nil
+}
+
+// ValidateWithValues rejects a withValues map the merge-patch builder
+// cannot honour, at parse time, before any cluster is touched.
+//
+// withValues follows the same top-level-only restriction ValidateClear
+// enforces on clear, and for the identical reason: the literal it adds
+// lands as a sibling KEY at the top level of the merge patch, alongside
+// field's own value, so field itself must be a top-level spec.forProvider
+// key for that sibling placement to mean what it says.
+//
+// Each key in withValues is validated the same way each entry in clear is:
+// a dotted key is rejected, since this tool only ever patches a top-level
+// sibling; a key equal to field itself is rejected too, for the same
+// reason ValidateClear rejects it — it would silently overwrite the very
+// value the patch is meant to set. A key that also appears in clear is
+// rejected as well: the two directives would disagree about what that one
+// sibling should hold in the same patch (a literal value from withValues,
+// a null from clear), and nothing about a map's iteration order should
+// decide which one wins.
+//
+// Exported so every source of a withValues map shares this one check — the
+// "withValues:" key on an update-test annotation entry (via ParseAnnotation
+// above) and the merge-patch builder that actually shapes the JSON (see
+// runner.buildMergePatch).
+func ValidateWithValues(field string, withValues map[string]interface{}, clear []string) error {
+	if len(withValues) == 0 {
+		return nil
+	}
+	if strings.Contains(field, ".") {
+		return fmt.Errorf(
+			"withValues is only supported for a top-level field; %q is nested — sibling-value patching at a "+
+				"non-root nesting level is not supported", field)
+	}
+	clearSet := make(map[string]bool, len(clear))
+	for _, c := range clear {
+		clearSet[c] = true
+	}
+	// Sorted so a map with more than one invalid entry reports the SAME
+	// offending key on every run — map iteration order is randomised by
+	// Go, and an error message that changes from run to run for identical
+	// input is its own small bug.
+	keys := make([]string, 0, len(withValues))
+	for k := range withValues {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, sibling := range keys {
+		if strings.Contains(sibling, ".") {
+			return fmt.Errorf(
+				"withValues entry %q: dot-separated paths are not supported — withValues only names a "+
+					"top-level spec.forProvider field", sibling)
+		}
+		if sibling == field {
+			return fmt.Errorf(
+				"withValues entry %q: withValues must name OTHER sibling fields, not the field being patched itself", sibling)
+		}
+		if clearSet[sibling] {
+			return fmt.Errorf(
+				"withValues entry %q: also named in this entry's clear list — a sibling cannot be both nulled "+
+					"and given a literal value in the same merge patch; remove it from one list", sibling)
 		}
 	}
 	return nil

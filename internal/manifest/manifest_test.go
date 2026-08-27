@@ -1,6 +1,7 @@
 package manifest
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -688,6 +689,149 @@ func TestParseAnnotationRejectsUnsupportedClearShapes(t *testing.T) {
   clear: [botProtectionSetting]
 `,
 			wantErrSubstr: `clear entry "botProtectionSetting": clear must name OTHER sibling fields`,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, _, _, _, err := ParseAnnotation(tc.annotation)
+			if err == nil {
+				t.Fatalf("%s: ParseAnnotation() error = nil, want an error", tc.reason)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrSubstr) {
+				t.Errorf("%s: ParseAnnotation() error = %q, want it to contain %q", tc.reason, err.Error(), tc.wantErrSubstr)
+			}
+		})
+	}
+}
+
+// TestParseBytesWithValuesField proves a "withValues:" key on an
+// update-test entry parses onto UpdateTest.WithValues, and that a manifest
+// with no "withValues:" key at all parses with a nil WithValues — mirroring
+// TestParseBytesClearField for the additive sibling-literal-value route.
+func TestParseBytesWithValuesField(t *testing.T) {
+	cases := map[string]struct {
+		reason string
+		yaml   string
+		want   map[string]interface{}
+	}{
+		"Absent": {
+			reason: "an entry with no withValues key parses with a nil WithValues, not an error",
+			yaml: `
+apiVersion: network.example.crossplane.io/v1alpha1
+kind: Network
+metadata:
+  name: example-network
+  annotations:
+    crossplane.io/update-test: |
+      - field: comment
+        value: "updated"
+`,
+			want: nil,
+		},
+		"SingleSibling": {
+			reason: "a single-entry withValues map is parsed verbatim, carrying a real non-null literal",
+			yaml: `
+apiVersion: network.example.crossplane.io/v1alpha1
+kind: Network
+metadata:
+  name: example-network
+  annotations:
+    crossplane.io/update-test: |
+      - field: tags
+        value: []
+        withValues:
+          tag: ""
+`,
+			want: map[string]interface{}{"tag": ""},
+		},
+		"MultipleSiblings": {
+			reason: "every named sibling's literal value is preserved, not just the first",
+			yaml: `
+apiVersion: network.example.crossplane.io/v1alpha1
+kind: Network
+metadata:
+  name: example-network
+  annotations:
+    crossplane.io/update-test: |
+      - field: armA
+        value: "x"
+        withValues:
+          armB: "y"
+          armC: "z"
+`,
+			want: map[string]interface{}{"armB": "y", "armC": "z"},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			m, err := ParseBytes([]byte(tc.yaml))
+			if err != nil {
+				t.Fatalf("%s: ParseBytes() error = %v", tc.reason, err)
+			}
+			if len(m.Tests) != 1 {
+				t.Fatalf("%s: len(Tests) = %d, want 1", tc.reason, len(m.Tests))
+			}
+			if !reflect.DeepEqual(m.Tests[0].WithValues, tc.want) {
+				t.Errorf("%s: Tests[0].WithValues = %#v, want %#v", tc.reason, m.Tests[0].WithValues, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseAnnotationRejectsUnsupportedWithValuesShapes pins
+// ValidateWithValues's rejections at the annotation-parsing entry point —
+// before any cluster is touched — mirroring
+// TestParseAnnotationRejectsUnsupportedClearShapes for the additive
+// withValues mechanism, plus the one shape unique to withValues: a sibling
+// named in both clear and withValues in the same entry.
+func TestParseAnnotationRejectsUnsupportedWithValuesShapes(t *testing.T) {
+	cases := map[string]struct {
+		reason        string
+		annotation    string
+		wantErrSubstr string
+	}{
+		"NestedFieldWithWithValues": {
+			reason: "sibling-value patching at a non-root nesting level is not supported",
+			annotation: `
+- field: parent.child
+  value: "x"
+  withValues:
+    otherTopLevel: "y"
+`,
+			wantErrSubstr: `withValues is only supported for a top-level field; "parent.child" is nested`,
+		},
+		"DottedWithValuesKey": {
+			reason: "a withValues key naming a nested path is rejected the same way clear rejects one",
+			annotation: `
+- field: tags
+  value: []
+  withValues:
+    nested.sibling: "x"
+`,
+			wantErrSubstr: `withValues entry "nested.sibling": dot-separated paths are not supported`,
+		},
+		"WithValuesNamesFieldItself": {
+			reason: "withValues must name OTHER siblings, not the field being patched",
+			annotation: `
+- field: tags
+  value: []
+  withValues:
+    tags: ["x"]
+`,
+			wantErrSubstr: `withValues entry "tags": withValues must name OTHER sibling fields`,
+		},
+		"KeyInBothClearAndWithValues": {
+			reason: "a sibling cannot be both nulled and given a literal value in the same merge patch",
+			annotation: `
+- field: tags
+  value: []
+  clear: [tag]
+  withValues:
+    tag: ""
+`,
+			wantErrSubstr: `withValues entry "tag": also named in this entry's clear list`,
 		},
 	}
 

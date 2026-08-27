@@ -1263,6 +1263,55 @@ func TestApplyPatchAndReconcileClearNullsSiblingInSamePatch(t *testing.T) {
 	}
 }
 
+// TestApplyPatchAndReconcileWithValuesSetsSiblingLiteralInSamePatch proves
+// the end-to-end wiring of manifest.UpdateTest.WithValues:
+// applyPatchAndReconcile passes t.WithValues through to Patch/
+// buildMergePatch, so an entry clearing a backend-derived field (tags) and
+// its coupled source field (tag) converge in ONE kubectl patch call, with
+// neither side left null — the shape clear: alone cannot express because it
+// only ever nulls a sibling.
+func TestApplyPatchAndReconcileWithValuesSetsSiblingLiteralInSamePatch(t *testing.T) {
+	f := &fakeCluster{
+		forProvider: map[string]interface{}{
+			"tag":  "legacy-value",
+			"tags": []interface{}{"legacy-value"},
+		},
+		atProvider:      map[string]interface{}{},
+		generation:      1,
+		kind:            testKindExample,
+		name:            testNameExample,
+		readyAfterCalls: 1,
+	}
+	r := newFakeRunner(f)
+
+	test := manifest.UpdateTest{
+		Field:      "tags",
+		Value:      []interface{}{},
+		WithValues: map[string]interface{}{"tag": ""},
+	}
+	if err := r.applyPatchAndReconcile(test); err != nil {
+		t.Fatalf("applyPatchAndReconcile: %v", err)
+	}
+
+	if f.patchCalls != 1 {
+		t.Errorf("expected exactly 1 real field patch (both fields must converge atomically), got %d", f.patchCalls)
+	}
+	tagValue, tagPresent := f.forProvider["tag"]
+	if !tagPresent {
+		t.Fatalf("forProvider is missing tag after the withValues-bearing patch, want it present and set to \"\"")
+	}
+	if tagValue != "" {
+		t.Errorf("forProvider[\"tag\"] = %#v, want the literal empty string, not null and not left unchanged", tagValue)
+	}
+	tagsValue, tagsPresent := f.forProvider["tags"]
+	if !tagsPresent {
+		t.Fatalf("forProvider is missing tags after the patch, want the primary field's own value applied")
+	}
+	if _, ok := tagsValue.([]interface{}); !ok || len(tagsValue.([]interface{})) != 0 {
+		t.Errorf("forProvider[\"tags\"] = %#v, want an empty slice", tagsValue)
+	}
+}
+
 // TestRunFieldTestNotEvidencedWhenNoUpdateEvent covers the failure mode this
 // evidence check exists to catch: a field whose observed value ends up
 // matching the target (e.g. because something outside the reconciler wrote
@@ -3100,15 +3149,21 @@ func TestResolveResourceRecordsNamespace(t *testing.T) {
 
 // TestBuildMergePatch covers the dot-path-to-JSON-merge-patch conversion,
 // including the nested case where each segment becomes a wrapping object,
-// and the "clear" case where OTHER top-level forProvider siblings are
-// nulled in the SAME patch object as the primary field's value.
+// the "clear" case where OTHER top-level forProvider siblings are nulled in
+// the SAME patch object as the primary field's value, and the "withValues"
+// case where OTHER top-level forProvider siblings are given an explicit,
+// non-null literal value in that same patch object — the route a
+// backend-derived field (e.g. one re-computed from a deprecated source
+// field on every write that omits it) needs when it cannot be cleared
+// without its source field ALSO carrying a real value in the same patch.
 func TestBuildMergePatch(t *testing.T) {
 	cases := map[string]struct {
-		reason string
-		field  string
-		value  interface{}
-		clear  []string
-		want   string
+		reason     string
+		field      string
+		value      interface{}
+		clear      []string
+		withValues map[string]interface{}
+		want       string
 	}{
 		"TopLevelField": {
 			reason: "a single segment patches one key under spec.forProvider",
@@ -3136,11 +3191,33 @@ func TestBuildMergePatch(t *testing.T) {
 			clear:  []string{"armB", "armC"},
 			want:   `{"spec":{"forProvider":{"armA":"x","armB":null,"armC":null}}}`,
 		},
+		"WithValuesSingleSibling": {
+			reason:     "a top-level field with one withValues entry sets that sibling's literal value in the SAME patch object, neither one null",
+			field:      "tags",
+			value:      []interface{}{},
+			withValues: map[string]interface{}{"tag": ""},
+			want:       `{"spec":{"forProvider":{"tag":"","tags":[]}}}`,
+		},
+		"WithValuesMultipleSiblings": {
+			reason:     "every named sibling carries its own literal value, not just the first",
+			field:      "armA",
+			value:      "x",
+			withValues: map[string]interface{}{"armB": "y", "armC": "z"},
+			want:       `{"spec":{"forProvider":{"armA":"x","armB":"y","armC":"z"}}}`,
+		},
+		"ClearAndWithValuesTogether": {
+			reason:     "clear and withValues name disjoint siblings and combine freely in one patch object",
+			field:      "armA",
+			value:      "x",
+			clear:      []string{"armB"},
+			withValues: map[string]interface{}{"armC": "z"},
+			want:       `{"spec":{"forProvider":{"armA":"x","armB":null,"armC":"z"}}}`,
+		},
 	}
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			got, err := buildMergePatch(tc.field, tc.value, tc.clear)
+			got, err := buildMergePatch(tc.field, tc.value, tc.clear, tc.withValues)
 			if err != nil {
 				t.Fatalf("%s: unexpected error: %v", tc.reason, err)
 			}
@@ -3184,7 +3261,55 @@ func TestBuildMergePatchRejectsUnsupportedClearShapes(t *testing.T) {
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			_, err := buildMergePatch(tc.field, "value", tc.clear)
+			_, err := buildMergePatch(tc.field, "value", tc.clear, nil)
+			if err == nil {
+				t.Fatalf("%s: expected an error, got none", tc.reason)
+			}
+		})
+	}
+}
+
+// TestBuildMergePatchRejectsUnsupportedWithValuesShapes proves the shapes
+// buildMergePatch's withValues route cannot honour are rejected outright,
+// mirroring TestBuildMergePatchRejectsUnsupportedClearShapes for the
+// additive withValues mechanism: a dotted field, a dotted withValues key, a
+// withValues key equal to field itself, and a key named in BOTH clear and
+// withValues (the two would disagree about what that sibling ends up
+// holding in the same patch).
+func TestBuildMergePatchRejectsUnsupportedWithValuesShapes(t *testing.T) {
+	cases := map[string]struct {
+		reason     string
+		field      string
+		clear      []string
+		withValues map[string]interface{}
+	}{
+		"NestedFieldWithWithValues": {
+			reason: "sibling-value patching at a non-root nesting level is not supported: a dotted field's " +
+				"\"sibling\" would land next to the nested field's own parent object, not next to its value",
+			field:      "parent.child",
+			withValues: map[string]interface{}{"otherTopLevel": "x"},
+		},
+		"DottedWithValuesKey": {
+			reason:     "withValues only names a top-level spec.forProvider field, mirroring clear's own dot rejection",
+			field:      "tags",
+			withValues: map[string]interface{}{"nested.sibling": "x"},
+		},
+		"WithValuesNamesFieldItself": {
+			reason:     "withValues must name OTHER siblings; naming field itself would silently overwrite the value the patch just set",
+			field:      "tags",
+			withValues: map[string]interface{}{"tags": []interface{}{}},
+		},
+		"KeyInBothClearAndWithValues": {
+			reason:     "a sibling cannot be both nulled and given a literal value in the same merge patch",
+			field:      "tags",
+			clear:      []string{"tag"},
+			withValues: map[string]interface{}{"tag": ""},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := buildMergePatch(tc.field, "value", tc.clear, tc.withValues)
 			if err == nil {
 				t.Fatalf("%s: expected an error, got none", tc.reason)
 			}

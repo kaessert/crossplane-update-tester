@@ -866,6 +866,7 @@ three top-level directive lines: `converge-skip:`, `assert-unchanged:` and
 | `expect` | Optional. The value expected in `status.atProvider` when the backend normalises what it stores. Defaults to `value`. |
 | `skip` | Optional. Either a free-prose string (the legacy form, reported as `SKIPPED` and credited under `validate`'s `skipped-unstructured` status) or a structured mapping with a `reason:` from a closed set (reported as `SKIPPED` and credited under `validate`'s `skipped` status — see "`skip:` reasons" below). Either way the entry still counts as coverage for `validate` and is mutually exclusive with `knownDefect`. |
 | `clear` | Optional. A list of OTHER top-level `spec.forProvider` field names nulled in the SAME merge patch that sets `field`'s value, so a union modeled as separate top-level fields switches arms atomically. Only valid when `field` itself is top-level (not dotted); a dotted entry, or one naming `field` itself, is rejected at parse time — even for a `field` with no other sibling to name; see "Whole-field tombstones without a sibling field" for that case's own route. |
+| `withValues` | Optional. A mapping of OTHER top-level `spec.forProvider` field names to an explicit, non-null literal value set in the SAME merge patch that sets `field`'s value — see "Backend-coupled fields: converging a source field and its derived field in one patch" below. Only valid when `field` itself is top-level (not dotted); a dotted key, a key naming `field` itself, or a key also present in this entry's own `clear` list is rejected at parse time. |
 | `knownDefect` | Optional. The ID of the ticket tracking a real defect that keeps this field's update path from converging. Unlike `skip`, the entry RUNS: `value` is required, the patch is applied exactly as normal, and non-convergence is reported as `KNOWN-DEFECT` — expected, not a failure. If the field DOES converge, that FAILS the run hard as `KNOWN-DEFECT CONVERGED`, naming the ticket and telling the reader to delete the token. A field that converges in value but has no `Update()` Event to prove it (`NOT-EVIDENCED`) is likewise never credited as `KNOWN-DEFECT` — it fails the run through its own `NOT-EVIDENCED` verdict instead, since a value match is evidence the defect may already be fixed. Mutually exclusive with `skip`. The value must be non-empty, contain no whitespace, not be a placeholder (`TODO`, `TBD`, `n/a`, etc.), and be at least 6 characters — reject anything that cannot be followed back to an actual ticket. Also rejected if the same top-level field name appears in this manifest's own `ignore-fields:` set (dead config — see `ignore-fields:` below). |
 | `ignoreMapKeys` | Optional. A list of top-level member keys excluded, on BOTH sides, from `run`'s equality check between `expect` (or `value`, when `expect` is unset) and the live `status.atProvider` value — see "`ignoreMapKeys:` — excluding a provider-injected map member" below. Mutually exclusive with `skip` (there is no comparison left for it to affect). |
 | `ignoreListElementKeys` | Optional. A list of per-element member keys excluded, on BOTH sides and from EVERY element, from `run`'s equality check between `expect` (or `value`, when `expect` is unset) and the live `status.atProvider` value, for a list-of-objects field — see "`ignoreListElementKeys:` — excluding a provider-injected per-element member" below. Mutually exclusive with `skip` (there is no comparison left for it to affect). |
@@ -968,6 +969,42 @@ Either working route only ever credits the exact field carrying it;
 neither has an ancestor-walk analogue the way a `clear:` tombstone on an
 ancestor object does; see the `containerClear` cell-denominator breakdown
 above for how this is reported.
+
+#### Backend-coupled fields: converging a source field and its derived field in one patch
+
+`clear:` folds a `null` for a sibling into the same merge patch; `withValues:`
+folds an explicit, non-null LITERAL for a sibling into that same patch
+instead. It exists for a pair of fields that are coupled on the BACKEND, not
+merely in the CRD schema: a deprecated source field and the field the backend
+derives from it on every write. A backend of this shape re-derives the
+derived field from whatever the source field currently holds server-side on
+ANY patch that does not also carry an explicit value for the source field —
+independent of what that same patch's own value for the derived field is. So
+genuinely converging the derived field to a new value, once the source field
+has ever been set, requires the SAME patch to also carry a real, non-null
+value for the source field. `clear:` cannot express this: a `null` on an
+optional field is dropped from the outgoing request by `omitempty` rather
+than read as "clear this", which is exactly the "no change" outcome that
+fails to converge the source field at all.
+
+```yaml
+crossplane.io/update-test: |
+  - field: tags
+    value: []
+    withValues:
+      tag: ""
+```
+
+This converges `tags` to an empty list and `tag` to an empty string in ONE
+merge patch — `{"spec":{"forProvider":{"tag":"","tags":[]}}}` — rather than
+two sequential patches, each of which would independently succeed at the
+Kubernetes level while leaving a window where the two fields disagree on the
+backend.
+
+A field named in `withValues:` must not also appear in this entry's own
+`clear:` list — the two directives would disagree about what that one
+sibling ends up holding in the same patch, so the combination is rejected at
+parse time rather than left to resolve however a map happens to iterate.
 
 #### `assert-unchanged:` — silent-wipe guard
 

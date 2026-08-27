@@ -328,11 +328,14 @@ func (r *Runner) NudgeReconcile() error {
 }
 
 // Patch applies a JSON merge patch for the given field and value. clear
-// names OTHER top-level spec.forProvider fields to null in the SAME patch —
-// see manifest.UpdateTest.Clear and buildMergePatch. Pass nil (or an empty
-// slice) when the test has no clear directive.
-func (r *Runner) Patch(field string, value interface{}, clear []string) error {
-	patchJSON, err := buildMergePatch(field, value, clear)
+// names OTHER top-level spec.forProvider fields to null in the SAME patch,
+// and withValues names OTHER top-level spec.forProvider fields to set to an
+// explicit, non-null literal value in the SAME patch — see
+// manifest.UpdateTest.Clear, manifest.UpdateTest.WithValues and
+// buildMergePatch. Pass nil (or an empty slice/map) when the test carries
+// no clear or withValues directive.
+func (r *Runner) Patch(field string, value interface{}, clear []string, withValues map[string]interface{}) error {
+	patchJSON, err := buildMergePatch(field, value, clear, withValues)
 	if err != nil {
 		return fmt.Errorf("building patch: %w", err)
 	}
@@ -1486,7 +1489,7 @@ func (r *Runner) runFieldTest(t manifest.UpdateTest, snapshot []byte, kind, name
 // reconcile waiting on the same background poll tick this is meant to
 // avoid.
 func (r *Runner) applyPatchAndReconcile(t manifest.UpdateTest) error {
-	if err := r.Patch(t.Field, t.Value, t.Clear); err != nil {
+	if err := r.Patch(t.Field, t.Value, t.Clear, t.WithValues); err != nil {
 		return err
 	}
 	if err := r.reconcileOnce(); err != nil {
@@ -1765,16 +1768,23 @@ func CheckExternalNamePrefix(name, expectedPrefix string) (ok bool, reason strin
 
 // buildMergePatch constructs a JSON merge patch for a dot-separated field
 // path under spec.forProvider, optionally nulling one or more sibling
-// top-level forProvider fields in the SAME patch object — see
-// manifest.UpdateTest.Clear for why a standalone patch of the primary field
-// cannot also null a sibling: a JSON merge patch (RFC 7386) only reaches
-// keys the patch object itself names, so a second sequential patch would be
-// required, and the two are not atomic together. clear is validated through
-// manifest.ValidateClear before any patch is built, so a dotted field paired
-// with a non-empty clear, a dotted clear entry, or a clear entry equal to
-// field itself never reaches the map-building below.
-func buildMergePatch(field string, value interface{}, clear []string) (string, error) {
+// top-level forProvider fields (clear) and/or setting one or more sibling
+// top-level forProvider fields to an explicit, non-null literal value
+// (withValues) in the SAME patch object — see manifest.UpdateTest.Clear and
+// manifest.UpdateTest.WithValues for why a standalone patch of the primary
+// field cannot also touch a sibling: a JSON merge patch (RFC 7386) only
+// reaches keys the patch object itself names, so a second sequential patch
+// would be required, and the two are not atomic together. clear and
+// withValues are each validated through manifest.ValidateClear and
+// manifest.ValidateWithValues before any patch is built, so a dotted field
+// paired with either, a dotted entry in either, a clear/withValues entry
+// equal to field itself, or a sibling named in both never reaches the
+// map-building below.
+func buildMergePatch(field string, value interface{}, clear []string, withValues map[string]interface{}) (string, error) {
 	if err := manifest.ValidateClear(field, clear); err != nil {
+		return "", err
+	}
+	if err := manifest.ValidateWithValues(field, withValues, clear); err != nil {
 		return "", err
 	}
 
@@ -1786,17 +1796,21 @@ func buildMergePatch(field string, value interface{}, clear []string) (string, e
 		inner = map[string]interface{}{parts[i]: inner}
 	}
 
-	if len(clear) > 0 {
-		// ValidateClear already confirmed field has no dot, so inner is
-		// exactly the single-iteration map built above — the top-level
-		// spec.forProvider object itself, safe to add sibling nulls into
-		// directly.
+	if len(clear) > 0 || len(withValues) > 0 {
+		// ValidateClear/ValidateWithValues already confirmed field has no
+		// dot whenever either is non-empty, so inner is exactly the
+		// single-iteration map built above — the top-level
+		// spec.forProvider object itself, safe to add sibling entries
+		// into directly.
 		forProvider, ok := inner.(map[string]interface{})
 		if !ok {
 			return "", fmt.Errorf("internal error: field %q produced a non-map patch body", field)
 		}
 		for _, sibling := range clear {
 			forProvider[sibling] = nil
+		}
+		for sibling, v := range withValues {
+			forProvider[sibling] = v
 		}
 		inner = forProvider
 	}

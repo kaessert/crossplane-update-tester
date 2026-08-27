@@ -89,20 +89,36 @@ func collectContainerLeaves(schema interface{}, prefix string, out *[]ContainerL
 }
 
 // ContainerClearFinding records one declared container-typed leaf's
-// clear-direction coverage.
+// clear-direction coverage — one of THREE states, never two: covered,
+// uncovered, or ineligible. Ineligible is distinct from uncovered: it
+// means the leaf's removal direction cannot be exercised AT ALL (see
+// IneligibilityReason), so it is excluded from the container-clear
+// denominator entirely rather than counted as a gap to close. Covered is
+// always false when Ineligible is true — ContainerClearCoverage refuses to
+// produce a finding that is both (see its own doc comment).
 //
 // REPORT-ONLY, by construction: this type carries no field a caller could
 // fold into a process exit code without writing new code to do so, and no
-// function in this file returns a bool or error that means "fail". Six of
-// the fleet's seven providers measure zero clear-direction coverage today;
-// enforcing this would break every one of their E2E runs the moment it
-// shipped. Flipping this from advisory to enforcing is a distinct,
-// deliberate, later act — not a side effect of this type existing.
+// function in this file returns a bool or error that means "fail" for the
+// covered/uncovered split. Six of the fleet's seven providers measure zero
+// clear-direction coverage today; enforcing this would break every one of
+// their E2E runs the moment it shipped. Flipping this from advisory to
+// enforcing is a distinct, deliberate, later act — not a side effect of
+// this type existing.
 type ContainerClearFinding struct {
 	Path    string
 	Shape   Shape
 	Covered bool
-	Detail  string
+	// Ineligible is true when this leaf's removal direction can never be
+	// exercised — see IneligibilityReason. An ineligible leaf is excluded
+	// from the container-clear denominator (see containerLeafSummary) but
+	// is still reported here, with Reason set, so an exclusion is always
+	// visible and auditable rather than silently dropped.
+	Ineligible bool
+	// Reason explains why Ineligible is true. Empty when Ineligible is
+	// false.
+	Reason IneligibilityReason
+	Detail string
 }
 
 // ContainerClearCoverage checks every declared container-typed leaf under
@@ -144,8 +160,19 @@ type ContainerClearFinding struct {
 // than nulling it, is NOT covered — an RFC-7386 merge patch treats an
 // omitted key as "leave alone", never as "remove", which is exactly the
 // blind spot this check exists to close.
+//
+// A leaf classified INELIGIBLE (see IneligibilityReason and
+// classifyIneligibility) skips all of the above: its removal direction can
+// never be exercised at all, so it is reported with Ineligible set and
+// Covered always false — see this function's own contradiction check
+// below for what happens when an existing manifest entry disagrees.
 func ContainerClearCoverage(crd map[string]interface{}, m *manifest.Manifest) ([]ContainerClearFinding, error) {
 	leaves, err := DeclaredContainerLeaves(crd)
+	if err != nil {
+		return nil, err
+	}
+
+	ineligible, err := classifyIneligibility(crd, leaves)
 	if err != nil {
 		return nil, err
 	}
@@ -165,37 +192,51 @@ func ContainerClearCoverage(crd map[string]interface{}, m *manifest.Manifest) ([
 
 	findings := make([]ContainerClearFinding, 0, len(leaves))
 	for _, leaf := range leaves {
-		ancestor, ancestorCleared := clearedAncestor(leaf.Path, clearedSiblings)
-		self, hasSelf := selfByField[leaf.Path]
-		switch {
-		case clearedSiblings[leaf.Path]:
+		covered, detail := coverageFor(leaf, clearedSiblings, perKeyNulled, selfByField)
+
+		if reason, isIneligible := ineligible[leaf.Path]; isIneligible {
+			if covered {
+				// A leaf can never be both ineligible and covered — an
+				// existing manifest entry exercising a removal direction
+				// this run's schema-derived predicate says cannot be
+				// exercised is a contradiction in the predicate itself, not
+				// something to silently resolve one way or the other.
+				return nil, fmt.Errorf(
+					"container leaf %q is classified BOTH ineligible (%s) and covered (%s) — "+
+						"the ineligibility predicate and the manifest's own coverage disagree; fix the predicate or the manifest, do not silently prefer one",
+					leaf.Path, reason, detail)
+			}
 			findings = append(findings, ContainerClearFinding{
-				Path: leaf.Path, Shape: leaf.Shape, Covered: true,
-				Detail: "whole-field tombstone: named in a sibling entry's clear: list",
+				Path: leaf.Path, Shape: leaf.Shape, Ineligible: true, Reason: reason,
+				Detail: string(reason),
 			})
-		case ancestorCleared:
-			findings = append(findings, ContainerClearFinding{
-				Path: leaf.Path, Shape: leaf.Shape, Covered: true,
-				Detail: fmt.Sprintf("whole-subtree tombstone: ancestor %q named in a sibling entry's clear: list removes this leaf too", ancestor),
-			})
-		case perKeyNulled[leaf.Path]:
-			findings = append(findings, ContainerClearFinding{
-				Path: leaf.Path, Shape: leaf.Shape, Covered: true,
-				Detail: "per-key removal: this field's own tested value nulls a member key",
-			})
-		case hasSelf && selfTombstoned(self, leaf.Shape):
-			findings = append(findings, ContainerClearFinding{
-				Path: leaf.Path, Shape: leaf.Shape, Covered: true,
-				Detail: "whole-field tombstone: this field's own tested value is an explicit `value: null` or an empty container, with no sibling field needed to host it",
-			})
-		default:
-			findings = append(findings, ContainerClearFinding{
-				Path: leaf.Path, Shape: leaf.Shape, Covered: false,
-				Detail: "no clear:, whole-field tombstone, whole-subtree tombstone, per-key removal, or self-tombstone exercises this container leaf's removal direction",
-			})
+			continue
 		}
+
+		findings = append(findings, ContainerClearFinding{Path: leaf.Path, Shape: leaf.Shape, Covered: covered, Detail: detail})
 	}
 	return findings, nil
+}
+
+// coverageFor applies the covered/uncovered decision ContainerClearCoverage
+// documents to one leaf, independent of whether that leaf turns out to be
+// ineligible — kept separate so the ineligible/covered contradiction check
+// above can compute both without duplicating this logic.
+func coverageFor(leaf ContainerLeaf, clearedSiblings, perKeyNulled map[string]bool, selfByField map[string]manifest.UpdateTest) (covered bool, detail string) {
+	ancestor, ancestorCleared := clearedAncestor(leaf.Path, clearedSiblings)
+	self, hasSelf := selfByField[leaf.Path]
+	switch {
+	case clearedSiblings[leaf.Path]:
+		return true, "whole-field tombstone: named in a sibling entry's clear: list"
+	case ancestorCleared:
+		return true, fmt.Sprintf("whole-subtree tombstone: ancestor %q named in a sibling entry's clear: list removes this leaf too", ancestor)
+	case perKeyNulled[leaf.Path]:
+		return true, "per-key removal: this field's own tested value nulls a member key"
+	case hasSelf && selfTombstoned(self, leaf.Shape):
+		return true, "whole-field tombstone: this field's own tested value is an explicit `value: null` or an empty container, with no sibling field needed to host it"
+	default:
+		return false, "no clear:, whole-field tombstone, whole-subtree tombstone, per-key removal, or self-tombstone exercises this container leaf's removal direction"
+	}
 }
 
 // clearedAncestor reports whether some strict ancestor of the dotted path
@@ -272,13 +313,27 @@ func selfTombstoned(t manifest.UpdateTest, shape Shape) bool {
 
 // containerLeafSummary renders a one-line coverage tally, e.g.
 // "3/9 container leaves carry clear-direction coverage" — the shape a CLI
-// report prints alongside the per-leaf detail.
+// report prints alongside the per-leaf detail. Ineligible leaves are
+// excluded from BOTH the numerator and the denominator — they are not
+// gaps to close, they cannot be exercised at all — and, when any exist,
+// their count is appended so an exclusion is never silently invisible in
+// the one-line tally.
 func containerLeafSummary(findings []ContainerClearFinding) string {
 	covered := 0
+	eligible := 0
+	ineligible := 0
 	for _, f := range findings {
+		if f.Ineligible {
+			ineligible++
+			continue
+		}
+		eligible++
 		if f.Covered {
 			covered++
 		}
 	}
-	return fmt.Sprintf("%d/%d container leaves carry clear-direction coverage", covered, len(findings))
+	if ineligible == 0 {
+		return fmt.Sprintf("%d/%d container leaves carry clear-direction coverage", covered, eligible)
+	}
+	return fmt.Sprintf("%d/%d container leaves carry clear-direction coverage (%d ineligible, excluded)", covered, eligible, ineligible)
 }

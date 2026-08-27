@@ -1270,7 +1270,14 @@ type roundtripVerifyReportJSON struct {
 	Seed           int64                `json:"seed"`
 	Cells          []cellCreditJSON     `json:"cells,omitempty"`
 	ContainerClear []containerClearJSON `json:"containerClear,omitempty"`
-	Waivers        []waiverFindingJSON  `json:"waivers,omitempty"`
+	// ContainerClearError is set instead of ContainerClear when
+	// roundtrip.ContainerClearCoverage itself errors — most notably its own
+	// ineligible-and-covered contradiction check. Never gates this command's
+	// exit code (container-clear stays report-only), but a contradiction is
+	// reported here rather than silently collapsing ContainerClear to an
+	// empty list, which would read identically to "nothing declared".
+	ContainerClearError string              `json:"containerClearError,omitempty"`
+	Waivers             []waiverFindingJSON `json:"waivers,omitempty"`
 }
 
 // cellCreditJSON is the machine-readable shape one roundtrip.CellCredit
@@ -1294,11 +1301,16 @@ type cellCreditJSON struct {
 // containerClearJSON is the machine-readable shape one
 // roundtrip.ContainerClearFinding renders as. REPORT-ONLY: nothing reads
 // this slice to decide anyFindings — see buildRoundtripVerifyReport.
+// Ineligible/Reason surface the third state (see
+// roundtrip.ContainerClearFinding's own doc comment): Covered is always
+// false when Ineligible is true, and Reason is empty otherwise.
 type containerClearJSON struct {
-	Path    string `json:"path"`
-	Shape   string `json:"shape"`
-	Covered bool   `json:"covered"`
-	Detail  string `json:"detail"`
+	Path       string `json:"path"`
+	Shape      string `json:"shape"`
+	Covered    bool   `json:"covered"`
+	Ineligible bool   `json:"ineligible,omitempty"`
+	Reason     string `json:"reason,omitempty"`
+	Detail     string `json:"detail"`
 }
 
 // waiverFindingJSON is the machine-readable shape one
@@ -1330,7 +1342,10 @@ func toCellCreditJSON(credits []roundtrip.CellCredit, backend roundtrip.BackendT
 func toContainerClearJSON(findings []roundtrip.ContainerClearFinding) []containerClearJSON {
 	out := make([]containerClearJSON, len(findings))
 	for i, f := range findings {
-		out[i] = containerClearJSON{Path: f.Path, Shape: string(f.Shape), Covered: f.Covered, Detail: f.Detail}
+		out[i] = containerClearJSON{
+			Path: f.Path, Shape: string(f.Shape), Covered: f.Covered,
+			Ineligible: f.Ineligible, Reason: string(f.Reason), Detail: f.Detail,
+		}
 	}
 	return out
 }
@@ -1480,28 +1495,42 @@ func buildRoundtripVerifyReport(
 	credits, _ := roundtrip.CreditCells(cells, rotation, scope)
 
 	var clearFindings []roundtrip.ContainerClearFinding
+	var containerClearErr string
 	if crd != nil {
-		// Error ignored: a schema-shape problem here would already have
-		// surfaced via DiffReport above, which ran against the same CRD;
-		// this call cannot fail independently of that one in practice, and
-		// container-clear coverage is report-only regardless (see
-		// ContainerClearFinding's own doc comment).
-		clearFindings, _ = roundtrip.ContainerClearCoverage(crd, m)
+		// An error here is no longer assumed impossible: ContainerClearCoverage
+		// itself refuses to produce a finding that is both ineligible (see
+		// roundtrip.IneligibilityReason) and covered by an existing manifest
+		// entry, and the fleet HAS measured live instances of that
+		// contradiction (an ancestor clear: tombstone that incidentally also
+		// nulls a reference-resolution sibling; a self-tombstone authored
+		// against a field a CEL rule actually requires). Surfacing it as
+		// ContainerClearError — rather than silently discarding clearFindings
+		// to an empty list, which would read identically to "nothing
+		// declared" — keeps container-clear report-only (still never gates
+		// this command's exit code) while making the contradiction visible
+		// rather than invisible.
+		var err error
+		clearFindings, err = roundtrip.ContainerClearCoverage(crd, m)
+		if err != nil {
+			containerClearErr = err.Error()
+			clearFindings = nil
+		}
 	}
 	waivers := roundtrip.ClassifyWaivers(m, rows)
 
 	report = roundtripVerifyReportJSON{
-		Kind:           m.Kind,
-		Name:           m.Name,
-		Rows:           toRoundtripVerifyRowJSON(rows),
-		MustTestCount:  mustTestCount,
-		Findings:       toRoundtripVerifyFindingJSON(findings),
-		Excluded:       toRoundtripVerifyExcludedJSON(excluded),
-		Backend:        string(backend),
-		Seed:           rotation.Seed,
-		Cells:          toCellCreditJSON(credits, backend),
-		ContainerClear: toContainerClearJSON(clearFindings),
-		Waivers:        toWaiverFindingJSON(waivers),
+		Kind:                m.Kind,
+		Name:                m.Name,
+		Rows:                toRoundtripVerifyRowJSON(rows),
+		MustTestCount:       mustTestCount,
+		Findings:            toRoundtripVerifyFindingJSON(findings),
+		Excluded:            toRoundtripVerifyExcludedJSON(excluded),
+		Backend:             string(backend),
+		Seed:                rotation.Seed,
+		Cells:               toCellCreditJSON(credits, backend),
+		ContainerClear:      toContainerClearJSON(clearFindings),
+		ContainerClearError: containerClearErr,
+		Waivers:             toWaiverFindingJSON(waivers),
 	}
 	return report, findings, excluded, len(findings) > 0
 }
@@ -1570,6 +1599,9 @@ func cmdRoundtripVerify(args []string) error {
 		printfTo(os.Stdout, "%s\n", encoded)
 
 		printfTo(os.Stdout, "roundtrip-verify: %s/%s\n", m.Kind, m.Name)
+		if report.ContainerClearError != "" {
+			printfTo(os.Stdout, "container-clear: ERROR — %s\n", report.ContainerClearError)
+		}
 		roundtrip.PrintDenominatorFindings(func(format string, args ...interface{}) {
 			printfTo(os.Stdout, format, args...)
 		}, report.MustTestCount, manifestFindings, manifestExcluded)

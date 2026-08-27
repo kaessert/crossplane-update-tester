@@ -1826,6 +1826,90 @@ func TestBuildRoundtripVerifyReportSeedIsRecordedAndReported(t *testing.T) {
 	}
 }
 
+// ineligibleContradictionFixtureCRDForMain declares a single list leaf
+// ("subscriptions") required by a root x-kubernetes-validations rule under
+// managementPolicies' own default (['*']) — the exact shape measured live
+// on provider-tailscale — so a manifest entry claiming clear-direction
+// coverage of it collides with roundtrip.ContainerClearCoverage's own
+// ineligible-and-covered contradiction guard.
+const ineligibleContradictionFixtureCRDForMain = `apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+spec:
+  group: widgets.crossplane.io
+  names:
+    kind: Widget
+    plural: widgets
+  versions:
+  - name: v1alpha1
+    served: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        x-kubernetes-validations:
+        - message: subscriptions is required once managementPolicies includes '*', 'Create', or 'Update'
+          rule: "!has(self.spec) || !has(self.spec.managementPolicies) || !('*' in self.spec.managementPolicies || 'Create' in self.spec.managementPolicies || 'Update' in self.spec.managementPolicies) || has(self.spec.forProvider.subscriptions)"
+        properties:
+          spec:
+            type: object
+            properties:
+              managementPolicies:
+                type: array
+                default: ["*"]
+                items:
+                  type: string
+              forProvider:
+                type: object
+                properties:
+                  subscriptions:
+                    type: array
+                    items:
+                      type: string
+          status:
+            type: object
+            properties:
+              atProvider:
+                type: object
+                properties: {}
+`
+
+// TestBuildRoundtripVerifyReportContainerClearContradictionSurfacedNotSwallowed
+// is the regression pin for the fleet defect this ticket's own measurement
+// found live (provider-lambda's GlobalFirewallRuleset.rules,
+// provider-f5xc's ServicePolicy allowList.ipPrefixSetRefs): when an
+// existing manifest entry's clear-direction coverage collides with the
+// schema-derived ineligibility predicate,
+// roundtrip.ContainerClearCoverage errors rather than silently preferring
+// one side, and buildRoundtripVerifyReport must surface that error on the
+// report (ContainerClearError) rather than discarding it — collapsing
+// ContainerClear to an empty list would read identically to "this kind
+// declares no container leaves at all", which is false and hides a real
+// contradiction. anyFindings must stay false regardless: container-clear
+// remains report-only and never gates this command's exit code, a
+// contradiction included.
+func TestBuildRoundtripVerifyReportContainerClearContradictionSurfacedNotSwallowed(t *testing.T) {
+	crd := decodeCRDForMain(t, ineligibleContradictionFixtureCRDForMain)
+	m := &manifest.Manifest{
+		Kind: "Widget", Name: "example",
+		Tests: []manifest.UpdateTest{
+			// subscriptions is required by the CEL rule above (REASON 2),
+			// yet this entry claims to have exercised its removal.
+			{Field: "subscriptions", Value: nil, ValueExplicit: true},
+		},
+	}
+	rotation := roundtrip.NewRotationState()
+
+	report, _, _, anyFindings := buildRoundtripVerifyReport(m, crd, nil, "", &rotation)
+	if report.ContainerClearError == "" {
+		t.Fatal("report.ContainerClearError is empty, want the ineligible-and-covered contradiction surfaced")
+	}
+	if len(report.ContainerClear) != 0 {
+		t.Errorf("report.ContainerClear = %+v, want empty when ContainerClearError is set", report.ContainerClear)
+	}
+	if anyFindings {
+		t.Error("anyFindings = true; a container-clear contradiction must never gate this command's exit code")
+	}
+}
+
 // TestRotationStatePathLivesOutsideProviderRoot confirms the persisted
 // rotation-state file is NOT written inside root — root is a provider's
 // own git-controlled tree, and no provider's .gitignore is guaranteed to

@@ -728,19 +728,48 @@ decision:
   way — each of those stays individually tested and individually
   reported, exactly as the must-test findings above already require.
 - `containerClear` — for every declared container-typed (list or free-form
-  map) `spec.forProvider` leaf, whether ANY test entry actually exercises
-  its removal direction (a `clear:` list naming it exactly, a `clear:`
-  list naming an ANCESTOR of its dotted path — an RFC-7386 merge-patch
-  null removes the whole subtree beneath that ancestor, this leaf
-  included — a directly-tested map value that nulls one of its own
-  member keys, or a self-tombstone: the leaf's own entry setting `value:
-  null` explicitly, or (for a LIST leaf only) an empty list value
-  (`value: []`) — see "Whole-field tombstones without a sibling field"
-  below for when the self-tombstone route is needed, and for why a map
-  leaf's own `value: {}` does NOT qualify) as opposed to only ever adding
-  to it. This is advisory ONLY: it is informational in every report and
-  never turns the command's exit code non-zero, regardless of how much or
-  how little of a manifest's container-typed surface is covered.
+  map) `spec.forProvider` leaf, one of THREE states, never two:
+  - **ineligible** — the leaf's removal direction can never be exercised at
+    all, so it is excluded from the denominator entirely rather than
+    counted as a gap to close. Reported with its own `reason`, re-derived
+    from the CRD's schema on every run (never a hardcoded list, per-leaf
+    annotation, or per-provider config), so a schema change that removes
+    the shape or the rule puts the leaf back into the denominator
+    automatically. Two reasons, and only two:
+    - a crossplane reference-resolution field — a cross-resource
+      `*Selector`'s free-form `matchLabels` map, or a `*Refs` list of
+      reference items — resolved entirely by the platform before a
+      request ever reaches this provider, and never mirrored back in
+      `status.atProvider`. Derived from the field's SCHEMA SHAPE, never
+      from its name, and cross-checked against the live mirror schema so
+      a field that genuinely IS echoed back is never excluded on shape
+      alone;
+    - a field an `x-kubernetes-validations` rule requires whenever the
+      object's `managementPolicies` is at its own schema default — nulling
+      it is rejected by admission before this tool's patch ever reaches
+      the provider.
+  - **covered** — ANY test entry actually exercises its removal direction:
+    a `clear:` list naming it exactly, a `clear:` list naming an ANCESTOR
+    of its dotted path (an RFC-7386 merge-patch null removes the whole
+    subtree beneath that ancestor, this leaf included), a directly-tested
+    map value that nulls one of its own member keys, or a self-tombstone:
+    the leaf's own entry setting `value: null` explicitly, or (for a LIST
+    leaf only) an empty list value (`value: []`) — see "Whole-field
+    tombstones without a sibling field" below for when the self-tombstone
+    route is needed, and for why a map leaf's own `value: {}` does NOT
+    qualify.
+  - **uncovered** — neither of the above; a gap this manifest could close.
+
+  A leaf is never reported as both ineligible and covered — that
+  combination means an existing manifest entry disagrees with the
+  ineligibility predicate, and the report surfaces that disagreement
+  explicitly (`containerClearError`) rather than silently preferring one
+  side.
+
+  This whole breakdown is advisory ONLY: it is informational in every
+  report and never turns the command's exit code non-zero, regardless of
+  how much or how little of a manifest's container-typed surface is
+  covered, ineligible, or in conflict.
 - `waivers` — every `skip:`-carrying entry, bucketed against its own live
   row as `redundant` (the row is `equal`; the waiver is unnecessary),
   `false` (the row is a must-test classification the tool already

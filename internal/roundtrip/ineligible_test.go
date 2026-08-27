@@ -29,6 +29,18 @@ import (
 //     mirrored back must never be excluded on shape alone.
 //   - tags: an ordinary list, kept as the eligible control matching
 //     containerClearFixtureCRD.
+//   - backendConfigRefs: the OVER-EXCLUSION counter-fixture — a list field
+//     whose JSON name ends in "Refs" exactly like vpcRefs, but whose items
+//     are shaped nothing like crossplane-runtime's generated Reference
+//     (id/kind instead of name/namespace/policy). A genuine backend
+//     field that happens to end in "Refs" must stay ELIGIBLE: REASON 1 is
+//     keyed on the item schema's SHAPE, never the field's name.
+//   - weirdSelector: the OVER-EXCLUSION counter-fixture for REASON 1's
+//     other shape — an object field whose JSON name ends in "Selector"
+//     exactly like vpcSelector, but whose only property ("mode") is not
+//     drawn from {matchControllerRef, matchLabels, policy} at all. Its own
+//     container leaf (weirdSelector.mode, a free-form map) must stay
+//     ELIGIBLE for the same reason.
 //   - subscriptions: a plain list REQUIRED by a ROOT x-kubernetes-validations
 //     rule whenever managementPolicies intersects its own schema default
 //     — measured verbatim against provider-tailscale's Webhook CRD
@@ -81,6 +93,23 @@ spec:
                     type: array
                     items:
                       type: string
+                  backendConfigRefs:
+                    type: array
+                    items:
+                      type: object
+                      required: ["id", "kind"]
+                      properties:
+                        id:
+                          type: string
+                        kind:
+                          type: string
+                  weirdSelector:
+                    type: object
+                    properties:
+                      mode:
+                        type: object
+                        additionalProperties:
+                          type: string
                   subscriptions:
                     type: array
                     items:
@@ -228,6 +257,44 @@ func TestContainerClearCoverageOrdinaryListStaysEligible(t *testing.T) {
 
 	if f := byPath["tags"]; f.Ineligible {
 		t.Errorf("tags marked Ineligible, want an ordinary eligible leaf: %+v", f)
+	}
+}
+
+// TestContainerClearCoverageOverExclusionRefsNameMatchButShapeMismatch is
+// the reviewer's own primary concern, pinned as a regression test: a
+// genuine backend-carried container field whose JSON name happens to end
+// in "Refs", exactly like a real crossplane-runtime *Refs field, must NOT
+// be marked ineligible when its item schema does not match
+// Reference/NamespacedReference. A name-suffix implementation would fail
+// this test; the schema-shape implementation must pass it.
+func TestContainerClearCoverageOverExclusionRefsNameMatchButShapeMismatch(t *testing.T) {
+	crd := decodeCRD(t, ineligibleFixtureCRD)
+	byPath := ineligibleFindingsByPath(t, crd)
+
+	f, ok := byPath["backendConfigRefs"]
+	if !ok {
+		t.Fatalf("backendConfigRefs not found in findings: %+v", byPath)
+	}
+	if f.Ineligible {
+		t.Errorf("backendConfigRefs marked Ineligible on NAME alone (ends in \"Refs\") despite its items not matching the Reference shape: %+v", f)
+	}
+}
+
+// TestContainerClearCoverageOverExclusionSelectorNameMatchButShapeMismatch
+// is the Selector-shape analogue of the test above: an object field whose
+// JSON name ends in "Selector" but whose properties are not drawn from
+// {matchControllerRef, matchLabels, policy} must leave its own container
+// leaf (weirdSelector.mode) ELIGIBLE.
+func TestContainerClearCoverageOverExclusionSelectorNameMatchButShapeMismatch(t *testing.T) {
+	crd := decodeCRD(t, ineligibleFixtureCRD)
+	byPath := ineligibleFindingsByPath(t, crd)
+
+	f, ok := byPath["weirdSelector.mode"]
+	if !ok {
+		t.Fatalf("weirdSelector.mode not found in findings: %+v", byPath)
+	}
+	if f.Ineligible {
+		t.Errorf("weirdSelector.mode marked Ineligible on NAME alone (parent ends in \"Selector\") despite the parent not matching the Selector shape: %+v", f)
 	}
 }
 

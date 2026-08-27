@@ -279,6 +279,20 @@ type fakeCluster struct {
 	driftField         string
 	driftValue         interface{}
 	driftAfterGetCalls int
+
+	// listElementInjectField, listElementInjectKey and
+	// listElementInjectValue, when listElementInjectField is non-empty,
+	// simulate a backend that assigns a per-element key on EVERY element
+	// of the named list-typed atProvider field on every real field patch —
+	// the exact shape IgnoreListElementKeys exists to exempt (a
+	// server-assigned per-element id the manifest can never predict,
+	// unlike silentWipeField's single scalar reset). The injected value is
+	// listElementInjectValue suffixed with the element's own index, so
+	// distinct elements get distinct values the same way a real per-rule
+	// id would never repeat.
+	listElementInjectField string
+	listElementInjectKey   string
+	listElementInjectValue string
 }
 
 // readyCondition reports the status.conditions entry handleGet should embed
@@ -591,6 +605,19 @@ func (f *fakeCluster) handlePatch(args []string) (string, error) {
 	// named — see silentWipeField's doc comment.
 	if f.silentWipeField != "" {
 		f.atProvider[f.silentWipeField] = f.silentWipeValue
+	}
+
+	// Simulate a backend that assigns a per-element key on EVERY element
+	// of a list-typed atProvider field on every write — see
+	// listElementInjectField's doc comment.
+	if f.listElementInjectField != "" {
+		if arr, ok := f.atProvider[f.listElementInjectField].([]interface{}); ok {
+			for i, elem := range arr {
+				if m, ok := elem.(map[string]interface{}); ok {
+					m[f.listElementInjectKey] = fmt.Sprintf("%s-%d", f.listElementInjectValue, i)
+				}
+			}
+		}
 	}
 
 	f.generation++
@@ -3175,76 +3202,141 @@ func containsArg(args []string, want string) bool {
 	return false
 }
 
-// TestCompareFieldValue covers compareFieldValue directly: with an empty
-// ignoreKeys it must behave exactly like jsonEqual (every existing caller's
-// contract), and with a non-empty ignoreKeys it must strip the named
-// top-level keys from BOTH sides before comparing, tolerating a side that
-// is not a JSON object (a still-converging read, or a genuinely
-// non-map-typed field) by simply not matching rather than erroring.
+// TestCompareFieldValue covers compareFieldValue directly: with both
+// ignoreMapKeys and ignoreListElementKeys empty it must behave exactly like
+// jsonEqual (every existing caller's contract); a non-empty ignoreMapKeys
+// must strip the named top-level keys from BOTH sides of a map-shaped
+// comparison, and a non-empty ignoreListElementKeys must strip the named
+// keys from EVERY element of a list-of-objects-shaped comparison, on both
+// sides — tolerating a side whose shape does not match what a given
+// directive strips (a still-converging read, or a genuinely
+// differently-shaped field) by simply not matching rather than erroring.
 func TestCompareFieldValue(t *testing.T) {
 	cases := map[string]struct {
-		reason     string
-		expected   interface{}
-		actual     string
-		ignoreKeys []string
-		want       bool
+		reason                string
+		expected              interface{}
+		actual                string
+		ignoreMapKeys         []string
+		ignoreListElementKeys []string
+		want                  bool
 	}{
 		"EmptyIgnoreKeysScalarMatch": {
-			reason:   "no ignoreKeys means this is exactly jsonEqual for a scalar",
+			reason:   "no ignore directive means this is exactly jsonEqual for a scalar",
 			expected: "hello",
 			actual:   "hello",
 			want:     true,
 		},
 		"EmptyIgnoreKeysMapMismatch": {
-			reason:     "with no ignoreKeys, an extra actual key is an ordinary mismatch",
-			expected:   map[string]interface{}{"a": "1"},
-			actual:     `{"a":"1","ownerStamp":"xyz"}`,
-			ignoreKeys: nil,
-			want:       false,
+			reason:        "with no ignoreMapKeys, an extra actual key is an ordinary mismatch",
+			expected:      map[string]interface{}{"a": "1"},
+			actual:        `{"a":"1","ownerStamp":"xyz"}`,
+			ignoreMapKeys: nil,
+			want:          false,
 		},
 		"IgnoredKeyStrippedFromActual": {
-			reason:     "a key named in ignoreKeys is removed from actual before comparing, so an unpredictable provider-injected value never has to be named",
-			expected:   map[string]interface{}{"a": "1"},
-			actual:     `{"a":"1","ownerStamp":"xyz-unpredictable"}`,
-			ignoreKeys: []string{"ownerStamp"},
-			want:       true,
+			reason:        "a key named in ignoreMapKeys is removed from actual before comparing, so an unpredictable provider-injected value never has to be named",
+			expected:      map[string]interface{}{"a": "1"},
+			actual:        `{"a":"1","ownerStamp":"xyz-unpredictable"}`,
+			ignoreMapKeys: []string{"ownerStamp"},
+			want:          true,
 		},
 		"IgnoredKeyStrippedFromBothSides": {
-			reason:     "stripping is symmetric — an ignored key present on the expected side too is also removed",
-			expected:   map[string]interface{}{"a": "1", "ownerStamp": "whatever-the-author-guessed"},
-			actual:     `{"a":"1","ownerStamp":"xyz-unpredictable"}`,
-			ignoreKeys: []string{"ownerStamp"},
-			want:       true,
+			reason:        "stripping is symmetric — an ignored key present on the expected side too is also removed",
+			expected:      map[string]interface{}{"a": "1", "ownerStamp": "whatever-the-author-guessed"},
+			actual:        `{"a":"1","ownerStamp":"xyz-unpredictable"}`,
+			ignoreMapKeys: []string{"ownerStamp"},
+			want:          true,
 		},
 		"NonIgnoredMismatchStillFails": {
-			reason:     "ignoreKeys only exempts the named keys — every other key still has to match",
-			expected:   map[string]interface{}{"a": "1"},
-			actual:     `{"a":"2","ownerStamp":"xyz"}`,
-			ignoreKeys: []string{"ownerStamp"},
-			want:       false,
+			reason:        "ignoreMapKeys only exempts the named keys — every other key still has to match",
+			expected:      map[string]interface{}{"a": "1"},
+			actual:        `{"a":"2","ownerStamp":"xyz"}`,
+			ignoreMapKeys: []string{"ownerStamp"},
+			want:          false,
 		},
 		"ActualNotYetAnObjectDuringConvergence": {
-			reason:     "a still-converging field (e.g. empty string before the first Observe) never satisfies the comparison, but must not panic or error",
-			expected:   map[string]interface{}{"a": "1"},
-			actual:     "",
-			ignoreKeys: []string{"ownerStamp"},
-			want:       false,
+			reason:        "a still-converging field (e.g. empty string before the first Observe) never satisfies the comparison, but must not panic or error",
+			expected:      map[string]interface{}{"a": "1"},
+			actual:        "",
+			ignoreMapKeys: []string{"ownerStamp"},
+			want:          false,
 		},
 		"ExpectedNotAnObject": {
-			reason:     "ignoreKeys set on a scalar-typed comparison has nothing to strip on the expected side; it simply never matches an object actual",
-			expected:   "hello",
-			actual:     `{"a":"1"}`,
-			ignoreKeys: []string{"ownerStamp"},
-			want:       false,
+			reason:        "ignoreMapKeys set on a scalar-typed comparison has nothing to strip on the expected side; it simply never matches an object actual",
+			expected:      "hello",
+			actual:        `{"a":"1"}`,
+			ignoreMapKeys: []string{"ownerStamp"},
+			want:          false,
+		},
+		"ListElementKeyStrippedFromActual": {
+			reason: "a key named in ignoreListElementKeys is removed from every actual list element before comparing, so a server-assigned per-element id never has to be named",
+			expected: []interface{}{
+				map[string]interface{}{"port": float64(80)},
+				map[string]interface{}{"port": float64(443)},
+			},
+			actual:                `[{"port":80,"id":"rule-a-unpredictable"},{"port":443,"id":"rule-b-unpredictable"}]`,
+			ignoreListElementKeys: []string{"id"},
+			want:                  true,
+		},
+		"ListElementKeyStrippedFromBothSides": {
+			reason: "stripping is symmetric across every element — an ignored key the expected side also guesses at is removed too",
+			expected: []interface{}{
+				map[string]interface{}{"port": float64(80), "id": "whatever-the-author-guessed"},
+			},
+			actual:                `[{"port":80,"id":"rule-a-unpredictable"}]`,
+			ignoreListElementKeys: []string{"id"},
+			want:                  true,
+		},
+		"ListElementNonIgnoredMismatchStillFails": {
+			reason: "ignoreListElementKeys only exempts the named per-element keys — every other element member still has to match",
+			expected: []interface{}{
+				map[string]interface{}{"port": float64(80)},
+			},
+			actual:                `[{"port":8080,"id":"rule-a"}]`,
+			ignoreListElementKeys: []string{"id"},
+			want:                  false,
+		},
+		"ListElementCountMismatchStillFails": {
+			reason: "ignoreListElementKeys strips member keys, not elements — a missing element is still an ordinary mismatch",
+			expected: []interface{}{
+				map[string]interface{}{"port": float64(80)},
+				map[string]interface{}{"port": float64(443)},
+			},
+			actual:                `[{"port":80,"id":"rule-a"}]`,
+			ignoreListElementKeys: []string{"id"},
+			want:                  false,
+		},
+		"ListElementActualNotYetAnArrayDuringConvergence": {
+			reason: "a still-converging field (e.g. empty string before the first Observe) never satisfies the comparison, but must not panic or error",
+			expected: []interface{}{
+				map[string]interface{}{"port": float64(80)},
+			},
+			actual:                "",
+			ignoreListElementKeys: []string{"id"},
+			want:                  false,
+		},
+		"ListElementExpectedNotAnArray": {
+			reason:                "ignoreListElementKeys set on a scalar-typed comparison has nothing to strip; it simply never matches an array actual",
+			expected:              "hello",
+			actual:                `[{"port":80,"id":"rule-a"}]`,
+			ignoreListElementKeys: []string{"id"},
+			want:                  false,
+		},
+		"ElementNotAnObjectIsLeftUntouched": {
+			reason:                "a list-of-scalars is not what ignoreListElementKeys targets — a non-object element has nothing to strip and the comparison falls through to an ordinary scalar-list match",
+			expected:              []interface{}{"a", "b"},
+			actual:                `["a","b"]`,
+			ignoreListElementKeys: []string{"id"},
+			want:                  true,
 		},
 	}
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			got := compareFieldValue(tc.expected, tc.actual, tc.ignoreKeys)
+			got := compareFieldValue(tc.expected, tc.actual, tc.ignoreMapKeys, tc.ignoreListElementKeys)
 			if got != tc.want {
-				t.Errorf("%s: compareFieldValue(%v, %q, %v) = %v, want %v",
-					tc.reason, tc.expected, tc.actual, tc.ignoreKeys, got, tc.want)
+				t.Errorf("%s: compareFieldValue(%v, %q, %v, %v) = %v, want %v",
+					tc.reason, tc.expected, tc.actual, tc.ignoreMapKeys, tc.ignoreListElementKeys, got, tc.want)
 			}
 		})
 	}
@@ -3294,10 +3386,11 @@ func TestJSONEqualNilExpectationSatisfiedByAbsentActual(t *testing.T) {
 			if got := jsonEqual(tc.expected, tc.actual); got != tc.want {
 				t.Errorf("%s: jsonEqual(%#v, %q) = %v, want %v", tc.reason, tc.expected, tc.actual, got, tc.want)
 			}
-			// compareFieldValue with no ignoreKeys must agree exactly —
-			// the contract TestCompareFieldValue's own doc comment states.
-			if got := compareFieldValue(tc.expected, tc.actual, nil); got != tc.want {
-				t.Errorf("%s: compareFieldValue(%#v, %q, nil) = %v, want %v", tc.reason, tc.expected, tc.actual, got, tc.want)
+			// compareFieldValue with no ignore directive must agree
+			// exactly — the contract TestCompareFieldValue's own doc
+			// comment states.
+			if got := compareFieldValue(tc.expected, tc.actual, nil, nil); got != tc.want {
+				t.Errorf("%s: compareFieldValue(%#v, %q, nil, nil) = %v, want %v", tc.reason, tc.expected, tc.actual, got, tc.want)
 			}
 		})
 	}
@@ -3406,11 +3499,119 @@ func TestRunFieldTestIgnoreMapKeysAbsentStillRequiresExactMatch(t *testing.T) {
 	expected := map[string]interface{}{"existingKey": "updated"}
 	actual := `{"existingKey":"updated","ownerStamp":"unpredictable-value"}`
 
-	if compareFieldValue(expected, actual, nil) {
+	if compareFieldValue(expected, actual, nil, nil) {
 		t.Fatal("expected compareFieldValue to fail without ignoreMapKeys naming ownerStamp")
 	}
-	if !compareFieldValue(expected, actual, []string{"ownerStamp"}) {
+	if !compareFieldValue(expected, actual, []string{"ownerStamp"}, nil) {
 		t.Fatal("expected compareFieldValue to pass once ignoreMapKeys names ownerStamp")
+	}
+}
+
+// TestRunFieldTestIgnoreListElementKeysProviderInjectedPerElementID is the
+// end-to-end proof this mechanism exists for: a list-of-objects field
+// (firewallRules) whose live elements each carry a member the PROVIDER
+// itself assigns per element — a server-generated per-rule id, modelled
+// here the same way a load balancer backend echoes back a rule id no
+// example manifest could ever predict in advance.
+//
+// The patch wholesale-replaces the list (the only shape an RFC 7386 merge
+// patch supports for an array), and the fake cluster's own per-element
+// injector then stamps a fresh, distinct id onto every element — standing
+// in for the backend assigning identity at write time. Without
+// IgnoreListElementKeys this entry could never pass: the whole-list
+// comparison would have to match every element's id exactly, and the id is
+// set up here to look exactly as unpredictable as a real server-assigned
+// one would — this test never hardcodes it into the expectation.
+func TestRunFieldTestIgnoreListElementKeysProviderInjectedPerElementID(t *testing.T) {
+	const idPrefix = "rule-assigned-by-backend"
+
+	f := &fakeCluster{
+		forProvider: map[string]interface{}{
+			"firewallRules": []interface{}{
+				map[string]interface{}{"port": float64(80), "protocol": "tcp"},
+			},
+		},
+		atProvider: map[string]interface{}{
+			"firewallRules": []interface{}{
+				map[string]interface{}{"port": float64(80), "protocol": "tcp", "id": "stale-id-from-create"},
+			},
+		},
+		generation:             1,
+		kind:                   testKindExample,
+		name:                   testNameExample,
+		recordUpdateEvent:      true,
+		listElementInjectField: "firewallRules",
+		listElementInjectKey:   "id",
+		listElementInjectValue: idPrefix,
+	}
+	r := newFakeRunner(f)
+	snapshot, err := json.Marshal(f.atProvider)
+	if err != nil {
+		t.Fatalf("marshalling snapshot: %v", err)
+	}
+
+	test := manifest.UpdateTest{
+		Field: "firewallRules",
+		Value: []interface{}{
+			map[string]interface{}{"port": float64(443), "protocol": "tcp"},
+			map[string]interface{}{"port": float64(8080), "protocol": "tcp"},
+		},
+		// expect is unset, so the effective expectation is Value above —
+		// it never has to name, let alone predict, either element's
+		// server-assigned id.
+		IgnoreListElementKeys: []string{"id"},
+	}
+
+	result, _ := r.runFieldTest(test, snapshot, testKindExample, testNameExample, "", "")
+
+	if !result.Passed {
+		t.Fatalf("expected Passed=true, got %+v (error: %v)", result, result.Error)
+	}
+	if result.NoOp {
+		t.Fatal("expected NoOp=false — the patch replaces a single-element list with a two-element list at different ports")
+	}
+
+	gotRules, ok := f.atProvider["firewallRules"].([]interface{})
+	if !ok || len(gotRules) != 2 {
+		t.Fatalf("f.atProvider[firewallRules] = %v, want a 2-element list", f.atProvider["firewallRules"])
+	}
+	for i, elem := range gotRules {
+		m, ok := elem.(map[string]interface{})
+		if !ok {
+			t.Fatalf("element %d = %v, want an object", i, elem)
+		}
+		wantID := fmt.Sprintf("%s-%d", idPrefix, i)
+		if m["id"] != wantID {
+			t.Errorf("element %d id = %v, want it stamped at %q by the backend, left untouched by the comparison", i, m["id"], wantID)
+		}
+	}
+	if gotRules[0].(map[string]interface{})["port"] != float64(443) || gotRules[1].(map[string]interface{})["port"] != float64(8080) {
+		t.Errorf("gotRules = %v, want ports 443 and 8080", gotRules)
+	}
+}
+
+// TestRunFieldTestIgnoreListElementKeysAbsentStillRequiresExactMatch is the
+// negative control for
+// TestRunFieldTestIgnoreListElementKeysProviderInjectedPerElementID: the
+// exact same expected-vs-actual pair, but without ignoreListElementKeys
+// naming the provider-injected per-element key, must NOT compare equal —
+// proving the whole-list comparison really was unsatisfiable before this
+// mechanism, not merely untested.
+//
+// Checked at the compareFieldValue level for the same reason
+// TestRunFieldTestIgnoreMapKeysAbsentStillRequiresExactMatch is: reproducing
+// a genuine poll-to-timeout failure through a live runFieldTest would cost
+// several real seconds of pollField's fixed retry sleep for no additional
+// coverage.
+func TestRunFieldTestIgnoreListElementKeysAbsentStillRequiresExactMatch(t *testing.T) {
+	expected := []interface{}{map[string]interface{}{"port": float64(443)}}
+	actual := `[{"port":443,"id":"unpredictable-value"}]`
+
+	if compareFieldValue(expected, actual, nil, nil) {
+		t.Fatal("expected compareFieldValue to fail without ignoreListElementKeys naming id")
+	}
+	if !compareFieldValue(expected, actual, nil, []string{"id"}) {
+		t.Fatal("expected compareFieldValue to pass once ignoreListElementKeys names id")
 	}
 }
 

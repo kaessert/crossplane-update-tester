@@ -1647,3 +1647,211 @@ func TestParseAnnotationIgnoreMapKeys(t *testing.T) {
 		}
 	})
 }
+
+// TestValidateIgnoreListElementKeys pins ValidateIgnoreListElementKeys's
+// direct rejections: paired with skip, an empty entry, and a repeated
+// entry — plus the pass-through cases (absent, and a well-formed non-empty
+// list) — mirroring TestValidateIgnoreMapKeys one level deeper: the
+// collision scan here looks at each ELEMENT of a list-shaped expectation,
+// not at the expectation itself.
+func TestValidateIgnoreListElementKeys(t *testing.T) {
+	cases := map[string]struct {
+		reason        string
+		test          UpdateTest
+		wantErrSubstr string // empty means ValidateIgnoreListElementKeys must return nil
+	}{
+		"Absent": {
+			reason: "no ignoreListElementKeys key at all is the common case and must not error",
+			test:   UpdateTest{Field: "firewallRules", Value: []interface{}{map[string]interface{}{"port": "80"}}},
+		},
+		"WellFormed": {
+			reason: "a well-formed, non-empty list on an ordinary entry passes",
+			test: UpdateTest{
+				Field:                 "firewallRules",
+				Value:                 []interface{}{map[string]interface{}{"port": "80"}},
+				IgnoreListElementKeys: []string{"id"},
+			},
+		},
+		"PairedWithSkip": {
+			reason:        "skip already asserts no comparison exists to write, so ignoreListElementKeys has nothing left to affect",
+			test:          UpdateTest{Field: "firewallRules", Skip: LegacySkip("no test written yet"), IgnoreListElementKeys: []string{"id"}},
+			wantErrSubstr: "ignoreListElementKeys is set but skip is also set",
+		},
+		"EmptyEntry": {
+			reason:        "an empty string names no per-element key",
+			test:          UpdateTest{Field: "firewallRules", Value: []interface{}{map[string]interface{}{"port": "80"}}, IgnoreListElementKeys: []string{""}},
+			wantErrSubstr: "ignoreListElementKeys entry is empty",
+		},
+		"RepeatedEntry": {
+			reason:        "the same key named twice is not a second exclusion",
+			test:          UpdateTest{Field: "firewallRules", Value: []interface{}{map[string]interface{}{"port": "80"}}, IgnoreListElementKeys: []string{"id", "id"}},
+			wantErrSubstr: `ignoreListElementKeys entry "id" is repeated`,
+		},
+		"CollidesWithExpect": {
+			reason: "a key named in both ignoreListElementKeys and an element of expect: is stripped from every " +
+				"element on both sides of the comparison before it is ever checked, so the field test passes " +
+				"vacuously regardless of the live value",
+			test: UpdateTest{
+				Field: "firewallRules",
+				Value: []interface{}{map[string]interface{}{"port": "443", "id": "x"}},
+				Expect: []interface{}{
+					map[string]interface{}{"port": "443", "id": "guessed"},
+				},
+				IgnoreListElementKeys: []string{"id"},
+			},
+			wantErrSubstr: `ignoreListElementKeys entry "id" also appears as a key in one of this entry's own expect: elements`,
+		},
+		"CollidesWithValueNoExpect": {
+			reason: "with no expect:, value: is the effective expectation the runner compares against, so a " +
+				"collision there is exactly as vacuous as colliding with expect:",
+			test: UpdateTest{
+				Field:                 "firewallRules",
+				Value:                 []interface{}{map[string]interface{}{"port": "443", "id": "x"}},
+				IgnoreListElementKeys: []string{"id"},
+			},
+			wantErrSubstr: `ignoreListElementKeys entry "id" also appears as a key in one of this entry's own value: elements`,
+		},
+		"CollidesOnOnlyOneOfSeveralElements": {
+			reason: "the redundancy scan checks EVERY element, not just the first — a collision on the second " +
+				"element is caught exactly the same way",
+			test: UpdateTest{
+				Field: "firewallRules",
+				Value: []interface{}{
+					map[string]interface{}{"port": "443"},
+					map[string]interface{}{"port": "8080", "id": "x"},
+				},
+				IgnoreListElementKeys: []string{"id"},
+			},
+			wantErrSubstr: `ignoreListElementKeys entry "id" also appears as a key in one of this entry's own value: elements`,
+		},
+		"NamedOnlyInIgnoreListElementKeys": {
+			reason: "the legitimate shape: ignoreListElementKeys names the provider-injected per-element member " +
+				"that expect: deliberately never mentions",
+			test: UpdateTest{
+				Field:                 "firewallRules",
+				Value:                 []interface{}{map[string]interface{}{"port": "443"}},
+				Expect:                []interface{}{map[string]interface{}{"port": "443"}},
+				IgnoreListElementKeys: []string{"id"},
+			},
+		},
+		"NonArrayExpectation": {
+			reason: "a scalar or map expectation has no elements to collide with, so ignoreListElementKeys is " +
+				"accepted even though it will never match anything on that side",
+			test: UpdateTest{
+				Field:                 "count",
+				Value:                 "5",
+				IgnoreListElementKeys: []string{"id"},
+			},
+		},
+		"ElementNotAnObjectIsSkipped": {
+			reason: "a list-of-scalars has no member keys to collide with — a non-object element is skipped " +
+				"rather than treated as a match",
+			test: UpdateTest{
+				Field:                 "tags",
+				Value:                 []interface{}{"a", "b"},
+				IgnoreListElementKeys: []string{"id"},
+			},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := ValidateIgnoreListElementKeys(tc.test)
+			if tc.wantErrSubstr == "" {
+				if err != nil {
+					t.Fatalf("%s: ValidateIgnoreListElementKeys() error = %v, want nil", tc.reason, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("%s: ValidateIgnoreListElementKeys() error = nil, want an error containing %q", tc.reason, tc.wantErrSubstr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrSubstr) {
+				t.Errorf("%s: ValidateIgnoreListElementKeys() error = %q, want it to contain %q", tc.reason, err.Error(), tc.wantErrSubstr)
+			}
+		})
+	}
+}
+
+// TestParseAnnotationIgnoreListElementKeys proves an "ignoreListElementKeys:"
+// key on an update-test entry parses onto UpdateTest.IgnoreListElementKeys,
+// that an entry with no such key parses with a nil IgnoreListElementKeys
+// (the common case every pre-existing fleet entry must keep matching), and
+// that ParseAnnotation rejects the entry-level combination
+// ValidateIgnoreListElementKeys itself rejects (skip paired with
+// ignoreListElementKeys) at the same entry point every other per-entry
+// validation runs through.
+func TestParseAnnotationIgnoreListElementKeys(t *testing.T) {
+	t.Run("Absent", func(t *testing.T) {
+		tests, _, _, _, err := ParseAnnotation(`
+- field: comment
+  value: "updated"
+`)
+		if err != nil {
+			t.Fatalf("ParseAnnotation() error = %v", err)
+		}
+		if len(tests) != 1 {
+			t.Fatalf("len(tests) = %d, want 1", len(tests))
+		}
+		if tests[0].IgnoreListElementKeys != nil {
+			t.Errorf("IgnoreListElementKeys = %v, want nil", tests[0].IgnoreListElementKeys)
+		}
+	})
+
+	t.Run("Present", func(t *testing.T) {
+		tests, _, _, _, err := ParseAnnotation(`
+- field: firewallRules
+  value: [{port: 443, protocol: tcp}]
+  expect: [{port: 443, protocol: tcp}]
+  ignoreListElementKeys: [id]
+`)
+		if err != nil {
+			t.Fatalf("ParseAnnotation() error = %v", err)
+		}
+		if len(tests) != 1 {
+			t.Fatalf("len(tests) = %d, want 1", len(tests))
+		}
+		want := []string{"id"}
+		got := tests[0].IgnoreListElementKeys
+		if len(got) != len(want) || got[0] != want[0] {
+			t.Errorf("IgnoreListElementKeys = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("RejectsSkipCombination", func(t *testing.T) {
+		_, _, _, _, err := ParseAnnotation(`
+- field: firewallRules
+  skip: "no test written yet"
+  ignoreListElementKeys: [id]
+`)
+		if err == nil {
+			t.Fatal("ParseAnnotation() error = nil, want an error rejecting skip + ignoreListElementKeys")
+		}
+		wantErrSubstr := "ignoreListElementKeys is set but skip is also set"
+		if !strings.Contains(err.Error(), wantErrSubstr) {
+			t.Errorf("ParseAnnotation() error = %q, want it to contain %q", err.Error(), wantErrSubstr)
+		}
+	})
+
+	// RejectsVacuousSelfCollision reproduces, through the real annotation
+	// parse path, the exact expected/actual pair this check exists to
+	// catch: id is named in both an expect: element and
+	// ignoreListElementKeys, so the comparison would strip it from both
+	// sides and report PASS against a live value that never actually
+	// converged.
+	t.Run("RejectsVacuousSelfCollision", func(t *testing.T) {
+		_, _, _, _, err := ParseAnnotation(`
+- field: firewallRules
+  value: [{port: 443, id: "x"}]
+  expect: [{port: 443, id: "guessed"}]
+  ignoreListElementKeys: [id]
+`)
+		if err == nil {
+			t.Fatal("ParseAnnotation() error = nil, want an error rejecting the id self-collision")
+		}
+		wantErrSubstr := `ignoreListElementKeys entry "id" also appears as a key in one of this entry's own expect: elements`
+		if !strings.Contains(err.Error(), wantErrSubstr) {
+			t.Errorf("ParseAnnotation() error = %q, want it to contain %q", err.Error(), wantErrSubstr)
+		}
+	})
+}

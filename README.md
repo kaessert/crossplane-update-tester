@@ -868,6 +868,7 @@ three top-level directive lines: `converge-skip:`, `assert-unchanged:` and
 | `clear` | Optional. A list of OTHER top-level `spec.forProvider` field names nulled in the SAME merge patch that sets `field`'s value, so a union modeled as separate top-level fields switches arms atomically. Only valid when `field` itself is top-level (not dotted); a dotted entry, or one naming `field` itself, is rejected at parse time — even for a `field` with no other sibling to name; see "Whole-field tombstones without a sibling field" for that case's own route. |
 | `knownDefect` | Optional. The ID of the ticket tracking a real defect that keeps this field's update path from converging. Unlike `skip`, the entry RUNS: `value` is required, the patch is applied exactly as normal, and non-convergence is reported as `KNOWN-DEFECT` — expected, not a failure. If the field DOES converge, that FAILS the run hard as `KNOWN-DEFECT CONVERGED`, naming the ticket and telling the reader to delete the token. A field that converges in value but has no `Update()` Event to prove it (`NOT-EVIDENCED`) is likewise never credited as `KNOWN-DEFECT` — it fails the run through its own `NOT-EVIDENCED` verdict instead, since a value match is evidence the defect may already be fixed. Mutually exclusive with `skip`. The value must be non-empty, contain no whitespace, not be a placeholder (`TODO`, `TBD`, `n/a`, etc.), and be at least 6 characters — reject anything that cannot be followed back to an actual ticket. Also rejected if the same top-level field name appears in this manifest's own `ignore-fields:` set (dead config — see `ignore-fields:` below). |
 | `ignoreMapKeys` | Optional. A list of top-level member keys excluded, on BOTH sides, from `run`'s equality check between `expect` (or `value`, when `expect` is unset) and the live `status.atProvider` value — see "`ignoreMapKeys:` — excluding a provider-injected map member" below. Mutually exclusive with `skip` (there is no comparison left for it to affect). |
+| `ignoreListElementKeys` | Optional. A list of per-element member keys excluded, on BOTH sides and from EVERY element, from `run`'s equality check between `expect` (or `value`, when `expect` is unset) and the live `status.atProvider` value, for a list-of-objects field — see "`ignoreListElementKeys:` — excluding a provider-injected per-element member" below. Mutually exclusive with `skip` (there is no comparison left for it to affect). |
 
 None of `converge-skip: <reason>`, `assert-unchanged: <fields>` or
 `ignore-fields: <fields>` is valid YAML as a sibling of top-level sequence
@@ -1082,6 +1083,49 @@ crossplane.io/update-test: |
       # identity-stamp member is correctly absent too, without ever having
       # to name its live value.
     ignoreMapKeys: [OwnerStamp]
+```
+
+#### `ignoreListElementKeys:` — excluding a provider-injected per-element member
+
+A per-entry list of member keys excluded, on BOTH sides and from EVERY
+element, from `run`'s equality check between the entry's effective
+expectation (`expect`, or `value` when `expect` is unset) and the live
+`status.atProvider` value.
+
+It is the list-shaped counterpart of `ignoreMapKeys`: it exists for a
+list-of-objects field whose live elements each carry a member the PROVIDER
+itself assigns per element — a server-generated id on each rule of a
+firewall-rule list, for example — alongside the keys the manifest actually
+manages. `ignoreMapKeys` cannot reach this: it strips a key from the top
+level of a map-shaped comparison, but a list's own elements sit one level
+beneath that, so a provider-assigned per-element key would still force
+`expect` to predict a value that does not exist until the element is
+created on the backend, and can therefore never appear in a static example
+manifest.
+
+`ignoreListElementKeys` closes that gap the same way `ignoreMapKeys` does:
+`value` and `expect` still describe the list exactly as they always have —
+an RFC 7386 merge patch replaces a list-typed field wholesale, so there is
+no partial-element update to express — only the comparison ignores the
+named keys, on every element, on both sides, so `expect` never has to
+mention — let alone guess — any element's provider-assigned member.
+
+```yaml
+crossplane.io/update-test: |
+  - field: firewallRules
+    value:
+      - port: 443
+        protocol: tcp
+      - port: 8080
+        protocol: tcp
+    expect:
+      - port: 443
+        protocol: tcp
+      - port: 8080
+        protocol: tcp
+      # Each element's server-assigned id is correctly absent, without
+      # ever having to name its live value.
+    ignoreListElementKeys: [id]
 ```
 
 #### Worked example

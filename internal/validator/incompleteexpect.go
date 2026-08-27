@@ -101,7 +101,23 @@ func CheckIncompleteExpectations(typesPath string, paramFields []FieldInfo, m *m
 
 		alreadyReported := mergePatchSiblingKeySet(m.ForProvider, t)
 
-		bad := incompleteExpectationKeys(obsFields, effObjs, alreadyReported, t.IgnoreMapKeys)
+		// Union both ignore directives: an entry only ever populates the
+		// one matching its own field's shape (map-shaped ->
+		// IgnoreMapKeys, list-of-objects-shaped -> IgnoreListElementKeys
+		// — manifest.ValidateIgnoreMapKeys and
+		// ValidateIgnoreListElementKeys validate each independently), so
+		// the union is exactly "whichever one this entry set". Either
+		// way, incompleteExpectationKeys treats it as a member name to
+		// exclude from every object in effObjs, which is already
+		// per-element for a list-shaped field (see asObjects) — the same
+		// exclusion the runner's own compareFieldValue applies at
+		// comparison time.
+		ignoreKeys := t.IgnoreMapKeys
+		if len(t.IgnoreListElementKeys) > 0 {
+			ignoreKeys = append(append([]string(nil), ignoreKeys...), t.IgnoreListElementKeys...)
+		}
+
+		bad := incompleteExpectationKeys(obsFields, effObjs, alreadyReported, ignoreKeys)
 		if len(bad) == 0 {
 			continue
 		}
@@ -149,10 +165,11 @@ func mergePatchSiblingKeySet(forProvider map[string]interface{}, t manifest.Upda
 // effObjs (a member missing from even one list element is unsatisfiable for
 // that element's own read-back, since every non-omitempty member marshals
 // on every element independently), excluding any key already present in
-// alreadyReported or in ignoreKeys (the entry's own "ignoreMapKeys:"
-// declaration — see manifest.UpdateTest.IgnoreMapKeys — which excludes the
-// key from the runner's comparison entirely, so its absence from expect: is
-// deliberate, not an omission).
+// alreadyReported or in ignoreKeys (the entry's own "ignoreMapKeys:" or
+// "ignoreListElementKeys:" declaration — see manifest.UpdateTest.IgnoreMapKeys
+// and manifest.UpdateTest.IgnoreListElementKeys — either of which excludes
+// the key from the runner's comparison entirely, so its absence from
+// expect: is deliberate, not an omission).
 func incompleteExpectationKeys(obsFields []FieldInfo, effObjs []map[string]interface{}, alreadyReported map[string]bool, ignoreKeys []string) []string {
 	ignored := make(map[string]bool, len(ignoreKeys))
 	for _, k := range ignoreKeys {

@@ -99,6 +99,28 @@ type UpdateTest struct {
 	// Requires Expect or Value to resolve to a JSON object; see
 	// runner.compareFieldValue for what happens when it does not.
 	IgnoreMapKeys []string `yaml:"ignoreMapKeys"`
+	// IgnoreListElementKeys names per-element member keys to exclude, on
+	// BOTH sides and from EVERY element, from the equality check `run`
+	// performs between Expect (or Value, when Expect is unset) and the
+	// live status.atProvider value — see runner.compareFieldValue for the
+	// comparison itself.
+	//
+	// It exists for the list-shaped counterpart of IgnoreMapKeys: a
+	// list-of-objects field whose live elements each carry a member the
+	// PROVIDER itself assigns per element — a server-generated per-rule
+	// ID, for example — alongside the keys the manifest actually manages.
+	// IgnoreMapKeys cannot reach this: it strips a key from the top level
+	// of a map-shaped comparison, but a list's own elements are one level
+	// beneath that, so a provider-assigned per-element key would still
+	// force Expect to predict a value that does not exist until the
+	// element is created on the backend, and can therefore never appear
+	// in a static example manifest. Naming the member here lets Expect
+	// describe only the keys the test actually manages for each element;
+	// only the comparison ignores the named per-element keys.
+	//
+	// Requires Expect or Value to resolve to a JSON array of objects; see
+	// runner.compareFieldValue for what happens when it does not.
+	IgnoreListElementKeys []string `yaml:"ignoreListElementKeys"`
 	// ValueExplicit reports whether the "value:" key was present in the
 	// entry's own YAML mapping at all, regardless of what it decoded to.
 	//
@@ -636,6 +658,9 @@ func ParseAnnotation(annotation string) ([]UpdateTest, string, []string, []strin
 		if err := ValidateIgnoreMapKeys(t); err != nil {
 			return nil, "", nil, nil, fmt.Errorf("entry %d (%s): %w", i, t.Field, err)
 		}
+		if err := ValidateIgnoreListElementKeys(t); err != nil {
+			return nil, "", nil, nil, fmt.Errorf("entry %d (%s): %w", i, t.Field, err)
+		}
 		testedFields[t.Field] = true
 	}
 	for _, f := range assertUnchanged {
@@ -831,6 +856,79 @@ func ValidateIgnoreMapKeys(t UpdateTest) error {
 						"remove the key from ignoreMapKeys (it is redundant — %s: already covers it) or "+
 						"remove it from %s: (if it is really a provider-injected member the manifest cannot predict)",
 					k, source, source, source, source)
+			}
+		}
+	}
+	return nil
+}
+
+// ValidateIgnoreListElementKeys rejects an ignoreListElementKeys declaration
+// the runner could not act on, at parse time, before any cluster is
+// touched. See UpdateTest.IgnoreListElementKeys for what the mechanism is
+// for.
+//
+// It mirrors ValidateIgnoreMapKeys's checks — empty/duplicate entries,
+// mutual exclusion with skip, and the same-name authoring-error scan — but
+// the scan reaches one level deeper: the field this mechanism targets is
+// LIST-shaped, so "the entry's own effective expectation" is a JSON array,
+// and a name is redundant the moment ANY element of that array already
+// carries it, since the comparison (runner.compareFieldValue) strips the
+// key from every element, not from the array itself.
+//
+// It is exported so both sources of an ignoreListElementKeys list share
+// this one check — the "ignoreListElementKeys:" key on an update-test
+// annotation entry (via ParseAnnotation above) and any offline validator
+// that wants to check a manifest without running it.
+func ValidateIgnoreListElementKeys(t UpdateTest) error {
+	if len(t.IgnoreListElementKeys) == 0 {
+		return nil
+	}
+	if t.Skip.Present() {
+		return fmt.Errorf(
+			"ignoreListElementKeys is set but skip is also set — skip asserts no test exists to write, " +
+				"so there is no comparison left for ignoreListElementKeys to affect; remove one directive")
+	}
+	seen := make(map[string]bool, len(t.IgnoreListElementKeys))
+	for _, k := range t.IgnoreListElementKeys {
+		if k == "" {
+			return fmt.Errorf("ignoreListElementKeys entry is empty — name the per-element key to exclude from comparison")
+		}
+		if seen[k] {
+			return fmt.Errorf("ignoreListElementKeys entry %q is repeated", k)
+		}
+		seen[k] = true
+	}
+
+	// Same authoring-error scan as ValidateIgnoreMapKeys, one level
+	// deeper: the comparison strips every ignoreListElementKeys key from
+	// EVERY element on BOTH sides (runner.compareFieldValue), so a key
+	// named here that an element of the entry's own effective expectation
+	// ALSO names is deleted before the comparison ever looks at it — the
+	// field test then reports PASS regardless of what the live value
+	// actually is for that element.
+	effective := t.Expect
+	source := "expect"
+	if effective == nil {
+		effective = t.Value
+		source = "value"
+	}
+	if effArr, ok := effective.([]interface{}); ok {
+		for _, elem := range effArr {
+			effObj, ok := elem.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			for _, k := range t.IgnoreListElementKeys {
+				if _, present := effObj[k]; present {
+					return fmt.Errorf(
+						"ignoreListElementKeys entry %q also appears as a key in one of this entry's own %s: elements — "+
+							"the comparison strips ignoreListElementKeys keys from every element on BOTH sides before "+
+							"comparing, so this key would be deleted from %s: too and the test would pass without ever "+
+							"checking it; remove the key from ignoreListElementKeys (it is redundant — %s: already covers "+
+							"it) or remove it from %s: (if it is really a provider-injected per-element member the "+
+							"manifest cannot predict)",
+						k, source, source, source, source)
+				}
 			}
 		}
 	}

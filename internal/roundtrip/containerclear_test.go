@@ -313,6 +313,175 @@ func TestDeclaredContainerLeavesMissingSchemaIsAnError(t *testing.T) {
 	}
 }
 
+// TestContainerClearCoverageSelfTombstoneExplicitNull confirms the gap this
+// fix closes: a leaf with NO other top-level sibling to host a `clear:`
+// entry earns coverage from an explicit `value: null` on its OWN entry —
+// GlobalFirewallRuleset.rules from the ticket that filed this fix, modelled
+// here as the sole-top-level-field "tags" leaf on a manifest with no other
+// tested field at all.
+func TestContainerClearCoverageSelfTombstoneExplicitNull(t *testing.T) {
+	crd := decodeCRD(t, containerClearFixtureCRD)
+	m := &manifest.Manifest{
+		Tests: []manifest.UpdateTest{
+			{Field: "tags", Value: nil, ValueExplicit: true},
+		},
+	}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+
+	byPath := findingsByPath(findings)
+	if !byPath["tags"].Covered {
+		t.Errorf("tags not covered by an explicit value: null self-tombstone, findings = %+v", findings)
+	}
+	if byPath["labels"].Covered {
+		t.Errorf("labels reported covered with no entry naming it: %+v", byPath["labels"])
+	}
+}
+
+// TestContainerClearCoverageSelfTombstoneEmptyContainer confirms the second
+// route: an empty container value (`value: []` for a List leaf, `value: {}`
+// for a Map leaf) on the leaf's own entry, with NO ValueExplicit and no
+// clear: list at all — the shape provider-infobloxnios' zone-forward.yaml
+// already uses as a workaround for the same underlying gap.
+func TestContainerClearCoverageSelfTombstoneEmptyContainer(t *testing.T) {
+	crd := decodeCRD(t, containerClearFixtureCRD)
+	m := &manifest.Manifest{
+		Tests: []manifest.UpdateTest{
+			{Field: "tags", Value: []interface{}{}},
+			{Field: "labels", Value: map[string]interface{}{}},
+		},
+	}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+
+	byPath := findingsByPath(findings)
+	if !byPath["tags"].Covered {
+		t.Errorf("tags not covered by an empty-list self-tombstone, findings = %+v", findings)
+	}
+	if !byPath["labels"].Covered {
+		t.Errorf("labels not covered by an empty-map self-tombstone, findings = %+v", findings)
+	}
+}
+
+// TestContainerClearCoverageSelfTombstoneShapeMismatchNotCredited confirms
+// selfTombstoned checks the CORRECT empty shape for the leaf: an empty MAP
+// value on a List-typed leaf (or vice versa) does not type-assert to the
+// leaf's own shape, so it must not be credited as a self-tombstone.
+func TestContainerClearCoverageSelfTombstoneShapeMismatchNotCredited(t *testing.T) {
+	crd := decodeCRD(t, containerClearFixtureCRD)
+	m := &manifest.Manifest{
+		Tests: []manifest.UpdateTest{
+			// tags is List-shaped; an empty MAP is the wrong shape.
+			{Field: "tags", Value: map[string]interface{}{}},
+		},
+	}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+
+	if byPath := findingsByPath(findings); byPath["tags"].Covered {
+		t.Errorf("tags reported covered by an empty value of the WRONG container shape: %+v", byPath["tags"])
+	}
+}
+
+// TestContainerClearCoverageNonEmptyValueNotSelfTombstoned confirms an
+// ordinary non-empty value on the leaf's own entry — the everyday "set a
+// new value" test every field starts with — is not mistaken for a
+// self-tombstone.
+func TestContainerClearCoverageNonEmptyValueNotSelfTombstoned(t *testing.T) {
+	crd := decodeCRD(t, containerClearFixtureCRD)
+	m := &manifest.Manifest{
+		Tests: []manifest.UpdateTest{
+			{Field: "tags", Value: []interface{}{"a", "b"}},
+		},
+	}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+
+	if byPath := findingsByPath(findings); byPath["tags"].Covered {
+		t.Errorf("tags reported covered by an ordinary non-empty value: %+v", byPath["tags"])
+	}
+}
+
+// TestSelfTombstoned covers the helper in isolation, including the
+// ValueExplicit-vs-absent distinction and both container shapes.
+func TestSelfTombstoned(t *testing.T) {
+	cases := map[string]struct {
+		test  manifest.UpdateTest
+		shape Shape
+		want  bool
+	}{
+		"explicit null, list shape": {
+			test:  manifest.UpdateTest{Value: nil, ValueExplicit: true},
+			shape: ShapeList,
+			want:  true,
+		},
+		"explicit null, map shape": {
+			test:  manifest.UpdateTest{Value: nil, ValueExplicit: true},
+			shape: ShapeMap,
+			want:  true,
+		},
+		"absent value (not explicit)": {
+			test:  manifest.UpdateTest{Value: nil, ValueExplicit: false},
+			shape: ShapeList,
+			want:  false,
+		},
+		"empty list, list shape": {
+			test:  manifest.UpdateTest{Value: []interface{}{}},
+			shape: ShapeList,
+			want:  true,
+		},
+		"non-empty list, list shape": {
+			test:  manifest.UpdateTest{Value: []interface{}{"a"}},
+			shape: ShapeList,
+			want:  false,
+		},
+		"empty map, map shape": {
+			test:  manifest.UpdateTest{Value: map[string]interface{}{}},
+			shape: ShapeMap,
+			want:  true,
+		},
+		"non-empty map, map shape": {
+			test:  manifest.UpdateTest{Value: map[string]interface{}{"a": "1"}},
+			shape: ShapeMap,
+			want:  false,
+		},
+		"empty map, list shape (wrong shape)": {
+			test:  manifest.UpdateTest{Value: map[string]interface{}{}},
+			shape: ShapeList,
+			want:  false,
+		},
+		"empty list, map shape (wrong shape)": {
+			test:  manifest.UpdateTest{Value: []interface{}{}},
+			shape: ShapeMap,
+			want:  false,
+		},
+		"scalar value": {
+			test:  manifest.UpdateTest{Value: "x"},
+			shape: ShapeList,
+			want:  false,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := selfTombstoned(tc.test, tc.shape); got != tc.want {
+				t.Errorf("selfTombstoned(%+v, %v) = %v, want %v", tc.test, tc.shape, got, tc.want)
+			}
+		})
+	}
+}
+
 // findingsByPath indexes ContainerClearFinding by Path for the tests above.
 func findingsByPath(findings []ContainerClearFinding) map[string]ContainerClearFinding {
 	out := make(map[string]ContainerClearFinding, len(findings))

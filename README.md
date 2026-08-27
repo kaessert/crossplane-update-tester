@@ -732,10 +732,14 @@ decision:
   its removal direction (a `clear:` list naming it exactly, a `clear:`
   list naming an ANCESTOR of its dotted path — an RFC-7386 merge-patch
   null removes the whole subtree beneath that ancestor, this leaf
-  included — or a directly-tested map value that nulls one of its own
-  member keys) as opposed to only ever adding to it. This is advisory
-  ONLY: it is informational in every report and never turns the command's
-  exit code non-zero, regardless of how much or how little of a manifest's
+  included — a directly-tested map value that nulls one of its own
+  member keys, or a self-tombstone: the leaf's own entry setting `value:
+  null` explicitly, or an empty container value (`value: []` for a list
+  leaf, `value: {}` for a map leaf) — see "Whole-field tombstones without a
+  sibling field" below for when the self-tombstone route is needed) as
+  opposed to only ever adding to it. This is advisory ONLY: it is
+  informational in every report and never turns the command's exit code
+  non-zero, regardless of how much or how little of a manifest's
   container-typed surface is covered.
 - `waivers` — every `skip:`-carrying entry, bucketed against its own live
   row as `redundant` (the row is `equal`; the waiver is unnecessary),
@@ -813,10 +817,10 @@ three top-level directive lines: `converge-skip:`, `assert-unchanged:` and
 | Key | Meaning |
 |---|---|
 | `field` | Required. Field name under `spec.forProvider`; dot-separated for nested fields. |
-| `value` | The value to patch in. Required unless `skip` is set. |
+| `value` | The value to patch in. Required unless `skip` is set — but "required" means the `value:` key must be PRESENT, not non-null: an explicit `value: null` (or a bare `value:` with nothing after the colon) is accepted as a deliberate whole-field tombstone in its own right, distinct from the key being absent entirely — see "Whole-field tombstones without a sibling field" below. |
 | `expect` | Optional. The value expected in `status.atProvider` when the backend normalises what it stores. Defaults to `value`. |
 | `skip` | Optional. Either a free-prose string (the legacy form, reported as `SKIPPED` and credited under `validate`'s `skipped-unstructured` status) or a structured mapping with a `reason:` from a closed set (reported as `SKIPPED` and credited under `validate`'s `skipped` status — see "`skip:` reasons" below). Either way the entry still counts as coverage for `validate` and is mutually exclusive with `knownDefect`. |
-| `clear` | Optional. A list of OTHER top-level `spec.forProvider` field names nulled in the SAME merge patch that sets `field`'s value, so a union modeled as separate top-level fields switches arms atomically. Only valid when `field` itself is top-level (not dotted); a dotted entry, or one naming `field` itself, is rejected at parse time. |
+| `clear` | Optional. A list of OTHER top-level `spec.forProvider` field names nulled in the SAME merge patch that sets `field`'s value, so a union modeled as separate top-level fields switches arms atomically. Only valid when `field` itself is top-level (not dotted); a dotted entry, or one naming `field` itself, is rejected at parse time — even for a `field` with no other sibling to name; see "Whole-field tombstones without a sibling field" for that case's own route. |
 | `knownDefect` | Optional. The ID of the ticket tracking a real defect that keeps this field's update path from converging. Unlike `skip`, the entry RUNS: `value` is required, the patch is applied exactly as normal, and non-convergence is reported as `KNOWN-DEFECT` — expected, not a failure. If the field DOES converge, that FAILS the run hard as `KNOWN-DEFECT CONVERGED`, naming the ticket and telling the reader to delete the token. A field that converges in value but has no `Update()` Event to prove it (`NOT-EVIDENCED`) is likewise never credited as `KNOWN-DEFECT` — it fails the run through its own `NOT-EVIDENCED` verdict instead, since a value match is evidence the defect may already be fixed. Mutually exclusive with `skip`. The value must be non-empty, contain no whitespace, not be a placeholder (`TODO`, `TBD`, `n/a`, etc.), and be at least 6 characters — reject anything that cannot be followed back to an actual ticket. Also rejected if the same top-level field name appears in this manifest's own `ignore-fields:` set (dead config — see `ignore-fields:` below). |
 | `ignoreMapKeys` | Optional. A list of top-level member keys excluded, on BOTH sides, from `run`'s equality check between `expect` (or `value`, when `expect` is unset) and the live `status.atProvider` value — see "`ignoreMapKeys:` — excluding a provider-injected map member" below. Mutually exclusive with `skip` (there is no comparison left for it to affect). |
 
@@ -862,6 +866,51 @@ The pre-existing free-prose string form (`skip: "some reason"`) still parses
 and still counts as coverage, but is reported under `validate`'s distinct
 `skipped-unstructured` status rather than `skipped` — see the status list
 above.
+
+#### Whole-field tombstones without a sibling field
+
+`clear:` folds a null for OTHER top-level fields into the merge patch that
+sets `field`'s own value, so it can never null `field` itself — that
+restriction stays in force even for a `Kind` whose `spec.forProvider`
+declares no other top-level field at all to name. A container-typed field
+(a list or a free-form map) that IS the only top-level field on its `Kind`
+still needs a way to prove its removal direction is tested, so two
+additive routes exist, authored directly on the field's own entry instead
+of a sibling's:
+
+```yaml
+crossplane.io/update-test: |
+  - field: rules
+    value: null
+```
+
+An explicit `value: null` (equivalently `value: ~`, or a bare `value:`
+with nothing after the colon — all three are the same YAML null) builds
+exactly the same `{"spec":{"forProvider":{"rules":null}}}` merge-patch
+body a `clear:` entry would produce for a sibling, but targets `field`
+itself. It is accepted only because the entry deliberately wrote the
+`value:` key — an entry that omits `value:` altogether still fails with
+"value is required unless skip is set", exactly as before this existed.
+
+The second route reaches the same coverage credit with an ordinary value,
+no null involved:
+
+```yaml
+crossplane.io/update-test: |
+  - field: tags
+    value: []
+```
+
+An empty container (`value: []` for a list-typed field, `value: {}` for a
+free-form map field) replaces the field wholesale under RFC-7386
+merge-patch semantics — the live collection is not merged member-by-member,
+it is replaced outright — so it removes every existing member exactly as a
+null tombstone does, while still reading as a normal, non-null test value.
+
+Either route only ever credits the exact field carrying it; neither has an
+ancestor-walk analogue the way a `clear:` tombstone on an ancestor object
+does; see the `containerClear` cell-denominator breakdown above for how
+this is reported.
 
 #### `assert-unchanged:` — silent-wipe guard
 

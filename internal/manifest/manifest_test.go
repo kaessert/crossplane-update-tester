@@ -704,6 +704,102 @@ func TestParseAnnotationRejectsUnsupportedClearShapes(t *testing.T) {
 	}
 }
 
+// TestParseAnnotationExplicitNullValueIsAcceptedAsSelfTombstone proves the
+// mechanism this ticket adds: an entry whose "value:" key is present but
+// null (spelled as "null", "~", or a bare "value:" with nothing after the
+// colon) parses successfully with ValueExplicit set, rather than tripping
+// the "value is required" rejection — the whole-field self-tombstone route
+// for a leaf with no sibling top-level field able to host a clear: entry
+// (see roundtrip.ContainerClearCoverage's self-tombstone case).
+func TestParseAnnotationExplicitNullValueIsAcceptedAsSelfTombstone(t *testing.T) {
+	cases := map[string]struct {
+		reason     string
+		annotation string
+	}{
+		"NullKeyword": {
+			reason: "value: null spells the explicit null out",
+			annotation: `
+- field: rules
+  value: null
+`,
+		},
+		"TildeKeyword": {
+			reason: "value: ~ is YAML's other null spelling",
+			annotation: `
+- field: rules
+  value: ~
+`,
+		},
+		"BareColon": {
+			reason: "a bare value: with nothing after the colon is also an explicit null in YAML",
+			annotation: `
+- field: rules
+  value:
+`,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			tests, _, _, _, err := ParseAnnotation(tc.annotation)
+			if err != nil {
+				t.Fatalf("%s: ParseAnnotation() error = %v, want nil", tc.reason, err)
+			}
+			if len(tests) != 1 {
+				t.Fatalf("%s: len(tests) = %d, want 1", tc.reason, len(tests))
+			}
+			if tests[0].Value != nil {
+				t.Errorf("%s: tests[0].Value = %#v, want nil", tc.reason, tests[0].Value)
+			}
+			if !tests[0].ValueExplicit {
+				t.Errorf("%s: tests[0].ValueExplicit = false, want true", tc.reason)
+			}
+		})
+	}
+}
+
+// TestParseAnnotationAbsentValueStillRejected is the companion negative
+// case: an entry with NO "value:" key at all — the pre-existing rejection —
+// must still fail parsing exactly as before. ValueExplicit's addition is
+// additive only; it must not loosen this check for the genuinely
+// incomplete entry it exists to catch.
+func TestParseAnnotationAbsentValueStillRejected(t *testing.T) {
+	annotation := `
+- field: rules
+`
+	_, _, _, _, err := ParseAnnotation(annotation)
+	if err == nil {
+		t.Fatal("ParseAnnotation() error = nil, want an error for a genuinely absent value: key")
+	}
+	if !strings.Contains(err.Error(), "value is required unless skip is set") {
+		t.Errorf("ParseAnnotation() error = %q, want it to contain the value-required message", err.Error())
+	}
+}
+
+// TestParseAnnotationValueExplicitFalseForOrdinaryEntries confirms
+// ValueExplicit does not leak true onto every entry regardless of shape —
+// only entries whose value: key is present carry it, exactly as an
+// ordinary present-and-non-null value already implies.
+func TestParseAnnotationValueExplicitFalseForOrdinaryEntries(t *testing.T) {
+	annotation := `
+- field: comment
+  value: "hello"
+`
+	tests, _, _, _, err := ParseAnnotation(annotation)
+	if err != nil {
+		t.Fatalf("ParseAnnotation() error = %v, want nil", err)
+	}
+	if len(tests) != 1 {
+		t.Fatalf("len(tests) = %d, want 1", len(tests))
+	}
+	if !tests[0].ValueExplicit {
+		t.Error("ValueExplicit = false for an entry whose value: key is present and non-null, want true")
+	}
+	if tests[0].Value != "hello" {
+		t.Errorf("Value = %#v, want %q", tests[0].Value, "hello")
+	}
+}
+
 // TestParseBytesKnownDefect proves a "knownDefect:" key on an update-test
 // entry parses onto UpdateTest.KnownDefect, and that an entry with no such
 // key parses with an empty KnownDefect — the additive-only case every

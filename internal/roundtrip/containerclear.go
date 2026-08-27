@@ -122,12 +122,20 @@ type ContainerClearFinding struct {
 //     that nested path directly; or
 //   - the entry directly testing the leaf itself carries a Value whose
 //     top-level member map contains at least one explicit null — the
-//     per-key removal shape ({"spec":{"forProvider":{"<leaf>":{"a":"1","b":null}}}}).
+//     per-key removal shape ({"spec":{"forProvider":{"<leaf>":{"a":"1","b":null}}}}); or
+//   - the entry directly testing the leaf itself patches the leaf's OWN
+//     value to a tombstone — either an explicit `value: null`
+//     (manifest.UpdateTest.ValueExplicit, credited for a leaf with no
+//     sibling top-level field able to host a Clear entry naming it — see
+//     selfTombstoned) or an empty container value (`value: []` for a List
+//     leaf, `value: {}` for a Map leaf) — the shape RFC-7386 treats
+//     identically to a Clear tombstone once it lands, but authored on the
+//     leaf's own field entry instead of a sibling's.
 //
-// The per-key-removal check stays exact-path-only by construction: a
-// per-key null only ever targets the field whose own Value carries it, and
-// has no ancestor-walk analogue — nulling a member of some OTHER field's
-// map value cannot remove a descendant of a different leaf.
+// The per-key-removal and self-tombstone checks stay exact-path-only by
+// construction: both only ever look at the entry testing the leaf's own
+// field, and have no ancestor-walk analogue — nulling or emptying a
+// different field's value cannot remove a descendant of a different leaf.
 //
 // Neither the exact-path nor the ancestor-tombstone case is inferred
 // beyond ordinary merge-patch semantics: a leaf with no entry at all, and
@@ -143,6 +151,7 @@ func ContainerClearCoverage(crd map[string]interface{}, m *manifest.Manifest) ([
 
 	clearedSiblings := make(map[string]bool)
 	perKeyNulled := make(map[string]bool)
+	selfByField := make(map[string]manifest.UpdateTest, len(m.Tests))
 	for _, t := range m.Tests {
 		for _, sibling := range t.Clear {
 			clearedSiblings[sibling] = true
@@ -150,11 +159,13 @@ func ContainerClearCoverage(crd map[string]interface{}, m *manifest.Manifest) ([
 		if hasNestedNullMember(t.Value) {
 			perKeyNulled[t.Field] = true
 		}
+		selfByField[t.Field] = t
 	}
 
 	findings := make([]ContainerClearFinding, 0, len(leaves))
 	for _, leaf := range leaves {
 		ancestor, ancestorCleared := clearedAncestor(leaf.Path, clearedSiblings)
+		self, hasSelf := selfByField[leaf.Path]
 		switch {
 		case clearedSiblings[leaf.Path]:
 			findings = append(findings, ContainerClearFinding{
@@ -171,10 +182,15 @@ func ContainerClearCoverage(crd map[string]interface{}, m *manifest.Manifest) ([
 				Path: leaf.Path, Shape: leaf.Shape, Covered: true,
 				Detail: "per-key removal: this field's own tested value nulls a member key",
 			})
+		case hasSelf && selfTombstoned(self, leaf.Shape):
+			findings = append(findings, ContainerClearFinding{
+				Path: leaf.Path, Shape: leaf.Shape, Covered: true,
+				Detail: "whole-field tombstone: this field's own tested value is an explicit `value: null` or an empty container, with no sibling field needed to host it",
+			})
 		default:
 			findings = append(findings, ContainerClearFinding{
 				Path: leaf.Path, Shape: leaf.Shape, Covered: false,
-				Detail: "no clear:, whole-field tombstone, whole-subtree tombstone, or per-key removal exercises this container leaf's removal direction",
+				Detail: "no clear:, whole-field tombstone, whole-subtree tombstone, per-key removal, or self-tombstone exercises this container leaf's removal direction",
 			})
 		}
 	}
@@ -214,6 +230,45 @@ func hasNestedNullMember(v interface{}) bool {
 		}
 	}
 	return false
+}
+
+// selfTombstoned reports whether entry t's OWN tested value removes the
+// WHOLE leaf shape rather than describing a value for it — either an
+// explicit `value: null` (manifest.UpdateTest.ValueExplicit; see that
+// field's doc comment for why an explicit null cannot be told apart from
+// t.Value simply being unset without it) or an empty container value
+// matching shape: `value: []` for a List leaf, `value: {}` for a Map leaf.
+//
+// Both are equivalent, once applied, to the whole-field tombstone a Clear
+// entry on a SIBLING field would produce
+// ({"spec":{"forProvider":{"<field>":null}}} or an empty collection at that
+// same key) — but authored directly on the leaf's own entry, so a leaf with
+// no sibling top-level field able to host a Clear entry (see
+// manifest.ValidateClear's rejection of clear naming its own field) can
+// still earn clear-direction coverage.
+//
+// An empty container is credited here even though it is not byte-identical
+// to a null tombstone: RFC 7386 merge-patch semantics apply a scalar,
+// list, or empty-object VALUE by wholesale replacement at that key exactly
+// as they apply null — the live collection is not merged member-by-member,
+// it is replaced outright — so both bodies remove every existing member the
+// leaf held. shape distinguishes which empty form is the right one to
+// check for; a List leaf's Value is never itself credited by an empty MAP
+// or vice versa.
+func selfTombstoned(t manifest.UpdateTest, shape Shape) bool {
+	if t.Value == nil {
+		return t.ValueExplicit
+	}
+	switch shape {
+	case ShapeList:
+		v, ok := t.Value.([]interface{})
+		return ok && len(v) == 0
+	case ShapeMap:
+		v, ok := t.Value.(map[string]interface{})
+		return ok && len(v) == 0
+	default:
+		return false
+	}
 }
 
 // containerLeafSummary renders a one-line coverage tally, e.g.

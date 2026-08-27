@@ -99,6 +99,50 @@ type UpdateTest struct {
 	// Requires Expect or Value to resolve to a JSON object; see
 	// runner.compareFieldValue for what happens when it does not.
 	IgnoreMapKeys []string `yaml:"ignoreMapKeys"`
+	// ValueExplicit reports whether the "value:" key was present in the
+	// entry's own YAML mapping at all, regardless of what it decoded to.
+	//
+	// It exists to break a genuine ambiguity: `value: null`, a bare
+	// `value:` with nothing after the colon, and the "value:" key being
+	// entirely ABSENT from the mapping all decode Value to the identical
+	// Go nil — yaml.v3 gives an interface{} target no way to tell "the key
+	// was there and explicitly null" from "the key was never written" once
+	// decoding has happened. That distinction matters here specifically:
+	// an explicit `value: null` is a legitimate whole-field-tombstone
+	// entry (see ValidateClear and roundtrip.ContainerClearCoverage's
+	// self-tombstone case for the container leaf this unlocks — a
+	// top-level container field with no sibling to host a clear: list),
+	// while a genuinely omitted value: is simply an incomplete entry with
+	// nothing to test. Populated by UnmarshalYAML; not itself part of the
+	// YAML schema (no yaml tag) and not settable by an author.
+	ValueExplicit bool `yaml:"-"`
+}
+
+// UnmarshalYAML implements yaml.Unmarshaler for UpdateTest so
+// ValueExplicit can be derived from the raw mapping node — see its doc
+// comment for why that requires looking at the node directly rather than
+// at the decoded Value.
+func (t *UpdateTest) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("update-test entry must be a mapping, got YAML node kind %d", node.Kind)
+	}
+	// A distinct named type, not UpdateTest itself: decoding into
+	// UpdateTest directly here would recurse into this same method
+	// forever, since yaml.v3 uses the Unmarshaler interface at every
+	// level it finds it implemented.
+	type rawUpdateTest UpdateTest
+	var raw rawUpdateTest
+	if err := node.Decode(&raw); err != nil {
+		return err
+	}
+	*t = UpdateTest(raw)
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value == "value" {
+			t.ValueExplicit = true
+			break
+		}
+	}
+	return nil
 }
 
 // SkipReason is the closed set of reasons a structured "skip:" entry may
@@ -578,7 +622,7 @@ func ParseAnnotation(annotation string) ([]UpdateTest, string, []string, []strin
 				"entry %d (%s): knownDefect and skip are mutually exclusive — skip asserts no test exists to write, "+
 					"knownDefect asserts an expressible test fails; an entry cannot be both", i, t.Field)
 		}
-		if t.Value == nil && !t.Skip.Present() {
+		if t.Value == nil && !t.ValueExplicit && !t.Skip.Present() {
 			return nil, "", nil, nil, fmt.Errorf("entry %d (%s): value is required unless skip is set", i, t.Field)
 		}
 		if t.KnownDefect != "" {
@@ -697,6 +741,14 @@ func ValidateIgnoreFields(fields []string) error {
 // the very value the patch is meant to set, silently undoing it (map
 // iteration order is not guaranteed, so the outcome would be indeterminate
 // besides being wrong).
+//
+// This rejection stays unconditional even for a Kind whose spec.forProvider
+// declares no OTHER top-level field to host a sibling clear: entry against —
+// it does not relax into accepting c == field just because no alternative
+// exists. An entry that wants to null field itself uses a plain explicit
+// `value: null` instead (see UpdateTest.ValueExplicit): that is a different,
+// additive route to the same whole-field-tombstone merge-patch body, entirely
+// outside the clear: mechanism this function guards.
 //
 // Exported so every source of a clear list shares this one check — the
 // "clear:" key on an update-test annotation entry (via ParseAnnotation

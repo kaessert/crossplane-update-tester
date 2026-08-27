@@ -47,9 +47,10 @@ type GuaranteedNoOpFinding struct {
 // It is deliberately conservative, the same bar as this package's other
 // offline checks: an entry is flagged only when EVERY earlier non-skipped
 // entry left the field's top-level name untouched — neither as its own
-// "field:", nor named in its "clear:" list. Entries run in order against
-// one live resource, so an earlier entry naming the same top-level field
-// may have changed what is actually there by the time THIS entry's patch is
+// "field:", named in its "clear:" list, nor named in its "withValues:" map.
+// Entries run in order against one live resource, so an earlier entry
+// naming the same top-level field — by any of those three routes — may
+// have changed what is actually there by the time THIS entry's patch is
 // built. This check has no way to know whether that earlier entry
 // converged, so it declines to guess and leaves the later entry unflagged
 // rather than risk a false positive — see topLevelField.
@@ -77,6 +78,9 @@ func CheckGuaranteedNoOp(m *manifest.Manifest) []GuaranteedNoOpFinding {
 		touched[top] = true
 		for _, c := range t.Clear {
 			touched[topLevelField(c)] = true
+		}
+		for sibling := range t.WithValues {
+			touched[topLevelField(sibling)] = true
 		}
 	}
 

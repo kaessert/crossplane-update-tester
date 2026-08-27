@@ -418,6 +418,80 @@ func TestContainerClearCoverageNonEmptyValueNotSelfTombstoned(t *testing.T) {
 	}
 }
 
+// TestContainerClearCoverageWithValuesEmptyListTombstonesLeaf confirms site
+// 3's decision (ticket cf604fcf-24aa-4ba9-8cfa-2f1d906d882b): a sibling
+// entry's withValues: map naming a LIST-shaped leaf with an empty list
+// literal credits that leaf as covered, exactly like the value: []
+// self-tombstone case above — RFC-7386 treats an empty list as wholesale
+// replacement regardless of which directive placed it in the merge patch.
+func TestContainerClearCoverageWithValuesEmptyListTombstonesLeaf(t *testing.T) {
+	crd := decodeCRD(t, containerClearFixtureCRD)
+	m := &manifest.Manifest{
+		Tests: []manifest.UpdateTest{
+			{Field: "name", Value: "new-name", WithValues: map[string]interface{}{"tags": []interface{}{}}},
+		},
+	}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+
+	byPath := findingsByPath(findings)
+	if !byPath["tags"].Covered {
+		t.Errorf("tags not covered by a sibling entry's withValues: empty-list literal, findings = %+v", findings)
+	}
+	if byPath["labels"].Covered {
+		t.Errorf("labels reported covered with no entry naming it: %+v", byPath["labels"])
+	}
+}
+
+// TestContainerClearCoverageWithValuesNonEmptyListNotCredited confirms the
+// withValues: credit route requires the EMPTY list specifically — a
+// non-empty literal is an ordinary write, not a removal-direction proof,
+// and must not be credited.
+func TestContainerClearCoverageWithValuesNonEmptyListNotCredited(t *testing.T) {
+	crd := decodeCRD(t, containerClearFixtureCRD)
+	m := &manifest.Manifest{
+		Tests: []manifest.UpdateTest{
+			{Field: "name", Value: "new-name", WithValues: map[string]interface{}{"tags": []interface{}{"a"}}},
+		},
+	}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+
+	if byPath := findingsByPath(findings); byPath["tags"].Covered {
+		t.Errorf("tags reported covered by a non-empty withValues: literal: %+v", byPath["tags"])
+	}
+}
+
+// TestContainerClearCoverageWithValuesMapShapedNeverCredited confirms the
+// shape gate: withValues: can never write a null (manifest.ValidateWithValues
+// requires a real, non-null value), and an empty MAP literal is not a
+// tombstone under RFC-7386 (it recurses into the object and merges
+// key-by-key, removing nothing) — so a MAP-shaped leaf must never be
+// credited through withValues:, regardless of what literal is given.
+func TestContainerClearCoverageWithValuesMapShapedNeverCredited(t *testing.T) {
+	crd := decodeCRD(t, containerClearFixtureCRD)
+	m := &manifest.Manifest{
+		Tests: []manifest.UpdateTest{
+			{Field: "name", Value: "new-name", WithValues: map[string]interface{}{"labels": map[string]interface{}{}}},
+		},
+	}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+
+	if byPath := findingsByPath(findings); byPath["labels"].Covered {
+		t.Errorf("labels (Map-shaped) reported covered via withValues:, but an empty map is never a tombstone under RFC-7386: %+v", byPath["labels"])
+	}
+}
+
 // TestSelfTombstoned covers the helper in isolation, including the
 // ValueExplicit-vs-absent distinction and both container shapes.
 func TestSelfTombstoned(t *testing.T) {

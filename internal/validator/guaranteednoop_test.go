@@ -150,6 +150,27 @@ func TestCheckGuaranteedNoOp(t *testing.T) {
 			},
 			wantFields: nil,
 		},
+		"PrecedingEntryWithValuesGuardsLaterEntry": {
+			reason: "an earlier entry's withValues: map names this field's top-level name — the README's own tag/tags worked example: withValues writes tag in the SAME patch that empties tags, so a later entry repeating tag's create-time value must not be flagged as a guaranteed no-op (site 2, ticket cf604fcf-24aa-4ba9-8cfa-2f1d906d882b)",
+			forProvider: map[string]interface{}{
+				"tags": []interface{}{"a", "b"},
+				"tag":  "original-tag",
+			},
+			tests: []manifest.UpdateTest{
+				{
+					Field:      "tags",
+					Value:      []interface{}{},
+					WithValues: map[string]interface{}{"tag": ""},
+				},
+				// A genuine change: after the entry above, tag is "" on
+				// the backend, not "original-tag" — but this check has no
+				// way to know that without the withValues: touch, so
+				// without the fix this repeats the CREATE-time value and
+				// is (wrongly) flagged.
+				{Field: "tag", Value: "original-tag"},
+			},
+			wantFields: nil,
+		},
 		"PrecedingSkipEntryDoesNotGuard": {
 			reason: "a skip: entry never patches anything, so it must not guard a later entry targeting the same field",
 			forProvider: map[string]interface{}{

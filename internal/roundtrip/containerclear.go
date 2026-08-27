@@ -129,6 +129,14 @@ type ContainerClearFinding struct {
 //     shape ({"spec":{"forProvider":{"<leaf>":null}}}), folded into the
 //     same merge patch as that entry's own field (see
 //     manifest.UpdateTest.Clear and runner.buildMergePatch); or
+//   - some entry's WithValues map names it EXACTLY with an empty LIST
+//     literal ({"spec":{"forProvider":{"<leaf>":[]}}}) — a leaf can never
+//     be nulled through WithValues (manifest.ValidateWithValues requires a
+//     real, non-null value), but RFC-7386 still treats an empty list as a
+//     wholesale replacement at that key, identical in effect to the
+//     value: [] self-tombstone case below; only the LIST shape qualifies —
+//     a Map-shaped leaf can never be emptied this way, see the empty-MAP
+//     note on selfTombstoned; or
 //   - some entry's Clear list names an ANCESTOR of the leaf's dotted path
 //     — the same whole-field tombstone shape, but applied to an object
 //     several levels above the leaf ({"spec":{"forProvider":{"<ancestor>":null}}}).
@@ -184,11 +192,17 @@ func ContainerClearCoverage(crd map[string]interface{}, m *manifest.Manifest) ([
 	}
 
 	clearedSiblings := make(map[string]bool)
+	withValuesEmptyList := make(map[string]bool)
 	perKeyNulled := make(map[string]bool)
 	selfByField := make(map[string]manifest.UpdateTest, len(m.Tests))
 	for _, t := range m.Tests {
 		for _, sibling := range t.Clear {
 			clearedSiblings[sibling] = true
+		}
+		for sibling, v := range t.WithValues {
+			if l, ok := v.([]interface{}); ok && len(l) == 0 {
+				withValuesEmptyList[sibling] = true
+			}
 		}
 		if hasNestedNullMember(t.Value) {
 			perKeyNulled[t.Field] = true
@@ -198,7 +212,7 @@ func ContainerClearCoverage(crd map[string]interface{}, m *manifest.Manifest) ([
 
 	findings := make([]ContainerClearFinding, 0, len(leaves))
 	for _, leaf := range leaves {
-		covered, detail := coverageFor(leaf, clearedSiblings, perKeyNulled, selfByField)
+		covered, detail := coverageFor(leaf, clearedSiblings, withValuesEmptyList, perKeyNulled, selfByField)
 
 		reason, isIneligible := ineligible[leaf.Path]
 		if !isIneligible {
@@ -247,12 +261,14 @@ func ContainerClearCoverage(crd map[string]interface{}, m *manifest.Manifest) ([
 // documents to one leaf, independent of whether that leaf turns out to be
 // ineligible — kept separate so the ineligible/covered contradiction check
 // above can compute both without duplicating this logic.
-func coverageFor(leaf ContainerLeaf, clearedSiblings, perKeyNulled map[string]bool, selfByField map[string]manifest.UpdateTest) (covered bool, detail string) {
+func coverageFor(leaf ContainerLeaf, clearedSiblings, withValuesEmptyList, perKeyNulled map[string]bool, selfByField map[string]manifest.UpdateTest) (covered bool, detail string) {
 	ancestor, ancestorCleared := clearedAncestor(leaf.Path, clearedSiblings)
 	self, hasSelf := selfByField[leaf.Path]
 	switch {
 	case clearedSiblings[leaf.Path]:
 		return true, "whole-field tombstone: named in a sibling entry's clear: list"
+	case leaf.Shape == ShapeList && withValuesEmptyList[leaf.Path]:
+		return true, "whole-field tombstone: named in a sibling entry's withValues: map with an empty list literal (RFC-7386 wholesale replacement, equivalent to a null tombstone)"
 	case ancestorCleared:
 		return true, fmt.Sprintf("whole-subtree tombstone: ancestor %q named in a sibling entry's clear: list removes this leaf too", ancestor)
 	case perKeyNulled[leaf.Path]:

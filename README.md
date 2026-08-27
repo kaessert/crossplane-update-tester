@@ -332,6 +332,13 @@ overrides discovery.
 - `clear-target-unknown` — a `clear:` list names something that is not a
   declared field on this type (a typo, or a field renamed or removed since the
   entry was written). The command exits non-zero.
+- `withValues-target-unknown` — a `withValues:` map names something that is not
+  a declared field on this type — the same typo/rename failure mode
+  `clear-target-unknown` guards against, applied to the other directive that
+  writes a sibling in the same merge patch. The command exits non-zero. Unlike
+  `clear:`, a `withValues:` sibling never earns coverage credit (see
+  `tested-via-switch` above) even when it does name a real field: its
+  post-patch value is never asserted by the runner, only written.
 - `guarded-assert-unchanged` — the field has no entry of its own, but is named
   (as its own top-level field, or as the first segment of a nested
   `status.atProvider` path) by the annotation's top-level `assert-unchanged:`

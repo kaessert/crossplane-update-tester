@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/kaessert/crossplane-update-tester/internal/manifest"
@@ -43,7 +44,7 @@ type ValidationResult struct {
 // FieldValidation holds the status of a single field in validation.
 type FieldValidation struct {
 	JSONName string
-	Status   string // "tested", "skipped", "skipped-unstructured", "immutable", "reference-plumbing", "MISSING", "tested-via-switch", "clear-target-unknown", "guarded-assert-unchanged"
+	Status   string // "tested", "skipped", "skipped-unstructured", "immutable", "reference-plumbing", "MISSING", "tested-via-switch", "clear-target-unknown", "withValues-target-unknown", "guarded-assert-unchanged"
 }
 
 // clearCreditStatus is the status a field is credited under when the ONLY
@@ -73,6 +74,18 @@ const legacySkipStatus = "skipped-unstructured"
 // status feeds into the same AllGood/Fields reporting a MISSING field uses
 // rather than passing silently. See ValidateManifest.
 const clearTargetUnknownStatus = "clear-target-unknown"
+
+// withValuesTargetUnknownStatus flags a "withValues:" entry naming a field
+// that does not exist in the target type's declared struct fields — the
+// same failure mode clearTargetUnknownStatus guards for "clear:", applied
+// to the other directive that writes a sibling in the same merge patch. A
+// typo'd or stale key here is silently accepted at parse time, folded into
+// the outgoing merge patch, and then pruned by the API server's
+// structural-schema pruning: the run reports coverage for a sibling it
+// never actually set. Kept as its own status rather than reusing
+// clearTargetUnknownStatus so the rendered detail names the directive that
+// was actually misused. See ValidateManifest.
+const withValuesTargetUnknownStatus = "withValues-target-unknown"
 
 // assertUnchangedCreditStatus is the status a field is credited under when
 // its ONLY coverage is being named — as its own top-level field, or as the
@@ -410,6 +423,39 @@ func ValidateManifest(m *manifest.Manifest, fields []FieldInfo) *ValidationResul
 		}
 	}
 
+	// Unknown-target rejection for "withValues:", mirroring the clear:
+	// check above. Deliberately NOT mirrored further: a withValues sibling
+	// earns no coverage credit here (contrast the clearCreditStatus
+	// assignment above) because its post-patch value is never asserted by
+	// the runner — only the null a clear: entry writes is proven to hold.
+	// A withValues sibling with no direct entry of its own is left exactly
+	// as it already was before this check existed (typically MISSING),
+	// which is the correct, unembellished answer to "was this field's
+	// value independently tested?".
+	for _, t := range m.Tests {
+		if t.Skip.Present() {
+			continue
+		}
+		// Sorted so a map with more than one unknown entry reports the
+		// same offending keys, in the same order, on every run — map
+		// iteration order is randomised by Go (mirrors the sort in
+		// manifest.ValidateWithValues).
+		siblings := make([]string, 0, len(t.WithValues))
+		for sibling := range t.WithValues {
+			siblings = append(siblings, sibling)
+		}
+		sort.Strings(siblings)
+		for _, sibling := range siblings {
+			if !fieldSet[sibling] {
+				result.Fields = append(result.Fields, FieldValidation{
+					JSONName: sibling,
+					Status:   withValuesTargetUnknownStatus,
+				})
+				result.AllGood = false
+			}
+		}
+	}
+
 	for _, f := range fields {
 		var v FieldValidation
 		v.JSONName = f.JSONName
@@ -458,6 +504,7 @@ var statusOrder = []statusIconDetail{
 	{Status: assertUnchangedCreditStatus, Icon: "⊙", Detail: "guarded (assert-unchanged) — proven never to drift, not independently value-tested"},
 	{Status: "MISSING", Icon: "✗", Detail: "MISSING — not covered by update-test annotation"},
 	{Status: clearTargetUnknownStatus, Icon: "✗", Detail: "INVALID — named in a clear: list but not a declared field on this type"},
+	{Status: withValuesTargetUnknownStatus, Icon: "✗", Detail: "INVALID — named in a withValues: map but not a declared field on this type"},
 }
 
 // KnownStatuses returns every status FieldValidation.Status can hold, in

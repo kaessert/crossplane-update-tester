@@ -404,6 +404,91 @@ func TestValidateManifestClearTargetUnknownField(t *testing.T) {
 	}
 }
 
+// TestValidateManifestWithValuesTargetUnknownField is withValues:'s
+// counterpart to TestValidateManifestClearTargetUnknownField above (ticket
+// cf604fcf-24aa-4ba9-8cfa-2f1d906d882b, site 1): a withValues: entry naming
+// a field that is NOT itself a declared struct field on the target type
+// must not silently pass. Today it is accepted at parse time, folded into
+// the merge patch, and then pruned by the API server's structural-schema
+// pruning — a wrong answer, never surfaced. It must instead fail the same
+// way an unknown clear: target does: a distinct FieldValidation entry and
+// AllGood=false.
+func TestValidateManifestWithValuesTargetUnknownField(t *testing.T) {
+	fields := []FieldInfo{
+		{GoName: "BotProtectionSetting", JSONName: fieldArmA},
+	}
+
+	m := &manifest.Manifest{
+		Kind: kindWidget,
+		Tests: []manifest.UpdateTest{
+			{
+				Field:      fieldArmA,
+				Value:      "new-value",
+				WithValues: map[string]interface{}{"noSuchField": "x"},
+			},
+		},
+	}
+
+	result := ValidateManifest(m, fields)
+
+	if result.AllGood {
+		t.Fatal("expected AllGood=false — withValues: names a field absent from the struct entirely")
+	}
+
+	statusByName := statusMap(result)
+	if got := statusByName["noSuchField"]; got != withValuesTargetUnknownStatus {
+		t.Errorf(`status["noSuchField"] = %q, want %q`, got, withValuesTargetUnknownStatus)
+	}
+	// The entry's own field must still be credited independently — an
+	// invalid sibling in someone else's withValues: map must not poison an
+	// otherwise-valid direct entry.
+	if got := statusByName[fieldArmA]; got != statusTested {
+		t.Errorf("field %q: status = %q, want %q", fieldArmA, got, statusTested)
+	}
+}
+
+// TestValidateManifestWithValuesGrantsNoCoverageCredit pins the asymmetry
+// the ticket calls out (site 1, AC bullet 2): a withValues: sibling's
+// post-patch value is never asserted by the runner, unlike a clear:
+// sibling's proven null, so it must earn NO coverage credit at all — never
+// clearCreditStatus, never any status distinct from what the field would
+// report with no withValues: mention. A real, declared sibling named only
+// in withValues:, with no entry of its own, must still report MISSING.
+func TestValidateManifestWithValuesGrantsNoCoverageCredit(t *testing.T) {
+	fields := []FieldInfo{
+		{GoName: "BotProtectionSetting", JSONName: fieldArmA},
+		{GoName: "DefaultBotSetting", JSONName: fieldArmB},
+	}
+
+	m := &manifest.Manifest{
+		Kind: kindWidget,
+		Tests: []manifest.UpdateTest{
+			{
+				Field:      fieldArmA,
+				Value:      "new-value",
+				WithValues: map[string]interface{}{fieldArmB: "derived-value"},
+			},
+		},
+	}
+
+	result := ValidateManifest(m, fields)
+
+	if result.AllGood {
+		t.Fatal("expected AllGood=false — fieldArmB is named only in withValues: and earns no credit for it")
+	}
+
+	statusByName := statusMap(result)
+	if got := statusByName[fieldArmA]; got != statusTested {
+		t.Errorf("field %q: status = %q, want %q", fieldArmA, got, statusTested)
+	}
+	if got := statusByName[fieldArmB]; got != statusMissing {
+		t.Errorf("field %q: status = %q, want %q — withValues: must grant no coverage credit (contrast clearCreditStatus)", fieldArmB, got, statusMissing)
+	}
+	if got := statusByName[fieldArmB]; got == clearCreditStatus {
+		t.Errorf("field %q must never be credited under clearCreditStatus via withValues:", fieldArmB)
+	}
+}
+
 // TestValidateManifestAssertUnchangedCoverage is the acceptance case this
 // ticket implements: a field named only by the manifest's top-level
 // "assert-unchanged:" directive (never by its own "field:"/"skip:" entry —
@@ -688,6 +773,7 @@ func TestPrintValidationDoesNotPanic(t *testing.T) {
 			{JSONName: "missing", Status: statusMissing},
 			{JSONName: fieldArmB, Status: clearCreditStatus},
 			{JSONName: "noSuchField", Status: clearTargetUnknownStatus},
+			{JSONName: "noSuchWithValuesField", Status: withValuesTargetUnknownStatus},
 		},
 		AllGood: false,
 	}

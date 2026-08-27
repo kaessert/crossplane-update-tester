@@ -126,11 +126,12 @@ type ContainerClearFinding struct {
 //   - the entry directly testing the leaf itself patches the leaf's OWN
 //     value to a tombstone — either an explicit `value: null`
 //     (manifest.UpdateTest.ValueExplicit, credited for a leaf with no
-//     sibling top-level field able to host a Clear entry naming it — see
-//     selfTombstoned) or an empty container value (`value: []` for a List
-//     leaf, `value: {}` for a Map leaf) — the shape RFC-7386 treats
-//     identically to a Clear tombstone once it lands, but authored on the
-//     leaf's own field entry instead of a sibling's.
+//     sibling top-level field able to host a Clear entry naming it) or an
+//     empty LIST value (`value: []`) — the one non-null shape RFC-7386
+//     still treats as wholesale replacement, because a list is never
+//     merged member-by-member. An empty MAP value (`value: {}`) is NOT a
+//     tombstone under RFC-7386 and is deliberately never credited here —
+//     see selfTombstoned for why.
 //
 // The per-key-removal and self-tombstone checks stay exact-path-only by
 // construction: both only ever look at the entry testing the leaf's own
@@ -236,39 +237,37 @@ func hasNestedNullMember(v interface{}) bool {
 // WHOLE leaf shape rather than describing a value for it — either an
 // explicit `value: null` (manifest.UpdateTest.ValueExplicit; see that
 // field's doc comment for why an explicit null cannot be told apart from
-// t.Value simply being unset without it) or an empty container value
-// matching shape: `value: []` for a List leaf, `value: {}` for a Map leaf.
+// t.Value simply being unset without it) or an empty LIST value
+// (`value: []`) on a List-shaped leaf.
 //
 // Both are equivalent, once applied, to the whole-field tombstone a Clear
 // entry on a SIBLING field would produce
-// ({"spec":{"forProvider":{"<field>":null}}} or an empty collection at that
-// same key) — but authored directly on the leaf's own entry, so a leaf with
-// no sibling top-level field able to host a Clear entry (see
+// ({"spec":{"forProvider":{"<field>":null}}} or an empty list at that same
+// key) — but authored directly on the leaf's own entry, so a leaf with no
+// sibling top-level field able to host a Clear entry (see
 // manifest.ValidateClear's rejection of clear naming its own field) can
 // still earn clear-direction coverage.
 //
-// An empty container is credited here even though it is not byte-identical
-// to a null tombstone: RFC 7386 merge-patch semantics apply a scalar,
-// list, or empty-object VALUE by wholesale replacement at that key exactly
-// as they apply null — the live collection is not merged member-by-member,
-// it is replaced outright — so both bodies remove every existing member the
-// leaf held. shape distinguishes which empty form is the right one to
-// check for; a List leaf's Value is never itself credited by an empty MAP
-// or vice versa.
+// An empty LIST is credited here even though it is not byte-identical to a
+// null tombstone: RFC 7386 merge-patch semantics apply a non-object VALUE
+// — a scalar, or a list — by wholesale replacement at that key, exactly as
+// they apply null, because a list is never merged member-by-member. An
+// empty MAP value is the opposite case and is deliberately NEVER credited:
+// RFC 7396 recurses into an object-valued patch member and merges it
+// key-by-key against the live object, so `{"<field>":{}}` names no member
+// to remove and the live map survives the patch completely unchanged. The
+// only way to remove every member of a Map-shaped leaf under RFC 7386 is
+// the explicit-null route above; shape gates the empty-list check so a
+// Map-shaped leaf's empty MAP value is never mistaken for it.
 func selfTombstoned(t manifest.UpdateTest, shape Shape) bool {
 	if t.Value == nil {
 		return t.ValueExplicit
 	}
-	switch shape {
-	case ShapeList:
+	if shape == ShapeList {
 		v, ok := t.Value.([]interface{})
 		return ok && len(v) == 0
-	case ShapeMap:
-		v, ok := t.Value.(map[string]interface{})
-		return ok && len(v) == 0
-	default:
-		return false
 	}
+	return false
 }
 
 // containerLeafSummary renders a one-line coverage tally, e.g.

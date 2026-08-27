@@ -3250,6 +3250,59 @@ func TestCompareFieldValue(t *testing.T) {
 	}
 }
 
+// TestJSONEqualNilExpectationSatisfiedByAbsentActual is the regression pin
+// for the self-tombstone convergence defect: an explicit `value: null`
+// entry (manifest.UpdateTest.ValueExplicit) carries an expected value of Go
+// nil, and once the merge patch has actually cleared the field,
+// ReadField/stringifyFieldValue can only ever report "" for it — the same
+// string a genuinely-absent field produces (see navigateJSONPath's own doc
+// comment for why that collapse is deliberate). Before this fix, jsonEqual
+// demanded the literal string "null", which ReadField can never produce, so
+// a null expectation could never converge and the field test failed by
+// timeout precisely BECAUSE the tombstone worked. The `expected == nil, actual
+// == ""` case is the only one this test exists to prove; every other
+// combination is an ordinary mismatch and must stay one.
+func TestJSONEqualNilExpectationSatisfiedByAbsentActual(t *testing.T) {
+	cases := map[string]struct {
+		reason   string
+		expected interface{}
+		actual   string
+		want     bool
+	}{
+		"NilExpectedAbsentActualConverges": {
+			reason:   "the defect this test exists to close: a cleared field must satisfy its null expectation",
+			expected: nil,
+			actual:   "",
+			want:     true,
+		},
+		"NilExpectedNonEmptyActualStillMismatches": {
+			reason:   "a null expectation must not vacuously match a field that has not converged yet",
+			expected: nil,
+			actual:   "still-here",
+			want:     false,
+		},
+		"NilExpectedLiteralNullStringStillMismatches": {
+			reason:   "ReadField never produces the 4-byte string \"null\" — a caller that somehow got it is not the case this fix targets",
+			expected: nil,
+			actual:   "null",
+			want:     false,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := jsonEqual(tc.expected, tc.actual); got != tc.want {
+				t.Errorf("%s: jsonEqual(%#v, %q) = %v, want %v", tc.reason, tc.expected, tc.actual, got, tc.want)
+			}
+			// compareFieldValue with no ignoreKeys must agree exactly —
+			// the contract TestCompareFieldValue's own doc comment states.
+			if got := compareFieldValue(tc.expected, tc.actual, nil); got != tc.want {
+				t.Errorf("%s: compareFieldValue(%#v, %q, nil) = %v, want %v", tc.reason, tc.expected, tc.actual, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestRunFieldTestIgnoreMapKeysProviderInjectedMember is the end-to-end
 // proof this mechanism exists for: a map-typed field (extAttrs) whose live
 // status.atProvider value carries BOTH the keys the manifest manages and a

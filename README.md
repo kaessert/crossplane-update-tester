@@ -734,13 +734,13 @@ decision:
   null removes the whole subtree beneath that ancestor, this leaf
   included — a directly-tested map value that nulls one of its own
   member keys, or a self-tombstone: the leaf's own entry setting `value:
-  null` explicitly, or an empty container value (`value: []` for a list
-  leaf, `value: {}` for a map leaf) — see "Whole-field tombstones without a
-  sibling field" below for when the self-tombstone route is needed) as
-  opposed to only ever adding to it. This is advisory ONLY: it is
-  informational in every report and never turns the command's exit code
-  non-zero, regardless of how much or how little of a manifest's
-  container-typed surface is covered.
+  null` explicitly, or (for a LIST leaf only) an empty list value
+  (`value: []`) — see "Whole-field tombstones without a sibling field"
+  below for when the self-tombstone route is needed, and for why a map
+  leaf's own `value: {}` does NOT qualify) as opposed to only ever adding
+  to it. This is advisory ONLY: it is informational in every report and
+  never turns the command's exit code non-zero, regardless of how much or
+  how little of a manifest's container-typed surface is covered.
 - `waivers` — every `skip:`-carrying entry, bucketed against its own live
   row as `redundant` (the row is `equal`; the waiver is unnecessary),
   `false` (the row is a must-test classification the tool already
@@ -891,9 +891,13 @@ body a `clear:` entry would produce for a sibling, but targets `field`
 itself. It is accepted only because the entry deliberately wrote the
 `value:` key — an entry that omits `value:` altogether still fails with
 "value is required unless skip is set", exactly as before this existed.
+This recipe needs no `expect:`: once the patch has cleared the field,
+`status.atProvider` no longer has anything at that path, which reads back
+exactly as the field being present-but-null does, and both are accepted as
+satisfying a `null` expectation.
 
 The second route reaches the same coverage credit with an ordinary value,
-no null involved:
+no null involved, but applies ONLY to a list-typed field:
 
 ```yaml
 crossplane.io/update-test: |
@@ -901,16 +905,23 @@ crossplane.io/update-test: |
     value: []
 ```
 
-An empty container (`value: []` for a list-typed field, `value: {}` for a
-free-form map field) replaces the field wholesale under RFC-7386
-merge-patch semantics — the live collection is not merged member-by-member,
-it is replaced outright — so it removes every existing member exactly as a
+An empty list replaces the field wholesale under RFC-7386 merge-patch
+semantics — a non-object value is never merged member-by-member, it is
+substituted outright — so it removes every existing member exactly as a
 null tombstone does, while still reading as a normal, non-null test value.
 
-Either route only ever credits the exact field carrying it; neither has an
-ancestor-walk analogue the way a `clear:` tombstone on an ancestor object
-does; see the `containerClear` cell-denominator breakdown above for how
-this is reported.
+**This does NOT extend to a free-form map field.** `value: {}` on a map
+field is not a tombstone: RFC 7386 recurses into an object-valued patch
+member and merges it key-by-key against the live object, so an empty
+object names no member to remove and the live map survives completely
+unchanged. A map-typed field with no sibling to host a `clear:` entry has
+exactly one route to proven removal coverage — the explicit `value: null`
+recipe above.
+
+Either working route only ever credits the exact field carrying it;
+neither has an ancestor-walk analogue the way a `clear:` tombstone on an
+ancestor object does; see the `containerClear` cell-denominator breakdown
+above for how this is reported.
 
 #### `assert-unchanged:` — silent-wipe guard
 

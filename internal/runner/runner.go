@@ -542,11 +542,28 @@ func navigateJSONPath(obj map[string]interface{}, container []string, field stri
 // failures. reflect.DeepEqual is used on the normalised values.
 //
 // Falls back to string comparison when JSON normalisation is not possible.
+//
+// An explicit `value: null` self-tombstone entry (manifest.UpdateTest.
+// ValueExplicit) decodes to a Go nil exactly like an ordinary "no expected
+// value" would, so expected == nil here is read as "the field is expected
+// to be absent" rather than as the JSON literal "null". Once a merge patch
+// has actually cleared the field, ReadField/stringifyFieldValue return ""
+// for BOTH "the key is gone entirely" and "the key holds JSON null" — see
+// navigateJSONPath's own doc comment for why that collapse happens — and
+// neither shape can ever stringify to the 4-byte string "null" that a
+// literal JSON comparison would otherwise demand. Comparing expected == nil
+// against actual == "" is therefore the correct — and only reachable —
+// success condition for a null expectation, not a special case invented
+// for it.
 func jsonEqual(expected interface{}, actual string) bool {
 	// String scalars: compare directly.
 	// ReadField strips JSON quotes from strings, so actual == "hello" not `"hello"`.
 	if s, ok := expected.(string); ok {
 		return s == actual
+	}
+
+	if expected == nil {
+		return actual == ""
 	}
 
 	// Marshal expected to canonical JSON.

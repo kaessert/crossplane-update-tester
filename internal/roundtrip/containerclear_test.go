@@ -342,10 +342,14 @@ func TestContainerClearCoverageSelfTombstoneExplicitNull(t *testing.T) {
 }
 
 // TestContainerClearCoverageSelfTombstoneEmptyContainer confirms the second
-// route: an empty container value (`value: []` for a List leaf, `value: {}`
-// for a Map leaf) on the leaf's own entry, with NO ValueExplicit and no
-// clear: list at all — the shape provider-infobloxnios' zone-forward.yaml
-// already uses as a workaround for the same underlying gap.
+// route: an empty LIST value (`value: []`) on a List leaf's own entry, with
+// NO ValueExplicit and no clear: list at all, credits that leaf — the shape
+// provider-infobloxnios' zone-forward.yaml already uses as a workaround for
+// the same underlying gap. It also pins the companion negative: an empty
+// MAP value (`value: {}`) on a Map leaf's own entry is NOT credited, since
+// an RFC-7386 merge patch recurses into an object value and merges it
+// member-by-member rather than replacing it, so `{}` removes nothing from
+// a populated live map.
 func TestContainerClearCoverageSelfTombstoneEmptyContainer(t *testing.T) {
 	crd := decodeCRD(t, containerClearFixtureCRD)
 	m := &manifest.Manifest{
@@ -364,8 +368,8 @@ func TestContainerClearCoverageSelfTombstoneEmptyContainer(t *testing.T) {
 	if !byPath["tags"].Covered {
 		t.Errorf("tags not covered by an empty-list self-tombstone, findings = %+v", findings)
 	}
-	if !byPath["labels"].Covered {
-		t.Errorf("labels not covered by an empty-map self-tombstone, findings = %+v", findings)
+	if byPath["labels"].Covered {
+		t.Errorf("labels reported covered by an empty-map value, but RFC-7386 merges an object value member-by-member and removes nothing: %+v", byPath["labels"])
 	}
 }
 
@@ -447,10 +451,10 @@ func TestSelfTombstoned(t *testing.T) {
 			shape: ShapeList,
 			want:  false,
 		},
-		"empty map, map shape": {
+		"empty map, map shape (not a tombstone under RFC 7386)": {
 			test:  manifest.UpdateTest{Value: map[string]interface{}{}},
 			shape: ShapeMap,
-			want:  true,
+			want:  false,
 		},
 		"non-empty map, map shape": {
 			test:  manifest.UpdateTest{Value: map[string]interface{}{"a": "1"}},
@@ -477,6 +481,107 @@ func TestSelfTombstoned(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			if got := selfTombstoned(tc.test, tc.shape); got != tc.want {
 				t.Errorf("selfTombstoned(%+v, %v) = %v, want %v", tc.test, tc.shape, got, tc.want)
+			}
+		})
+	}
+}
+
+// applyMergePatch applies an RFC 7396 JSON Merge Patch to target and
+// returns the result, following the RFC's own reference pseudocode
+// exactly: a non-object patch value replaces target wholesale; an object
+// patch value is merged into target key-by-key, with a null member
+// removing the corresponding target key and any other value recursively
+// merged. This is a byte-for-byte-equivalent-outcome reimplementation of
+// the semantics kube-apiserver applies for `kubectl patch --type=merge`
+// (the same semantics runner.buildMergePatch's output is applied under),
+// used here to prove what a credited self-tombstone shape actually does to
+// a populated live object rather than asserting it in prose.
+func applyMergePatch(target, patch interface{}) interface{} {
+	patchMap, ok := patch.(map[string]interface{})
+	if !ok {
+		return patch
+	}
+	merged := map[string]interface{}{}
+	if targetMap, ok := target.(map[string]interface{}); ok {
+		for k, v := range targetMap {
+			merged[k] = v
+		}
+	}
+	for k, v := range patchMap {
+		if v == nil {
+			delete(merged, k)
+			continue
+		}
+		merged[k] = applyMergePatch(merged[k], v)
+	}
+	return merged
+}
+
+// TestSelfTombstonedShapesMatchMergePatchSemantics builds the exact
+// merge-patch body each self-tombstone-credited (or deliberately
+// NOT-credited) shape produces for a leaf, applies RFC 7396 merge-patch
+// semantics (applyMergePatch) to a populated live object, and confirms the
+// credited/not-credited verdict matches what the patch actually does. This
+// is the regression guard for the defect where an empty MAP value was
+// credited as removing a leaf's members despite RFC 7396 recursing into
+// (rather than replacing) an object-valued patch member, leaving the live
+// members completely untouched.
+func TestSelfTombstonedShapesMatchMergePatchSemantics(t *testing.T) {
+	const leafKey = "leaf"
+
+	cases := map[string]struct {
+		shape         Shape
+		value         interface{}
+		valueExplicit bool
+		live          interface{}
+	}{
+		"explicit null, list-shaped leaf removes the whole key": {
+			shape: ShapeList, value: nil, valueExplicit: true,
+			live: []interface{}{"a", "b"},
+		},
+		"explicit null, map-shaped leaf removes the whole key": {
+			shape: ShapeMap, value: nil, valueExplicit: true,
+			live: map[string]interface{}{"a": "1", "b": "2"},
+		},
+		"empty list on a list-shaped leaf replaces it wholesale": {
+			shape: ShapeList, value: []interface{}{},
+			live: []interface{}{"a", "b"},
+		},
+		"empty map on a map-shaped leaf removes nothing": {
+			shape: ShapeMap, value: map[string]interface{}{},
+			live: map[string]interface{}{"a": "1", "b": "2"},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			test := manifest.UpdateTest{Field: leafKey, Value: tc.value, ValueExplicit: tc.valueExplicit}
+			credited := selfTombstoned(test, tc.shape)
+
+			target := map[string]interface{}{leafKey: tc.live}
+			patch := map[string]interface{}{leafKey: tc.value}
+			merged, ok := applyMergePatch(target, patch).(map[string]interface{})
+			if !ok {
+				t.Fatalf("applyMergePatch did not return an object: %#v", merged)
+			}
+			mergedVal, stillPresent := merged[leafKey]
+
+			// The live members are actually gone iff the key is gone
+			// entirely (null tombstone) or it is present but now an empty
+			// collection (wholesale-replaced by an empty value).
+			membersRemoved := !stillPresent
+			if stillPresent {
+				switch v := mergedVal.(type) {
+				case []interface{}:
+					membersRemoved = len(v) == 0
+				case map[string]interface{}:
+					membersRemoved = len(v) == 0
+				}
+			}
+
+			if credited != membersRemoved {
+				t.Errorf("%s: selfTombstoned credited=%v but the RFC-7396 merge patch %s removed the live members (merged=%#v)",
+					name, credited, map[bool]string{true: "actually", false: "did not"}[membersRemoved], merged)
 			}
 		})
 	}

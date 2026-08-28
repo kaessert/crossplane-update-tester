@@ -672,8 +672,8 @@ The must-test set is derived from the classification, not asserted by hand:
   nothing to resolve against. The other four structured reasons
   (`union-arm`, `covered-elsewhere`, `vendor-defect`, `fixture-missing`) are
   accepted — each carries its own citation (`sibling:`, `by:`,
-  `evidence:` + `ticket:`, or `ticket:`) resolved elsewhere (see `validate`'s
-  `skip: reasons` checks below).
+  `evidence:` + `ticket:` for either of the last two) resolved elsewhere
+  (see `validate`'s `skip: reasons` checks below).
 
 CEL-immutability never excuses `value-changed` or `defaulted-by-server`: a
 backend that changes or defaults a field the CRD declares immutable is a
@@ -872,7 +872,7 @@ than declared here.
 | `union-arm` | `sibling:` naming another field | yes — `sibling:` must be a field declared on the same `<Kind>Parameters` struct |
 | `covered-elsewhere` | `by:` as `<path>#<field>` | yes — that manifest and field must exist, and the named entry must itself be directly tested (not skipped, not missing, and not a `covered-elsewhere` cycle) |
 | `vendor-defect` | `evidence:` and `ticket:` | no — both keys are checked for presence only |
-| `fixture-missing` | `ticket:` | no — checked for presence only |
+| `fixture-missing` | `evidence:` and `ticket:` | no — both keys are checked for presence only |
 | `write-only` | none | no |
 
 ```yaml
@@ -884,6 +884,7 @@ crossplane.io/update-test: |
   - field: firewallGroupId
     skip:
       reason: fixture-missing
+      evidence: "no fixture backend exposes a second firewall group to move this field between"
       ticket: VU-FW-FIXTURE
   - field: dnsVolterraManaged
     skip:

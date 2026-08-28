@@ -215,8 +215,9 @@ const (
 	// are checked for presence only.
 	SkipVendorDefect SkipReason = "vendor-defect"
 	// SkipFixtureMissing marks a field that cannot be tested because the
-	// fixture data it needs does not exist yet, tracked in Ticket. Not
-	// resolvable offline — Ticket is checked for presence only.
+	// fixture data it needs does not exist yet, recorded in Evidence and
+	// tracked in Ticket. Not resolvable offline — Evidence and Ticket are
+	// checked for presence only.
 	SkipFixtureMissing SkipReason = "fixture-missing"
 	// SkipWriteOnly marks a field with no readable counterpart to assert
 	// against. Accepted here with no companion key, unlike the other four
@@ -274,7 +275,8 @@ type SkipInfo struct {
 	// SkipCoveredElsewhere.
 	By string
 	// Evidence records what was observed that makes this field's update
-	// path untestable. Set only when Reason is SkipVendorDefect.
+	// path untestable. Set when Reason is SkipVendorDefect or
+	// SkipFixtureMissing.
 	Evidence string
 	// Ticket names the ticket tracking why this field cannot be tested
 	// yet. Set when Reason is SkipVendorDefect or SkipFixtureMissing.
@@ -317,7 +319,7 @@ func (s SkipInfo) Describe() string {
 	case s.Reason == SkipVendorDefect:
 		return fmt.Sprintf("vendor-defect (%s; ticket: %s)", s.Evidence, s.Ticket)
 	case s.Reason == SkipFixtureMissing:
-		return fmt.Sprintf("fixture-missing (ticket: %s)", s.Ticket)
+		return fmt.Sprintf("fixture-missing (%s; ticket: %s)", s.Evidence, s.Ticket)
 	case s.Reason == SkipWriteOnly:
 		return "write-only"
 	default:
@@ -416,8 +418,8 @@ func validateSkipInfo(s SkipInfo) error {
 			return fmt.Errorf("skip: reason %q requires both evidence: and ticket: to be non-empty", s.Reason)
 		}
 	case SkipFixtureMissing:
-		if s.Ticket == "" {
-			return fmt.Errorf("skip: reason %q requires a non-empty ticket: field", s.Reason)
+		if s.Evidence == "" || s.Ticket == "" {
+			return fmt.Errorf("skip: reason %q requires both evidence: and ticket: to be non-empty", s.Reason)
 		}
 	case SkipWriteOnly:
 		// No required companion keys — see the SkipWriteOnly doc comment

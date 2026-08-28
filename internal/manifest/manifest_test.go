@@ -1180,14 +1180,19 @@ func TestParseAnnotationStructuredSkipAccepted(t *testing.T) {
 			},
 		},
 		"FixtureMissing": {
-			reason: "fixture-missing carries the ticket:",
+			reason: "fixture-missing carries both evidence: and ticket:",
 			annotation: `
 - field: firewallGroupId
   skip:
     reason: fixture-missing
+    evidence: "no fixture backend exposes a second firewall group to move this field between"
     ticket: VU-FW-FIXTURE
 `,
-			want: SkipInfo{Reason: SkipFixtureMissing, Ticket: "VU-FW-FIXTURE"},
+			want: SkipInfo{
+				Reason:   SkipFixtureMissing,
+				Evidence: "no fixture backend exposes a second firewall group to move this field between",
+				Ticket:   "VU-FW-FIXTURE",
+			},
 		},
 		"WriteOnly": {
 			reason: "write-only carries no companion keys",
@@ -1298,14 +1303,34 @@ func TestParseAnnotationStructuredSkipRejectsInvalidShapes(t *testing.T) {
 `,
 			wantErrSubstr: "requires both evidence: and ticket:",
 		},
-		"FixtureMissingNoTicket": {
-			reason: "fixture-missing requires a non-empty ticket:",
+		"FixtureMissingNoTicketOrEvidence": {
+			reason: "fixture-missing requires both evidence: and ticket:",
 			annotation: `
 - field: comment
   skip:
     reason: fixture-missing
 `,
-			wantErrSubstr: "requires a non-empty ticket:",
+			wantErrSubstr: "requires both evidence: and ticket:",
+		},
+		"FixtureMissingTicketOnly": {
+			reason: "fixture-missing requires evidence: as well as ticket:",
+			annotation: `
+- field: comment
+  skip:
+    reason: fixture-missing
+    ticket: VU-FW-FIXTURE
+`,
+			wantErrSubstr: "requires both evidence: and ticket:",
+		},
+		"FixtureMissingEvidenceOnly": {
+			reason: "fixture-missing requires ticket: as well as evidence:",
+			annotation: `
+- field: comment
+  skip:
+    reason: fixture-missing
+    evidence: "no fixture backend exposes a second firewall group to move this field between"
+`,
+			wantErrSubstr: "requires both evidence: and ticket:",
 		},
 	}
 
@@ -1385,9 +1410,13 @@ func TestSkipInfoDescribe(t *testing.T) {
 			want:   "vendor-defect (observed a 400; ticket: FX-DNS-DELEGATION)",
 		},
 		"FixtureMissing": {
-			reason: "fixture-missing names its ticket",
-			skip:   SkipInfo{Reason: SkipFixtureMissing, Ticket: "VU-FW-FIXTURE"},
-			want:   "fixture-missing (ticket: VU-FW-FIXTURE)",
+			reason: "fixture-missing names both its evidence and its ticket",
+			skip: SkipInfo{
+				Reason:   SkipFixtureMissing,
+				Evidence: "no fixture backend exposes a second firewall group to move this field between",
+				Ticket:   "VU-FW-FIXTURE",
+			},
+			want: "fixture-missing (no fixture backend exposes a second firewall group to move this field between; ticket: VU-FW-FIXTURE)",
 		},
 		"WriteOnly": {
 			reason: "write-only carries no companion data to render",

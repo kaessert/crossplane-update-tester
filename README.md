@@ -769,11 +769,13 @@ decision:
   how much or how little of a manifest's container-typed surface is
   covered, ineligible, or in conflict.
 - `waivers` — every `skip:`-carrying entry, bucketed against its own live
-  row as `redundant` (the row is `equal`; the waiver is unnecessary),
-  `false` (the row is a must-test classification the tool already
-  disproves; the waiver is hiding a real deviation), or `no-row` (nothing
-  to test against, or a confirmed legitimate exception — keep the waiver
-  as is).
+  row as `false` (the row is a must-test classification the tool already
+  disproves; the waiver is hiding a real deviation) or `keep` (nothing to
+  test against, a confirmed legitimate exception, or the row is `equal` —
+  a value set at CREATE round-tripped, which says nothing about whether
+  the UPDATE path the waiver guards can be exercised at all, so `equal` is
+  never grounds to delete a waiver). `keep`'s cost and priority are the
+  waiver's evidence tier, not this bucket.
 - `backend` / `seed` — `backend` restates the run's declared `--backend`
   (`real` or `simulator`; the flag is required, with no default and no
   inference from a provider name or endpoint). Every `cells` entry restates

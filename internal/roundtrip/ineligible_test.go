@@ -27,6 +27,14 @@ import (
 //     matchLabels leaf is ALSO declared under status.atProvider — the
 //     cross-check case: a field that matches the Selector shape but IS
 //     mirrored back must never be excluded on shape alone.
+//   - namespacedVpcSelector: the exact schema controller-tools generates
+//     for a NAMESPACED xpv1.Selector — schema-identical to vpcSelector but
+//     carrying a fourth property, "namespace" — measured against
+//     provider-vultr's namespaced instances CRD (attachVpcSelector). Its
+//     OWN container leaf is namespacedVpcSelector.matchLabels, and it must
+//     be classified ReasonReferenceResolution exactly like vpcSelector's:
+//     the namespaced twin of a cluster-scoped selector is reference-
+//     resolution plumbing either way.
 //   - tags: an ordinary list, kept as the eligible control matching
 //     containerClearFixtureCRD.
 //   - backendConfigRefs: the OVER-EXCLUSION counter-fixture — a list field
@@ -192,6 +200,24 @@ spec:
                               type: string
                             resolve:
                               type: string
+                  namespacedVpcSelector:
+                    type: object
+                    properties:
+                      matchControllerRef:
+                        type: boolean
+                      matchLabels:
+                        type: object
+                        additionalProperties:
+                          type: string
+                      namespace:
+                        type: string
+                      policy:
+                        type: object
+                        properties:
+                          resolution:
+                            type: string
+                          resolve:
+                            type: string
                   mirroredSelector:
                     type: object
                     properties:
@@ -249,6 +275,33 @@ func TestContainerClearCoverageReferenceResolutionSelector(t *testing.T) {
 	}
 	if f.Reason != ReasonReferenceResolution {
 		t.Errorf("vpcSelector.matchLabels.Reason = %q, want %q", f.Reason, ReasonReferenceResolution)
+	}
+}
+
+// TestContainerClearCoverageReferenceResolutionNamespacedSelector confirms
+// the NAMESPACED twin of a Selector — one carrying the extra "namespace"
+// property crossplane-runtime generates for a namespaced managed
+// resource — is reported ineligible with REASON 1 exactly like its
+// cluster-scoped sibling in
+// TestContainerClearCoverageReferenceResolutionSelector above. A future
+// edit that narrows isSelectorShape back to the cluster-scoped shape only
+// would pass that test and fail this one.
+func TestContainerClearCoverageReferenceResolutionNamespacedSelector(t *testing.T) {
+	crd := decodeCRD(t, ineligibleFixtureCRD)
+	byPath := ineligibleFindingsByPath(t, crd)
+
+	f, ok := byPath["namespacedVpcSelector.matchLabels"]
+	if !ok {
+		t.Fatalf("namespacedVpcSelector.matchLabels not found in findings: %+v", byPath)
+	}
+	if !f.Ineligible {
+		t.Errorf("namespacedVpcSelector.matchLabels not marked Ineligible: %+v", f)
+	}
+	if f.Covered {
+		t.Errorf("namespacedVpcSelector.matchLabels marked BOTH ineligible and covered: %+v", f)
+	}
+	if f.Reason != ReasonReferenceResolution {
+		t.Errorf("namespacedVpcSelector.matchLabels.Reason = %q, want %q", f.Reason, ReasonReferenceResolution)
 	}
 }
 
@@ -602,6 +655,55 @@ func TestIsSelectorShape(t *testing.T) {
 				},
 			},
 			want: true,
+		},
+		"genuine NAMESPACED Selector shape (matchControllerRef + matchLabels + namespace + policy)": {
+			schema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"matchControllerRef": map[string]interface{}{"type": "boolean"},
+					"matchLabels": map[string]interface{}{
+						"type":                 "object",
+						"additionalProperties": map[string]interface{}{"type": "string"},
+					},
+					"namespace": map[string]interface{}{"type": "string"},
+					"policy": map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"resolution": map[string]interface{}{"type": "string"},
+							"resolve":    map[string]interface{}{"type": "string"},
+						},
+					},
+				},
+			},
+			want: true,
+		},
+		"namespace present but not string-typed": {
+			schema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"matchLabels": map[string]interface{}{
+						"type":                 "object",
+						"additionalProperties": map[string]interface{}{"type": "string"},
+					},
+					"namespace": map[string]interface{}{"type": "integer"},
+				},
+			},
+			want: false,
+		},
+		"four properties, one outside the allowed set (NOT a generated selector despite the property count matching the namespaced shape)": {
+			schema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"matchControllerRef": map[string]interface{}{"type": "boolean"},
+					"matchLabels": map[string]interface{}{
+						"type":                 "object",
+						"additionalProperties": map[string]interface{}{"type": "string"},
+					},
+					"namespace": map[string]interface{}{"type": "string"},
+					"comment":   map[string]interface{}{"type": "string"},
+				},
+			},
+			want: false,
 		},
 		"extra property not in the allowed set": {
 			schema: map[string]interface{}{

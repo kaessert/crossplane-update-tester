@@ -276,19 +276,24 @@ func schemaAtPath(root map[string]interface{}, dotted string) (map[string]interf
 }
 
 // isSelectorShape reports whether m is shaped exactly like
-// crossplane-runtime's generated xpv1.Selector: an object whose declared
-// properties are drawn ONLY from {matchControllerRef, matchLabels,
-// policy}, with at least one of matchControllerRef/matchLabels present,
-// matchLabels (when present) itself a free-form string map, and policy
-// (when present) itself a resolution/resolve-shaped object. Every
-// condition is checked against the node's own structure — nothing here
-// reads the enclosing field's JSON name.
+// crossplane-runtime's generated xpv1.Selector — both the cluster-scoped
+// shape (matchControllerRef, matchLabels, policy) and the namespaced shape,
+// which carries one additional member, "namespace": that is the only
+// difference between the two generated forms (mirroring
+// isReferenceItemShape's own name/namespace pair below), and both are
+// reference-resolution plumbing either way. Properties are drawn ONLY from
+// {matchControllerRef, matchLabels, namespace, policy}, with at least one
+// of matchControllerRef/matchLabels present, matchLabels (when present)
+// itself a free-form string map, namespace (when present) itself
+// string-typed, and policy (when present) itself a resolution/resolve-shaped
+// object. Every condition is checked against the node's own structure —
+// nothing here reads the enclosing field's JSON name.
 func isSelectorShape(m map[string]interface{}) bool {
 	props, _ := m["properties"].(map[string]interface{})
 	if len(props) == 0 {
 		return false
 	}
-	allowed := map[string]bool{"matchControllerRef": true, "matchLabels": true, "policy": true}
+	allowed := map[string]bool{"matchControllerRef": true, "matchLabels": true, "namespace": true, "policy": true}
 	for name := range props {
 		if !allowed[name] {
 			return false
@@ -308,6 +313,16 @@ func isSelectorShape(m map[string]interface{}) bool {
 		typ, _ := ml["type"].(string)
 		_, hasAdd := ml["additionalProperties"]
 		if typ != "object" || !hasAdd {
+			return false
+		}
+	}
+	if nsRaw, hasNS := props["namespace"]; hasNS {
+		ns, ok := nsRaw.(map[string]interface{})
+		if !ok {
+			return false
+		}
+		typ, _ := ns["type"].(string)
+		if typ != "string" {
 			return false
 		}
 	}

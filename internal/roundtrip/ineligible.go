@@ -8,18 +8,20 @@ import (
 
 // IneligibilityReason names why a declared container leaf's removal
 // direction can never be exercised at all — see classifyIneligibility's own
-// doc comment for what each is derived from. Two structural causes produce
-// it: crossplane-runtime's own reference-resolution plumbing
-// (ReasonReferenceResolution), and an x-kubernetes-validations rule
-// requiring the leaf under the object's default managementPolicies. The
-// second cause renders as one of three concrete reasons depending on the
-// leaf's own shape and schema, because a LIST leaf has a removal route a
-// MAP leaf does not: `value: []` is RFC-7386 wholesale replacement (the
-// same route selfTombstoned already credits), so a CEL-required LIST leaf
-// is ineligible ONLY when its own schema also blocks the empty-list route —
-// via `minItems > 0` or a second CEL rule requiring `<path>.size() > 0`. A
-// CEL-required LIST leaf with neither guard is not ineligible at all: it is
-// left out of the map entirely, exactly like any other eligible leaf.
+// doc comment for what each is derived from. Three structural causes
+// produce it: crossplane-runtime's own reference-resolution plumbing
+// (ReasonReferenceResolution), a CEL "self == oldSelf" immutability rule on
+// the leaf or an enclosing ancestor (ReasonCELImmutable), and an
+// x-kubernetes-validations rule requiring the leaf under the object's
+// default managementPolicies. The third cause renders as one of three
+// concrete reasons depending on the leaf's own shape and schema, because a
+// LIST leaf has a removal route a MAP leaf does not: `value: []` is
+// RFC-7386 wholesale replacement (the same route selfTombstoned already
+// credits), so a CEL-required LIST leaf is ineligible ONLY when its own
+// schema also blocks the empty-list route — via `minItems > 0` or a second
+// CEL rule requiring `<path>.size() > 0`. A CEL-required LIST leaf with
+// neither guard is not ineligible at all: it is left out of the map
+// entirely, exactly like any other eligible leaf.
 type IneligibilityReason string
 
 const (
@@ -42,6 +44,18 @@ const (
 	// map survives the patch completely unchanged. With both routes
 	// closed, no clear-direction test can ever reach the backend.
 	ReasonRequiredByCELMap IneligibilityReason = "required by a CEL validation rule under the default managementPolicies; nulling it is rejected by that rule's has() guard, and `value: {}` is an RFC-7386 no-op that leaves every existing member untouched — no clear-direction test can ever reach the backend"
+
+	// ReasonCELImmutable reports that the leaf's own schema node, or an
+	// ancestor object node enclosing it, carries an x-kubernetes-validations
+	// rule requiring `self == oldSelf` (see immutable.go's reCELImmutable
+	// and immutablePaths, reused here rather than re-walked). That is a
+	// strictly stronger block than either reason above: those reject only a
+	// specific patch shape (a null, or an empty value against a has()
+	// guard); this one rejects EVERY mutation of the field, so there is no
+	// alternate route left to try — nulling, emptying, or setting any other
+	// value are all rejected identically. No clear-direction test can ever
+	// reach the backend.
+	ReasonCELImmutable IneligibilityReason = "CEL-immutable: an x-kubernetes-validations rule requires self == oldSelf on this leaf or an enclosing ancestor, so admission rejects EVERY mutation of the field — not merely a null or empty-value patch, unlike the has()-guard reasons above — and no clear-direction test can ever reach the backend"
 )
 
 // listRequiredByCELReason builds the ineligibility reason for a LIST leaf
@@ -84,12 +98,23 @@ func classifyIneligibility(crd map[string]interface{}, leaves []ContainerLeaf) (
 		apPaths[p] = true
 	}
 
+	// Reused rather than re-walked: immutablePaths already performs the
+	// exact ancestor-inheriting traversal this classification needs, and
+	// DiffReport already calls it against this same fpSchema node — a
+	// second implementation of the same walk would be a rejection on
+	// review even where it computes the identical answer.
+	immutable := immutablePaths(fpSchema)
+
 	mpDefault, hasDefault := managementPoliciesDefault(schema)
 
 	out := make(map[string]IneligibilityReason, len(leaves))
 	for _, leaf := range leaves {
 		if referenceResolutionShape(fpSchema, leaf, apPaths) {
 			out[leaf.Path] = ReasonReferenceResolution
+			continue
+		}
+		if immutable[leaf.Path] {
+			out[leaf.Path] = ReasonCELImmutable
 			continue
 		}
 		if !hasDefault || !requiredByManagementPolicies(schema, leaf.Path, mpDefault) {

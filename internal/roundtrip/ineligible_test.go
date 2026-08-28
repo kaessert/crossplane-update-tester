@@ -232,6 +232,40 @@ spec:
                             type: string
                           resolve:
                             type: string
+                  immutableTags:
+                    type: array
+                    items:
+                      type: string
+                    x-kubernetes-validations:
+                    - message: immutableTags is immutable
+                      rule: "self == oldSelf"
+                  immutableGroup:
+                    type: object
+                    x-kubernetes-validations:
+                    - message: immutableGroup is immutable after creation
+                      rule: "self == oldSelf"
+                    properties:
+                      members:
+                        type: array
+                        items:
+                          type: string
+                  conditionalImmutableList:
+                    type: array
+                    items:
+                      type: string
+                    x-kubernetes-validations:
+                    - message: conditionalImmutableList is immutable once set
+                      rule: "size(oldSelf) == 0 || self == oldSelf"
+                  guardedGroup:
+                    type: object
+                    x-kubernetes-validations:
+                    - message: someField must not be removed once set, but may otherwise change
+                      rule: "!has(oldSelf.someField) || has(self.someField)"
+                    properties:
+                      someField:
+                        type: array
+                        items:
+                          type: string
           status:
             type: object
             properties:
@@ -487,6 +521,139 @@ func TestContainerClearCoverageRequiredMapStaysIneligible(t *testing.T) {
 	}
 	if !f.Ineligible || f.Reason != ReasonRequiredByCELMap {
 		t.Errorf("requiredMap = %+v, want Ineligible=true Reason=%q", f, ReasonRequiredByCELMap)
+	}
+}
+
+// TestContainerClearCoverageCELImmutableDirectNodeIneligible confirms a
+// leaf whose OWN schema node carries an x-kubernetes-validations rule
+// matching "self == oldSelf" is reported ineligible with ReasonCELImmutable,
+// and that its reason text names what makes it distinct from
+// ReasonRequiredByCELMap: admission rejects EVERY mutation, not merely a
+// null patch. Measured verbatim against provider-lambda's
+// Instance.{fileSystemMounts,fileSystemNames,firewallRulesets,sshKeyNames,tags}.
+func TestContainerClearCoverageCELImmutableDirectNodeIneligible(t *testing.T) {
+	crd := decodeCRD(t, ineligibleFixtureCRD)
+	byPath := ineligibleFindingsByPath(t, crd)
+
+	f, ok := byPath["immutableTags"]
+	if !ok {
+		t.Fatalf("immutableTags not found in findings: %+v", byPath)
+	}
+	if !f.Ineligible || f.Covered {
+		t.Fatalf("immutableTags = %+v, want Ineligible=true Covered=false", f)
+	}
+	if f.Reason != ReasonCELImmutable {
+		t.Errorf("immutableTags.Reason = %q, want %q", f.Reason, ReasonCELImmutable)
+	}
+	if !strings.Contains(string(f.Reason), "EVERY mutation") {
+		t.Errorf("immutableTags.Reason = %q, want it to state that admission rejects EVERY mutation (not merely a null patch), so a reader can tell it apart from ReasonRequiredByCELMap", f.Reason)
+	}
+	if f.Reason == ReasonRequiredByCELMap {
+		t.Errorf("immutableTags.Reason must not collapse to ReasonRequiredByCELMap — the two are derived from different admission guards")
+	}
+}
+
+// TestContainerClearCoverageCELImmutableInheritedFromAncestorIneligible
+// confirms the ancestor-inheritance case: "immutableGroup" itself carries
+// the "self == oldSelf" marker, and it is not itself a declared container
+// leaf (it has properties, so DiffReport descends into it) — the marker
+// must still reach the nested leaf "immutableGroup.members" beneath it,
+// reusing immutable.go's own collectImmutablePaths walk rather than a
+// second one. Measured verbatim against provider-f5xc's
+// VirtualSite.siteSelector.expressions, inherited from the immutable
+// "siteSelector" ancestor.
+func TestContainerClearCoverageCELImmutableInheritedFromAncestorIneligible(t *testing.T) {
+	crd := decodeCRD(t, ineligibleFixtureCRD)
+	byPath := ineligibleFindingsByPath(t, crd)
+
+	f, ok := byPath["immutableGroup.members"]
+	if !ok {
+		t.Fatalf("immutableGroup.members not found in findings: %+v", byPath)
+	}
+	if !f.Ineligible || f.Covered {
+		t.Fatalf("immutableGroup.members = %+v, want Ineligible=true Covered=false", f)
+	}
+	if f.Reason != ReasonCELImmutable {
+		t.Errorf("immutableGroup.members.Reason = %q, want %q", f.Reason, ReasonCELImmutable)
+	}
+}
+
+// TestContainerClearCoverageCELImmutableConditionalFormIneligible confirms
+// the "immutable once set" conditional spelling —
+// "size(oldSelf) == 0 || self == oldSelf" — is recognised identically to
+// the unconditional form: reCELImmutable already matches it (the substring
+// "self == oldSelf" appears verbatim), and once a value exists no mutation
+// is accepted, so the removal direction is blocked from the moment the
+// field is populated — which every example manifest carrying it does at
+// create. Measured verbatim against provider-vultr's Instance.sshkeyId.
+func TestContainerClearCoverageCELImmutableConditionalFormIneligible(t *testing.T) {
+	crd := decodeCRD(t, ineligibleFixtureCRD)
+	byPath := ineligibleFindingsByPath(t, crd)
+
+	f, ok := byPath["conditionalImmutableList"]
+	if !ok {
+		t.Fatalf("conditionalImmutableList not found in findings: %+v", byPath)
+	}
+	if !f.Ineligible || f.Covered {
+		t.Fatalf("conditionalImmutableList = %+v, want Ineligible=true Covered=false", f)
+	}
+	if f.Reason != ReasonCELImmutable {
+		t.Errorf("conditionalImmutableList.Reason = %q, want %q", f.Reason, ReasonCELImmutable)
+	}
+}
+
+// TestContainerClearCoverageCELImmutableOrdinaryMutableLeafStaysEligible is
+// a counter-fixture proving no over-exclusion: "tags" carries no CEL rule
+// at all, so it must stay eligible rather than being swept in by an overly
+// broad immutability check.
+func TestContainerClearCoverageCELImmutableOrdinaryMutableLeafStaysEligible(t *testing.T) {
+	crd := decodeCRD(t, ineligibleFixtureCRD)
+	byPath := ineligibleFindingsByPath(t, crd)
+
+	f := byPath["tags"]
+	if f.Ineligible {
+		t.Errorf("tags marked Ineligible (Reason=%q), want an ordinary eligible leaf untouched by CEL-immutability", f.Reason)
+	}
+}
+
+// TestContainerClearCoverageCELImmutableSiblingRemoveGuardNotMistakenForImmutability
+// is the second, deliberate counter-fixture: "guardedGroup" carries the
+// "!has(oldSelf.someField) || has(self.someField)" sibling rule shape —
+// guarding one NAMED field against being removed once set, not declaring
+// the current schema node immutable — which reCELImmutable is documented
+// to NOT match. "guardedGroup.someField" beneath it must stay eligible; a
+// regex change that started matching this shape would misclassify every
+// field in an object carrying its own remove-guard as immutable.
+func TestContainerClearCoverageCELImmutableSiblingRemoveGuardNotMistakenForImmutability(t *testing.T) {
+	crd := decodeCRD(t, ineligibleFixtureCRD)
+	byPath := ineligibleFindingsByPath(t, crd)
+
+	f, ok := byPath["guardedGroup.someField"]
+	if !ok {
+		t.Fatalf("guardedGroup.someField not found in findings: %+v", byPath)
+	}
+	if f.Ineligible {
+		t.Errorf("guardedGroup.someField marked Ineligible (Reason=%q), want it to stay eligible — the enclosing rule guards removal of a named sibling field, it does not declare this node immutable", f.Reason)
+	}
+}
+
+// TestContainerClearCoverageCELImmutableContradictionWithCovered confirms
+// the ineligible/covered contradiction guard treats ReasonCELImmutable the
+// same as ReasonRequiredByCELMap (an error), not the same as
+// ReasonReferenceResolution (silent exclusion): a manifest entry that
+// claims to have exercised removal on immutableTags — a leaf admission
+// rejects every mutation of — is a genuine contradiction and must surface
+// loudly.
+func TestContainerClearCoverageCELImmutableContradictionWithCovered(t *testing.T) {
+	crd := decodeCRD(t, ineligibleFixtureCRD)
+	m := &manifest.Manifest{
+		Tests: []manifest.UpdateTest{
+			{Field: "immutableTags", Value: nil, ValueExplicit: true},
+		},
+	}
+
+	if _, err := ContainerClearCoverage(crd, m); err == nil {
+		t.Error("ContainerClearCoverage returned nil error for a CEL-immutable leaf classified both ineligible and covered, want a contradiction error")
 	}
 }
 

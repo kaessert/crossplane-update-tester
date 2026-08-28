@@ -239,12 +239,23 @@ func ContainerClearCoverage(crd map[string]interface{}, m *manifest.Manifest) ([
 			continue
 		}
 
-		// ReasonRequiredByCELMap, or a LIST leaf whose empty-list route is
-		// ALSO closed: the same x-kubernetes-validations rule that makes
-		// has() fail on a null patch would reject the EXACT merge patch a
-		// "covered" signal here claims succeeded, so a manifest entry
-		// disagreeing with this is a contradiction in the predicate
-		// itself, not something to silently resolve one way or the other.
+		// ReasonRequiredByCELMap, a LIST leaf whose empty-list route is
+		// ALSO closed, or ReasonCELImmutable: every one of these is a
+		// leaf where SOME x-kubernetes-validations rule rejects the exact
+		// merge patch a "covered" signal here claims succeeded, so a
+		// manifest entry disagreeing with this is a contradiction in the
+		// predicate itself, not something to silently resolve one way or
+		// the other. ReasonCELImmutable deliberately takes the SAME path
+		// as ReasonRequiredByCELMap rather than ReasonReferenceResolution's
+		// silent-exclusion path above: unlike reference-resolution (which
+		// carries no CEL rule at all, so nothing is ever rejected by
+		// admission), a CEL-immutable leaf's `self == oldSelf` rule is a
+		// real, enforced admission rule — the single strongest one in this
+		// file, rejecting every mutation rather than only a null or
+		// empty-value patch — so a manifest that claims to have exercised
+		// its removal is either wrong about what happened, or evidence
+		// this predicate misclassified the leaf. Both are worth surfacing
+		// loudly rather than silently believing the manifest.
 		if covered {
 			return nil, fmt.Errorf(
 				"container leaf %q is classified BOTH ineligible (%s) and covered (%s) — "+

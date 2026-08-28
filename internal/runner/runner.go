@@ -84,6 +84,16 @@ type Runner struct {
 	// convergeArm falls back to the package constants.
 	podSettleThreshold time.Duration
 	podSettleTimeout   time.Duration
+
+	// burstCeiling, when > 0, overrides defaultEventBurstCeiling as the
+	// number of Update()-triggering field tests attempted before
+	// proactively restarting the controller to earn back a fresh
+	// event-spam-filter burst (see eventBurstCeiling and
+	// defaultEventBurstCeiling). Populated by NewRunner from
+	// UPDATE_TESTER_EVENT_BURST_CEILING; zero or negative means "use the
+	// default", read through the eventBurstCeiling accessor rather than
+	// this field directly.
+	burstCeiling int
 }
 
 // sleep waits d, calling sleepFunc instead of time.Sleep when a test has
@@ -104,10 +114,23 @@ func NewRunner(manifestPath string, timeout int) *Runner {
 	if kubectl == "" {
 		kubectl = "kubectl"
 	}
+	// A parse failure here is deliberately NOT an error: this knob is read
+	// deep inside a hook subprocess tree, and failing an E2E run over a
+	// typo in an env var costs more than silently running at the
+	// calibrated default. burstCeiling stays 0 ("use the default") for an
+	// unset, empty, unparseable, zero or negative value; the
+	// eventBurstCeiling accessor is what actually applies the fallback.
+	var burstCeiling int
+	if v := os.Getenv(eventBurstCeilingEnvVar); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			burstCeiling = parsed
+		}
+	}
 	return &Runner{
 		kubectl:      kubectl,
 		manifestPath: manifestPath,
 		timeout:      fmt.Sprintf("%ds", timeout),
+		burstCeiling: burstCeiling,
 	}
 }
 
@@ -799,14 +822,14 @@ func (r *Runner) slowObserveThreshold() time.Duration {
 	return interval / slowObserveDivisor
 }
 
-// eventBurstCeiling caps the number of Update()-triggering field tests this
-// runner attempts against a single controller process before proactively
-// restarting it. client-go's EventBroadcaster spam filter allows a burst of
-// ~25 identical events per involved object before silently DROPPING further
-// ones — not folding them into an existing aggregated Event's .count — so a
-// resource with more mutable fields than that burst produces false
-// NOT-EVIDENCED results once the burst is spent, even though the
-// controller's Update() path ran correctly every time (see
+// defaultEventBurstCeiling caps the number of Update()-triggering field
+// tests this runner attempts against a single controller process before
+// proactively restarting it. client-go's EventBroadcaster spam filter
+// allows a burst of ~25 identical events per involved object before
+// silently DROPPING further ones — not folding them into an existing
+// aggregated Event's .count — so a resource with more mutable fields than
+// that burst produces false NOT-EVIDENCED results once the burst is spent,
+// even though the controller's Update() path ran correctly every time (see
 // applyEvidenceCheck and countUpdateEvents). Restarting the controller
 // discards that in-memory state — a brand new process starts with a fresh
 // burst and, because client-go's event-aggregation cache is also in-memory
@@ -818,7 +841,31 @@ func (r *Runner) slowObserveThreshold() time.Duration {
 // documented ~25-token ceiling leaves room for a stray incidental event
 // (e.g. a transient CannotUpdateExternalResource) without crossing the hard
 // limit before the proactive reset fires.
-const eventBurstCeiling = 20
+//
+// A controlplane running a raised client-go burst has nothing to earn back
+// by restarting this often; eventBurstCeiling lets that be tuned per run
+// via eventBurstCeilingEnvVar rather than paying a restart every
+// defaultEventBurstCeiling fields regardless.
+const defaultEventBurstCeiling = 20
+
+// eventBurstCeilingEnvVar names the environment variable that overrides
+// defaultEventBurstCeiling — see NewRunner and the eventBurstCeiling
+// accessor.
+const eventBurstCeilingEnvVar = "UPDATE_TESTER_EVENT_BURST_CEILING"
+
+// eventBurstCeiling returns the effective burst ceiling for this Runner:
+// the value read from eventBurstCeilingEnvVar at construction time (see
+// NewRunner), falling back to defaultEventBurstCeiling for any
+// unset, unparseable, zero or negative value. Every call site that used to
+// reference the eventBurstCeiling constant directly now calls this
+// accessor instead, so a Runner built by a test helper (which leaves
+// burstCeiling at its zero value) behaves exactly as production does.
+func (r *Runner) eventBurstCeiling() int {
+	if r.burstCeiling > 0 {
+		return r.burstCeiling
+	}
+	return defaultEventBurstCeiling
+}
 
 // RunTests executes all update tests from the manifest and returns results,
 // plus every manifest-declared assert-unchanged field (see
@@ -904,7 +951,7 @@ func (r *Runner) RunTests(m *manifest.Manifest) ([]TestResult, []UnchangedAssert
 	if preExisting, preErr := r.countUpdateEvents(m.Kind, m.Name, m.Namespace, m.APIVersion); preErr == nil {
 		eventBaseline = preExisting
 		haveEventBaseline = true
-		if preExisting >= eventBurstCeiling {
+		if preExisting >= r.eventBurstCeiling() {
 			if err := r.resetEventBurst(); err != nil {
 				fmt.Fprintf(os.Stderr, "    warning: resetting controller event burst (pre-run, %d pre-existing events): %v\n", preExisting, err)
 				resetFailed = true
@@ -953,9 +1000,9 @@ func (r *Runner) RunTests(m *manifest.Manifest) ([]TestResult, []UnchangedAssert
 		// burst-avoidance benefit rather than the whole run. The run's
 		// reported verdict is degraded instead — see resetFailed and
 		// EvidenceUntrusted.
-		shouldReset := attemptsSinceReset >= eventBurstCeiling
+		shouldReset := attemptsSinceReset >= r.eventBurstCeiling()
 		current, curErr := r.countUpdateEvents(m.Kind, m.Name, m.Namespace, m.APIVersion)
-		if curErr == nil && haveEventBaseline && current-eventBaseline >= eventBurstCeiling {
+		if curErr == nil && haveEventBaseline && current-eventBaseline >= r.eventBurstCeiling() {
 			shouldReset = true
 		}
 		if shouldReset {

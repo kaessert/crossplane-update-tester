@@ -154,7 +154,7 @@ type fakeCluster struct {
 	// eventBudget caps how many events a single controller "process" (the
 	// stretch between restart() calls) accumulates before further
 	// increments are silently dropped — simulating client-go's in-process
-	// event-spam-filter burst ceiling (see eventBurstCeiling in runner.go).
+	// event-spam-filter burst ceiling (see defaultEventBurstCeiling in runner.go).
 	// 0 (the default) means unlimited, for tests that are not exercising
 	// the ceiling.
 	eventBudget int32
@@ -551,7 +551,7 @@ func (f *fakeCluster) handleGetEvents() (string, error) {
 // restart simulates a controller pod restart: it appends a fresh generation
 // so subsequent recordUpdateEvent increments accumulate against a new,
 // unthrottled budget rather than the exhausted one. Wired in as
-// Runner.restartFunc so RunTests's proactive burst-reset (eventBurstCeiling)
+// Runner.restartFunc so RunTests's proactive burst-reset (defaultEventBurstCeiling)
 // can be exercised without a live cluster.
 func (f *fakeCluster) restart() error {
 	f.restartCalls++
@@ -1806,7 +1806,7 @@ func manifestWithSequentialFieldTests(n int) *manifest.Manifest {
 // restarts the controller (earning back a fresh burst) before the ceiling is
 // reached rather than after events have already been silently dropped.
 func TestRunTestsResetsEventBurstBeforeCeiling(t *testing.T) {
-	const numFields = eventBurstCeiling + 5 // comfortably past one burst
+	const numFields = defaultEventBurstCeiling + 5 // comfortably past one burst
 	f := &fakeCluster{
 		forProvider:       map[string]interface{}{testFieldNotifyDelay: float64(0)},
 		atProvider:        map[string]interface{}{testFieldNotifyDelay: float64(0)},
@@ -1817,8 +1817,8 @@ func TestRunTestsResetsEventBurstBeforeCeiling(t *testing.T) {
 		// eventBudget mirrors the real client-go burst ceiling: once a
 		// generation's aggregated count reaches it, further same-generation
 		// increments are silently dropped, exactly as production
-		// eventBurstCeiling is calibrated to stay under.
-		eventBudget: eventBurstCeiling,
+		// defaultEventBurstCeiling is calibrated to stay under.
+		eventBudget: defaultEventBurstCeiling,
 	}
 	r := newFakeRunner(f)
 
@@ -1859,13 +1859,13 @@ func TestRunTestsResetsEventBurstBeforeCeiling(t *testing.T) {
 // patch actually produced. Measured live on ServicePolicyRule, several
 // attempts produced 3 events each (the aggregated count climbed
 // 12 → 15 → 18 → 21 → 24), so the real burst was already exhausted while
-// attemptsSinceReset was still only at 17 — short of eventBurstCeiling —
+// attemptsSinceReset was still only at 17 — short of defaultEventBurstCeiling —
 // and the mid-loop reset never fired for the fields run in between. Those
 // fields came back NOT-EVIDENCED with no EvidenceUntrusted flag: the false
 // failure was silent, not merely degraded.
 //
 // eventsPerPatch: 3 with only numFields: 10 reproduces the same shape at a
-// much smaller scale: three events per attempt crosses eventBurstCeiling
+// much smaller scale: three events per attempt crosses defaultEventBurstCeiling
 // (20) by the 8th field, while attemptsSinceReset (incrementing by 1 per
 // attempt) would not reach the ceiling until the 21st — so a run this
 // short can only pass if RunTests resets on the REAL measured count, not
@@ -1880,7 +1880,7 @@ func TestRunTestsMidLoopResetAccountsForMultiEventAttempts(t *testing.T) {
 		name:              testNameExample,
 		recordUpdateEvent: true,
 		eventsPerPatch:    3,
-		eventBudget:       eventBurstCeiling,
+		eventBudget:       defaultEventBurstCeiling,
 	}
 	r := newFakeRunner(f)
 
@@ -1902,7 +1902,7 @@ func TestRunTestsMidLoopResetAccountsForMultiEventAttempts(t *testing.T) {
 		}
 	}
 
-	// attemptsSinceReset alone never reaches eventBurstCeiling across only
+	// attemptsSinceReset alone never reaches defaultEventBurstCeiling across only
 	// 10 fields, so any restart recorded here is proof the trigger came
 	// from the real measured count, not the 1-per-attempt estimate.
 	if f.restartCalls == 0 {
@@ -1914,7 +1914,7 @@ func TestRunTestsMidLoopResetAccountsForMultiEventAttempts(t *testing.T) {
 // 6bb473df's regression: creation-time settling (late-init corrections, an
 // oneof default settling, a multi-round convergence from empty to a
 // complex desired state) can leave an object's event spam-filter burst
-// already at or past eventBurstCeiling before RunTests issues its own
+// already at or past defaultEventBurstCeiling before RunTests issues its own
 // first patch. Measured live: provider-f5xc's HttpLoadbalancer, freshly
 // created with six newly-populated slice fields, arrived at its first
 // field test with 32 pre-existing update events already recorded against
@@ -1926,7 +1926,7 @@ func TestRunTestsMidLoopResetAccountsForMultiEventAttempts(t *testing.T) {
 // instrumented reproduction showed the aggregated count frozen at exactly
 // its pre-existing value for the whole retry window, on every field.
 // RunTests must reset the burst BEFORE the first patch when the object
-// arrives already at the ceiling, not only after eventBurstCeiling patches
+// arrives already at the ceiling, not only after defaultEventBurstCeiling patches
 // accumulate within the run itself.
 func TestRunTestsEarnsBurstBeforeFirstFieldWhenAlreadyAtCeiling(t *testing.T) {
 	f := &fakeCluster{
@@ -1936,12 +1936,12 @@ func TestRunTestsEarnsBurstBeforeFirstFieldWhenAlreadyAtCeiling(t *testing.T) {
 		kind:              testKindExample,
 		name:              testNameExample,
 		recordUpdateEvent: true,
-		eventBudget:       eventBurstCeiling,
+		eventBudget:       defaultEventBurstCeiling,
 		// generations pre-seeded AT the ceiling — simulating settling that
 		// happened entirely before RunTests was ever called. This mirrors
 		// what was measured live: the very first eventsBefore read already
-		// returns eventBurstCeiling, not a low number climbing from 0.
-		generations: []int32{eventBurstCeiling},
+		// returns defaultEventBurstCeiling, not a low number climbing from 0.
+		generations: []int32{defaultEventBurstCeiling},
 	}
 	r := newFakeRunner(f)
 
@@ -1978,9 +1978,9 @@ func TestRunTestsSkipsPreRunResetWhenBelowCeiling(t *testing.T) {
 		kind:              testKindExample,
 		name:              testNameExample,
 		recordUpdateEvent: true,
-		eventBudget:       eventBurstCeiling,
+		eventBudget:       defaultEventBurstCeiling,
 		// One short of the ceiling — must NOT trigger the pre-run reset.
-		generations: []int32{eventBurstCeiling - 1},
+		generations: []int32{defaultEventBurstCeiling - 1},
 	}
 	r := newFakeRunner(f)
 
@@ -1996,7 +1996,172 @@ func TestRunTestsSkipsPreRunResetWhenBelowCeiling(t *testing.T) {
 		t.Errorf("field 0 (%s): got NotEvidenced=true, want evidenced (err: %v)", results[0].Field, results[0].Error)
 	}
 	if f.restartCalls != 0 {
-		t.Errorf("expected no restart when pre-existing events (%d) are below the ceiling (%d), got %d restart(s)", eventBurstCeiling-1, eventBurstCeiling, f.restartCalls)
+		t.Errorf("expected no restart when pre-existing events (%d) are below the ceiling (%d), got %d restart(s)", defaultEventBurstCeiling-1, defaultEventBurstCeiling, f.restartCalls)
+	}
+}
+
+// TestRunTestsRaisedCeilingPerformsZeroRestarts is the configurable-ceiling
+// counterpart to TestRunTestsResetsEventBurstBeforeCeiling: a controlplane
+// running a raised client-go event-spam-filter burst has nothing to earn
+// back, so a Runner whose burstCeiling is raised to match must not pay a
+// single restart across a run that would have crossed
+// defaultEventBurstCeiling several times over. The fake cluster's own
+// eventBudget is raised in step, standing in for the raised client-go
+// burst itself — this test is about the RUNNER'S restart decision, not
+// about re-proving the fake's budget-drop simulation.
+func TestRunTestsRaisedCeilingPerformsZeroRestarts(t *testing.T) {
+	const numFields = defaultEventBurstCeiling*2 + 5 // comfortably past several default-sized bursts
+	const raisedCeiling = numFields + 10             // above every field count this run will reach
+
+	f := &fakeCluster{
+		forProvider:       map[string]interface{}{testFieldNotifyDelay: float64(0)},
+		atProvider:        map[string]interface{}{testFieldNotifyDelay: float64(0)},
+		generation:        1,
+		kind:              testKindExample,
+		name:              testNameExample,
+		recordUpdateEvent: true,
+		eventBudget:       raisedCeiling,
+	}
+	r := newFakeRunner(f)
+	r.burstCeiling = raisedCeiling
+
+	m := manifestWithSequentialFieldTests(numFields)
+	results, _, err := r.RunTests(m)
+	if err != nil {
+		t.Fatalf("RunTests: unexpected error: %v", err)
+	}
+	if len(results) != numFields {
+		t.Fatalf("got %d results, want %d", len(results), numFields)
+	}
+
+	for i, res := range results {
+		if res.NotEvidenced {
+			t.Errorf("field %d (%s): got NotEvidenced=true, want evidenced (err: %v)", i, res.Field, res.Error)
+		}
+		if res.EvidenceUntrusted {
+			t.Errorf("field %d (%s): got EvidenceUntrusted=true, want false", i, res.Field)
+		}
+		if !res.Passed {
+			t.Errorf("field %d (%s): got Passed=false, want true (err: %v)", i, res.Field, res.Error)
+		}
+	}
+
+	if f.restartCalls != 0 {
+		t.Errorf("expected zero restarts with the ceiling raised above the field count, got %d", f.restartCalls)
+	}
+}
+
+// TestNewRunnerEventBurstCeilingParsing pins the parsing contract for
+// UPDATE_TESTER_EVENT_BURST_CEILING: only a positive integer overrides
+// defaultEventBurstCeiling. Everything else — unset, empty, "0", a
+// negative value, a non-numeric value, or a float — falls back to the
+// default rather than failing NewRunner, because this knob is read deep
+// inside a hook subprocess tree where a typo must never abort a run.
+func TestNewRunnerEventBurstCeilingParsing(t *testing.T) {
+	cases := map[string]struct {
+		reason string
+		setEnv bool
+		value  string
+		want   int
+	}{
+		"unset": {
+			reason: "no override declared: the default applies",
+			setEnv: false,
+		},
+		"empty": {
+			reason: "an explicitly empty value is the same as unset",
+			setEnv: true,
+			value:  "",
+		},
+		"zero": {
+			reason: "0 is not a usable ceiling: falls back to the default",
+			setEnv: true,
+			value:  "0",
+		},
+		"negative": {
+			reason: "a negative ceiling is nonsensical: falls back to the default",
+			setEnv: true,
+			value:  "-5",
+		},
+		"non-numeric": {
+			reason: "a typo must not abort the run: falls back to the default",
+			setEnv: true,
+			value:  "abc",
+		},
+		"float": {
+			reason: "strconv.Atoi rejects a float: falls back to the default",
+			setEnv: true,
+			value:  "3.5",
+		},
+		"positive integer": {
+			reason: "a valid positive override is honoured verbatim",
+			setEnv: true,
+			value:  "50",
+			want:   50,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if tc.setEnv {
+				t.Setenv(eventBurstCeilingEnvVar, tc.value)
+			} else {
+				if orig, ok := os.LookupEnv(eventBurstCeilingEnvVar); ok {
+					os.Unsetenv(eventBurstCeilingEnvVar) //nolint:errcheck // best-effort test isolation
+					t.Cleanup(func() { os.Setenv(eventBurstCeilingEnvVar, orig) })
+				}
+			}
+
+			r := NewRunner("/dev/null", 30)
+
+			// The contract that matters is the EFFECTIVE ceiling — what
+			// eventBurstCeiling() returns — not how NewRunner happens to
+			// store the raw parsed value. strconv.Atoi("-5") parses
+			// cleanly, so the negative case still reaches the accessor's
+			// own <= 0 fallback rather than NewRunner's.
+			gotEffective := r.eventBurstCeiling()
+			wantEffective := tc.want
+			if wantEffective <= 0 {
+				wantEffective = defaultEventBurstCeiling
+			}
+			if gotEffective != wantEffective {
+				t.Errorf("%s: eventBurstCeiling() = %d, want %d", tc.reason, gotEffective, wantEffective)
+			}
+		})
+	}
+}
+
+// TestRunnerEventBurstCeilingAccessorFallback pins the accessor's own
+// fallback independent of NewRunner's parsing, so a Runner built by a test
+// helper (which sets burstCeiling directly, bypassing NewRunner entirely)
+// behaves exactly as production does for a zero or negative field value.
+func TestRunnerEventBurstCeilingAccessorFallback(t *testing.T) {
+	cases := map[string]struct {
+		reason       string
+		burstCeiling int
+		want         int
+	}{
+		"zero value falls back to the default": {
+			burstCeiling: 0,
+			want:         defaultEventBurstCeiling,
+		},
+		"negative value falls back to the default": {
+			burstCeiling: -1,
+			want:         defaultEventBurstCeiling,
+		},
+		"positive value is honoured": {
+			burstCeiling: 42,
+			want:         42,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			r := &Runner{burstCeiling: tc.burstCeiling}
+			if got := r.eventBurstCeiling(); got != tc.want {
+				t.Errorf("%s: eventBurstCeiling() = %d, want %d", tc.reason, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -2007,7 +2172,7 @@ func TestRunTestsSkipsPreRunResetWhenBelowCeiling(t *testing.T) {
 // for resetEventBurst to rescue) must still fail with NotEvidenced, restart
 // or no restart.
 func TestRunTestsWithoutRestartWiringStillDetectsGenuineNonEvidence(t *testing.T) {
-	const numFields = eventBurstCeiling + 3
+	const numFields = defaultEventBurstCeiling + 3
 	f := &fakeCluster{
 		forProvider: map[string]interface{}{testFieldNotifyDelay: float64(0)},
 		atProvider:  map[string]interface{}{testFieldNotifyDelay: float64(0)},
@@ -2171,9 +2336,9 @@ func TestRunTestsAssertUnchangedReportsDriftOnceAcrossMultipleFieldTests(t *test
 
 // TestRunTestsBelowCeilingNeverRestarts confirms the proactive reset is
 // scoped to the burst ceiling: a run whose non-skipped, non-no-op field
-// count never reaches eventBurstCeiling must never pay the restart cost.
+// count never reaches defaultEventBurstCeiling must never pay the restart cost.
 func TestRunTestsBelowCeilingNeverRestarts(t *testing.T) {
-	const numFields = eventBurstCeiling - 1
+	const numFields = defaultEventBurstCeiling - 1
 	f := &fakeCluster{
 		forProvider:       map[string]interface{}{testFieldNotifyDelay: float64(0)},
 		atProvider:        map[string]interface{}{testFieldNotifyDelay: float64(0)},
@@ -2205,7 +2370,7 @@ func TestRunTestsBelowCeilingNeverRestarts(t *testing.T) {
 // ever printing as a clean verdict once a reset has failed mid-run — the
 // caller rendering the summary must fail any run containing one.
 func TestRunTestsRestartFailureDoesNotAbortRun(t *testing.T) {
-	const numFields = eventBurstCeiling + 2
+	const numFields = defaultEventBurstCeiling + 2
 	f := &fakeCluster{
 		forProvider:       map[string]interface{}{testFieldNotifyDelay: float64(0)},
 		atProvider:        map[string]interface{}{testFieldNotifyDelay: float64(0)},
@@ -2213,7 +2378,7 @@ func TestRunTestsRestartFailureDoesNotAbortRun(t *testing.T) {
 		kind:              testKindExample,
 		name:              testNameExample,
 		recordUpdateEvent: true,
-		eventBudget:       eventBurstCeiling,
+		eventBudget:       defaultEventBurstCeiling,
 	}
 	r := newFakeRunner(f)
 	r.restartFunc = func() error {
@@ -2230,11 +2395,11 @@ func TestRunTestsRestartFailureDoesNotAbortRun(t *testing.T) {
 	}
 
 	// The proactive reset attempt fires immediately before the field at
-	// index eventBurstCeiling (the (eventBurstCeiling+1)th field). Every
+	// index defaultEventBurstCeiling (the (defaultEventBurstCeiling+1)th field). Every
 	// field before that index ran while the burst was still trusted; every
 	// field from that index onward ran after the failed reset.
 	for i, res := range results {
-		wantUntrusted := i >= eventBurstCeiling
+		wantUntrusted := i >= defaultEventBurstCeiling
 		if res.EvidenceUntrusted != wantUntrusted {
 			t.Errorf("field %d (%s): got EvidenceUntrusted=%v, want %v", i, res.Field, res.EvidenceUntrusted, wantUntrusted)
 		}
@@ -2246,7 +2411,7 @@ func TestRunTestsRestartFailureDoesNotAbortRun(t *testing.T) {
 			untrusted++
 		}
 	}
-	wantUntrustedCount := numFields - eventBurstCeiling
+	wantUntrustedCount := numFields - defaultEventBurstCeiling
 	if untrusted != wantUntrustedCount {
 		t.Errorf("got %d EvidenceUntrusted results, want %d", untrusted, wantUntrustedCount)
 	}
@@ -2263,7 +2428,7 @@ func TestRunTestsRestartFailureDoesNotAbortRun(t *testing.T) {
 func TestRunTestsAmbiguousProviderDeploymentDegradesToUntrusted(t *testing.T) {
 	t.Setenv(providerDeploymentEnvVar, "")
 
-	const numFields = eventBurstCeiling + 2
+	const numFields = defaultEventBurstCeiling + 2
 	f := &fakeCluster{
 		forProvider:       map[string]interface{}{testFieldNotifyDelay: float64(0)},
 		atProvider:        map[string]interface{}{testFieldNotifyDelay: float64(0)},
@@ -2271,7 +2436,7 @@ func TestRunTestsAmbiguousProviderDeploymentDegradesToUntrusted(t *testing.T) {
 		kind:              testKindExample,
 		name:              testNameExample,
 		recordUpdateEvent: true,
-		eventBudget:       eventBurstCeiling,
+		eventBudget:       defaultEventBurstCeiling,
 		providerPods:      []string{testProviderDeployment, testOtherProviderDeployment},
 	}
 	r := newFakeRunner(f)
@@ -2289,7 +2454,7 @@ func TestRunTestsAmbiguousProviderDeploymentDegradesToUntrusted(t *testing.T) {
 	}
 
 	for i, res := range results {
-		wantUntrusted := i >= eventBurstCeiling
+		wantUntrusted := i >= defaultEventBurstCeiling
 		if res.EvidenceUntrusted != wantUntrusted {
 			t.Errorf("field %d (%s): got EvidenceUntrusted=%v, want %v", i, res.Field, res.EvidenceUntrusted, wantUntrusted)
 		}

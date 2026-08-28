@@ -717,7 +717,19 @@ decision:
     from the CRD's schema on every run (never a hardcoded list, per-leaf
     annotation, or per-provider config), so a schema change that removes
     the shape or the rule puts the leaf back into the denominator
-    automatically. Two reasons, and only two:
+    automatically. Three reasons, and only three:
+    - a CEL-immutable field — the leaf's own schema node, or an ancestor
+      object node enclosing it, carries an `x-kubernetes-validations`
+      rule requiring `self == oldSelf` (including the "immutable once
+      set" spelling, `size(oldSelf) == 0 || self == oldSelf`). That is a
+      strictly stronger block than the CEL-required reason below: it
+      rejects EVERY mutation of the field rather than one specific patch
+      shape, so nulling, emptying and setting any other value are all
+      rejected identically and no clear-direction test can ever reach the
+      backend. Derived from the CRD schema alone — the same
+      ancestor-inheriting walk the `immutable` exclusion in the must-test
+      denominator already uses — and never from the field's name or any
+      `skip:` waiver;
     - a crossplane reference-resolution field — a cross-resource
       `*Selector`'s free-form `matchLabels` map, or a `*Refs` list of
       reference items — resolved entirely by the platform before a
@@ -752,8 +764,9 @@ decision:
     qualify.
   - **uncovered** — neither of the above; a gap this manifest could close.
 
-  A leaf is never reported as both ineligible and covered for the
-  CEL-required reason (map, or a list whose empty-clear route is also
+  A leaf is never reported as both ineligible and covered for either of
+  the CEL-derived reasons — CEL-immutable, or CEL-required (map, or a
+  list whose empty-clear route is also
   closed) — that combination means an existing manifest entry disagrees
   with the ineligibility predicate, and the report surfaces that
   disagreement explicitly (`containerClearError`) rather than silently

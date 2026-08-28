@@ -119,6 +119,17 @@ type ContainerClearFinding struct {
 	// false.
 	Reason IneligibilityReason
 	Detail string
+	// Disposition is the evidence-tier disposition (manifest.Disposition)
+	// declared on the skip: entry, if any, that directly names this leaf's
+	// own field path — populated ONLY for an uncovered, eligible leaf
+	// (Covered false, Ineligible false); a covered or ineligible leaf
+	// carries no disposition report at all, since neither is a gap this
+	// axis tracks. Empty means no disposition was authored — whether
+	// because no entry names this leaf, the entry names it with no skip:
+	// at all, or its skip: predates the disposition axis. Never guessed
+	// from Reason or Evidence prose: absent is reported as absent, not
+	// defaulted to a tier.
+	Disposition manifest.Disposition
 }
 
 // ContainerClearCoverage checks every declared container-typed leaf under
@@ -218,7 +229,11 @@ func ContainerClearCoverage(crd map[string]interface{}, m *manifest.Manifest) ([
 
 		reason, isIneligible := ineligible[leaf.Path]
 		if !isIneligible {
-			findings = append(findings, ContainerClearFinding{Path: leaf.Path, Shape: leaf.Shape, Covered: covered, Detail: detail})
+			finding := ContainerClearFinding{Path: leaf.Path, Shape: leaf.Shape, Covered: covered, Detail: detail}
+			if !covered {
+				finding.Disposition = dispositionFor(leaf, selfByField)
+			}
+			findings = append(findings, finding)
 			continue
 		}
 
@@ -291,6 +306,21 @@ func coverageFor(leaf ContainerLeaf, clearedSiblings, withValuesEmptyList, perKe
 	default:
 		return false, "no clear:, whole-field tombstone, whole-subtree tombstone, per-key removal, or self-tombstone exercises this container leaf's removal direction"
 	}
+}
+
+// dispositionFor reports the evidence-tier disposition, if any, declared on
+// the skip: entry that directly names leaf's own field path — called only
+// for a leaf ContainerClearCoverage has already determined is uncovered and
+// eligible (see ContainerClearFinding.Disposition's own doc comment for
+// why). Returns the empty Disposition, never a guess, when no entry names
+// this leaf, the entry carries no skip: at all, or the skip: it carries
+// authored no disposition: key.
+func dispositionFor(leaf ContainerLeaf, selfByField map[string]manifest.UpdateTest) manifest.Disposition {
+	self, hasSelf := selfByField[leaf.Path]
+	if !hasSelf || !self.Skip.Present() {
+		return ""
+	}
+	return self.Skip.Disposition
 }
 
 // clearedAncestor reports whether some strict ancestor of the dotted path

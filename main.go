@@ -1283,13 +1283,19 @@ type cellCreditJSON struct {
 // Ineligible/Reason surface the third state (see
 // roundtrip.ContainerClearFinding's own doc comment): Covered is always
 // false when Ineligible is true, and Reason is empty otherwise.
+// Disposition is also report-only and empty whenever Covered is true,
+// Ineligible is true, or no disposition: was authored on the leaf's own
+// skip: entry — omitempty means a report from a manifest with zero
+// authored dispositions (every manifest in the fleet today) renders
+// byte-identical to before this field existed.
 type containerClearJSON struct {
-	Path       string `json:"path"`
-	Shape      string `json:"shape"`
-	Covered    bool   `json:"covered"`
-	Ineligible bool   `json:"ineligible,omitempty"`
-	Reason     string `json:"reason,omitempty"`
-	Detail     string `json:"detail"`
+	Path        string `json:"path"`
+	Shape       string `json:"shape"`
+	Covered     bool   `json:"covered"`
+	Ineligible  bool   `json:"ineligible,omitempty"`
+	Reason      string `json:"reason,omitempty"`
+	Detail      string `json:"detail"`
+	Disposition string `json:"disposition,omitempty"`
 }
 
 // waiverFindingJSON is the machine-readable shape one
@@ -1324,6 +1330,7 @@ func toContainerClearJSON(findings []roundtrip.ContainerClearFinding) []containe
 		out[i] = containerClearJSON{
 			Path: f.Path, Shape: string(f.Shape), Covered: f.Covered,
 			Ineligible: f.Ineligible, Reason: string(f.Reason), Detail: f.Detail,
+			Disposition: string(f.Disposition),
 		}
 	}
 	return out

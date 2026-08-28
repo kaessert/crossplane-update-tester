@@ -275,6 +275,215 @@ func TestContainerClearCoverageOmittedKeyIsNotRemoval(t *testing.T) {
 	}
 }
 
+// dispositionFixtureCRD extends containerClearFixtureCRD's shapes with one
+// CEL-immutable leaf (immutableTags), so a disposition test can confirm an
+// INELIGIBLE leaf never carries a disposition report even when its own
+// skip: entry declares one — Disposition is defined only for the
+// uncovered/eligible state (see ContainerClearFinding.Disposition's own
+// doc comment).
+const dispositionFixtureCRD = `apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+spec:
+  group: widgets.crossplane.io
+  names:
+    kind: Widget
+    plural: widgets
+  versions:
+  - name: v1alpha1
+    served: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            properties:
+              forProvider:
+                type: object
+                properties:
+                  name:
+                    type: string
+                  tags:
+                    type: array
+                    items:
+                      type: string
+                  labels:
+                    type: object
+                    additionalProperties:
+                      type: string
+                  immutableTags:
+                    type: array
+                    items:
+                      type: string
+                    x-kubernetes-validations:
+                    - message: immutableTags is immutable
+                      rule: "self == oldSelf"
+          status:
+            type: object
+            properties:
+              atProvider:
+                type: object
+                properties:
+                  name:
+                    type: string
+`
+
+// TestContainerClearCoverageReportsDispositionOnUncoveredLeaf confirms an
+// uncovered, eligible leaf whose own skip: entry declares a disposition:
+// carries that exact value in the finding — the report-only surface this
+// ticket adds.
+func TestContainerClearCoverageReportsDispositionOnUncoveredLeaf(t *testing.T) {
+	crd := decodeCRD(t, containerClearFixtureCRD)
+	m := &manifest.Manifest{
+		Tests: []manifest.UpdateTest{
+			{
+				Field: "tags",
+				Skip: manifest.SkipInfo{
+					Reason:      manifest.SkipVendorDefect,
+					Evidence:    "observed a 400",
+					Ticket:      "FX-DNS-DELEGATION",
+					Disposition: manifest.DispositionOneLivePatch,
+				},
+			},
+		},
+	}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+
+	byPath := findingsByPath(findings)
+	tags := byPath["tags"]
+	if tags.Covered {
+		t.Fatalf("tags reported covered — this test needs it uncovered to exercise the disposition report: %+v", tags)
+	}
+	if tags.Disposition != manifest.DispositionOneLivePatch {
+		t.Errorf("tags.Disposition = %q, want %q", tags.Disposition, manifest.DispositionOneLivePatch)
+	}
+}
+
+// TestContainerClearCoverageUncoveredLeafWithNoDispositionReportsEmpty
+// confirms an uncovered leaf whose skip: entry authors NO disposition: key
+// reports an EMPTY Disposition — not defaulted to any of the four tiers.
+func TestContainerClearCoverageUncoveredLeafWithNoDispositionReportsEmpty(t *testing.T) {
+	crd := decodeCRD(t, containerClearFixtureCRD)
+	m := &manifest.Manifest{
+		Tests: []manifest.UpdateTest{
+			{Field: "tags", Skip: manifest.SkipInfo{Reason: manifest.SkipWriteOnly}},
+		},
+	}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+
+	byPath := findingsByPath(findings)
+	if got := byPath["tags"].Disposition; got != "" {
+		t.Errorf("tags.Disposition = %q, want empty — no disposition: key was authored, so none may be reported", got)
+	}
+}
+
+// TestContainerClearCoverageUncoveredLeafWithNoEntryReportsEmptyDisposition
+// confirms a leaf named by NO entry at all (the ordinary "nobody has
+// touched this field yet" state) reports an empty Disposition rather than
+// erroring or guessing one.
+func TestContainerClearCoverageUncoveredLeafWithNoEntryReportsEmptyDisposition(t *testing.T) {
+	crd := decodeCRD(t, containerClearFixtureCRD)
+	m := &manifest.Manifest{Tests: nil}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+
+	byPath := findingsByPath(findings)
+	if got := byPath["tags"].Disposition; got != "" {
+		t.Errorf("tags.Disposition = %q, want empty — no entry at all names this leaf", got)
+	}
+	if got := byPath["labels"].Disposition; got != "" {
+		t.Errorf("labels.Disposition = %q, want empty — no entry at all names this leaf", got)
+	}
+}
+
+// TestContainerClearCoverageCoveredLeafNeverReportsDisposition confirms a
+// leaf that IS covered — even one whose own entry carries a skip: with a
+// disposition: authored on it — reports an empty Disposition. Covered is
+// not a gap this axis tracks, and the ticket restricts the report to
+// uncovered leaves only.
+func TestContainerClearCoverageCoveredLeafNeverReportsDisposition(t *testing.T) {
+	crd := decodeCRD(t, containerClearFixtureCRD)
+	m := &manifest.Manifest{
+		Tests: []manifest.UpdateTest{
+			// "name" clears "tags" as a sibling, covering it via the
+			// whole-field tombstone route.
+			{Field: "name", Value: "new-name", Clear: []string{"tags"}},
+			// tags ALSO carries its own skip: with a disposition — an
+			// unusual but valid combination this test uses specifically to
+			// prove Covered wins and no disposition is ever surfaced for
+			// it.
+			{
+				Field: "tags",
+				Skip: manifest.SkipInfo{
+					Reason:      manifest.SkipWriteOnly,
+					Disposition: manifest.DispositionStaticallyProvable,
+				},
+			},
+		},
+	}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+
+	byPath := findingsByPath(findings)
+	tags := byPath["tags"]
+	if !tags.Covered {
+		t.Fatalf("tags not covered by clear:, findings = %+v", findings)
+	}
+	if tags.Disposition != "" {
+		t.Errorf("tags.Disposition = %q, want empty — a covered leaf never reports a disposition", tags.Disposition)
+	}
+}
+
+// TestContainerClearCoverageIneligibleLeafNeverReportsDisposition confirms
+// an INELIGIBLE leaf (CEL-immutable: its removal direction can never be
+// exercised at all) reports an empty Disposition even when its own skip:
+// entry declares one — Ineligible and Disposition are mutually exclusive
+// report axes, and this pins that Ineligible wins.
+func TestContainerClearCoverageIneligibleLeafNeverReportsDisposition(t *testing.T) {
+	crd := decodeCRD(t, dispositionFixtureCRD)
+	m := &manifest.Manifest{
+		Tests: []manifest.UpdateTest{
+			{
+				Field: "immutableTags",
+				Skip: manifest.SkipInfo{
+					Reason:      manifest.SkipWriteOnly,
+					Disposition: manifest.DispositionDeclaredExclusion,
+					DeclaredBy:  "a human",
+					Reconfirm:   "2027-01-01",
+				},
+			},
+		},
+	}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+
+	byPath := findingsByPath(findings)
+	immutableTags := byPath["immutableTags"]
+	if !immutableTags.Ineligible {
+		t.Fatalf("immutableTags not reported Ineligible, findings = %+v", findings)
+	}
+	if immutableTags.Disposition != "" {
+		t.Errorf("immutableTags.Disposition = %q, want empty — an ineligible leaf never reports a disposition", immutableTags.Disposition)
+	}
+}
+
 // TestContainerClearCoverageZeroCoverageStillProducesFindingsNoError is the
 // pin the ticket requires: a manifest with NO clear-direction coverage at
 // all — the measured state of six of the fleet's seven providers — still

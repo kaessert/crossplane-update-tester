@@ -1227,6 +1227,174 @@ func TestParseAnnotationStructuredSkipAccepted(t *testing.T) {
 	}
 }
 
+// TestParseAnnotationDispositionRoundTrips pins each of the four
+// disposition: values round-tripping through parse, alongside a reason:
+// that itself needs no companion keys (write-only) so the case exercises
+// only the disposition axis. declared-exclusion additionally carries the
+// declared-by: and reconfirm: keys it requires.
+func TestParseAnnotationDispositionRoundTrips(t *testing.T) {
+	cases := map[string]struct {
+		reason     string
+		annotation string
+		want       SkipInfo
+	}{
+		"StaticallyProvable": {
+			reason: "statically-provable round-trips with no companion keys of its own",
+			annotation: `
+- field: privateKey
+  skip:
+    reason: write-only
+    disposition: statically-provable
+`,
+			want: SkipInfo{Reason: SkipWriteOnly, Disposition: DispositionStaticallyProvable},
+		},
+		"OneLivePatch": {
+			reason: "one-live-patch round-trips with no companion keys of its own",
+			annotation: `
+- field: privateKey
+  skip:
+    reason: write-only
+    disposition: one-live-patch
+`,
+			want: SkipInfo{Reason: SkipWriteOnly, Disposition: DispositionOneLivePatch},
+		},
+		"DeclaredExclusion": {
+			reason: "declared-exclusion carries both declared-by: and reconfirm:",
+			annotation: `
+- field: privateKey
+  skip:
+    reason: write-only
+    disposition: declared-exclusion
+    declared-by: a human
+    reconfirm: 2027-01-01
+`,
+			want: SkipInfo{
+				Reason:      SkipWriteOnly,
+				Disposition: DispositionDeclaredExclusion,
+				DeclaredBy:  "a human",
+				Reconfirm:   "2027-01-01",
+			},
+		},
+		"Defect": {
+			reason: "defect round-trips with no companion keys of its own",
+			annotation: `
+- field: privateKey
+  skip:
+    reason: write-only
+    disposition: defect
+`,
+			want: SkipInfo{Reason: SkipWriteOnly, Disposition: DispositionDefect},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			tests, _, _, _, err := ParseAnnotation(tc.annotation)
+			if err != nil {
+				t.Fatalf("%s: ParseAnnotation() error = %v", tc.reason, err)
+			}
+			if len(tests) != 1 {
+				t.Fatalf("%s: got %d entries, want 1", tc.reason, len(tests))
+			}
+			if got := tests[0].Skip; got != tc.want {
+				t.Errorf("%s: Skip = %+v, want %+v", tc.reason, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseAnnotationDispositionRejectsInvalidShapes pins the disposition
+// axis's own parse-time rejections: an unrecognised disposition value named
+// in its own error text, and declared-exclusion's two required companion
+// keys each rejected individually when absent.
+func TestParseAnnotationDispositionRejectsInvalidShapes(t *testing.T) {
+	cases := map[string]struct {
+		reason        string
+		annotation    string
+		wantErrSubstr string
+	}{
+		"UnknownDisposition": {
+			reason: "a disposition outside the closed set is rejected NAMING THE OFFENDING VALUE — a dropped value would read as no disposition at all, indistinguishable from an unauthored leaf",
+			annotation: `
+- field: privateKey
+  skip:
+    reason: write-only
+    disposition: not-a-real-disposition
+`,
+			wantErrSubstr: `disposition "not-a-real-disposition" is not one of the valid dispositions`,
+		},
+		"DeclaredExclusionMissingDeclaredBy": {
+			reason: "declared-exclusion requires a non-empty declared-by:",
+			annotation: `
+- field: privateKey
+  skip:
+    reason: write-only
+    disposition: declared-exclusion
+    reconfirm: 2027-01-01
+`,
+			wantErrSubstr: "requires both declared-by: and reconfirm:",
+		},
+		"DeclaredExclusionMissingReconfirm": {
+			reason: "declared-exclusion requires a non-empty reconfirm:",
+			annotation: `
+- field: privateKey
+  skip:
+    reason: write-only
+    disposition: declared-exclusion
+    declared-by: a human
+`,
+			wantErrSubstr: "requires both declared-by: and reconfirm:",
+		},
+		"DeclaredExclusionMissingBoth": {
+			reason: "declared-exclusion requires both declared-by: and reconfirm: when neither is given",
+			annotation: `
+- field: privateKey
+  skip:
+    reason: write-only
+    disposition: declared-exclusion
+`,
+			wantErrSubstr: "requires both declared-by: and reconfirm:",
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, _, _, _, err := ParseAnnotation(tc.annotation)
+			if err == nil {
+				t.Fatalf("%s: expected an error, got nil", tc.reason)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrSubstr) {
+				t.Errorf("%s: error = %q, want substring %q", tc.reason, err.Error(), tc.wantErrSubstr)
+			}
+		})
+	}
+}
+
+// TestParseAnnotationDispositionNeverInferredFromReason confirms a skip:
+// entry with a rich, tier-suggestive reason: (vendor-defect, in a shape
+// that reads like a one-live-patch claim) parses with an EMPTY Disposition
+// when no disposition: key is authored — pinning that nothing in this
+// package pattern-matches reason: or evidence: prose to assign a tier. A
+// disposition is authored, or it is absent; it is never guessed.
+func TestParseAnnotationDispositionNeverInferredFromReason(t *testing.T) {
+	tests, _, _, _, err := ParseAnnotation(`
+- field: displayName
+  skip:
+    reason: vendor-defect
+    evidence: "HTTP 409, permanently reserved regardless of response code"
+    ticket: IAM-DISPLAYNAME
+`)
+	if err != nil {
+		t.Fatalf("ParseAnnotation() error = %v", err)
+	}
+	if len(tests) != 1 {
+		t.Fatalf("got %d entries, want 1", len(tests))
+	}
+	if got := tests[0].Skip.Disposition; got != "" {
+		t.Errorf("Skip.Disposition = %q, want empty — a disposition is authored via disposition:, never inferred from reason/evidence prose", got)
+	}
+}
+
 // TestParseAnnotationStructuredSkipRejectsInvalidShapes pins every
 // parse-time rejection a structured skip: entry can trigger: an unknown
 // reason, the "immutable" reason specifically, and each reason's own

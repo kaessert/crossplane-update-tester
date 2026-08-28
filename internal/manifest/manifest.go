@@ -251,6 +251,68 @@ func validSkipReasonList() string {
 	return strings.Join(out, ", ")
 }
 
+// Disposition is the closed set of evidence-tier dispositions a structured
+// "skip:" entry may declare alongside its Reason, via the optional
+// "disposition:" key — see SkipInfo. It answers a different question than
+// Reason does: Reason names WHY no test exists for the field; Disposition
+// names HOW that reason could be — or already has been — checked, so a
+// tool can tell a claim that is re-checkable by machine from one that is
+// only a human's word.
+//
+// The four values are the evidence tiers a fleet-wide reading of every
+// "skip:" waiver's own claim shape converged on. Deliberately closed, like
+// SkipReason: an open-ended free-text disposition could not be told apart
+// from a guess, which is exactly the failure this axis exists to end.
+type Disposition string
+
+const (
+	// DispositionStaticallyProvable marks a reason decidable from the repo
+	// alone — a CRD schema validation rule on the field's own declaration, a
+	// structural fact of the resource's own controller source (a field a
+	// request or response type never carries), or the example manifest's
+	// own data — with no cluster and no live call, re-checkable by a tool
+	// on every run for as long as the cited artifact exists.
+	DispositionStaticallyProvable Disposition = "statically-provable"
+	// DispositionOneLivePatch marks a reason that is a claim about backend
+	// runtime behaviour — a status code, or whether a value takes live
+	// effect — not decidable from the repo alone, but resolvable by firing
+	// ONE request that has no lasting consequence: a rejection leaves state
+	// unchanged, and an acceptance is undoable by a further,
+	// similarly-priced request. This includes a claim whose evidence was
+	// already gathered and is recorded in the reason's own prose — the
+	// disposition records the CLASS of evidence the claim rests on, not
+	// whether it happens to be already paid for.
+	DispositionOneLivePatch Disposition = "one-live-patch"
+	// DispositionDeclaredExclusion marks a reason where firing the
+	// one-live-patch-shaped probe is ITSELF the irreversible or destructive
+	// act, or damages state shared with other runs, so no mechanical check
+	// can ever confirm it. It is the only disposition that encodes a
+	// standing human commitment rather than a re-checkable claim, and it
+	// requires DeclaredBy and Reconfirm for exactly that reason — see
+	// validateSkipInfo.
+	DispositionDeclaredExclusion Disposition = "declared-exclusion"
+	// DispositionDefect marks a reason the repo's own artifacts contradict,
+	// or that names nothing checkable at all. Recording it is a defect
+	// finding, not a legitimate skip.
+	DispositionDefect Disposition = "defect"
+)
+
+// dispositions is the closed set of valid Disposition values, in the order
+// they are listed in a parse-time "not a valid disposition" error.
+var dispositions = []Disposition{
+	DispositionStaticallyProvable, DispositionOneLivePatch, DispositionDeclaredExclusion, DispositionDefect,
+}
+
+// validDispositionList renders dispositions as a comma-separated string for
+// a parse-time error message.
+func validDispositionList() string {
+	out := make([]string, len(dispositions))
+	for i, d := range dispositions {
+		out[i] = string(d)
+	}
+	return strings.Join(out, ", ")
+}
+
 // SkipInfo is a field's "skip:" declaration — the zero value means no
 // skip: key was present at all (see Present).
 //
@@ -281,6 +343,21 @@ type SkipInfo struct {
 	// Ticket names the ticket tracking why this field cannot be tested
 	// yet. Set when Reason is SkipVendorDefect or SkipFixtureMissing.
 	Ticket string
+	// Disposition is the optional evidence-tier disposition declared
+	// alongside Reason — see Disposition. Empty when no disposition: key
+	// was authored; an absent disposition is reported as absent, never
+	// guessed from Reason or Evidence — see ContainerClearFinding.
+	Disposition Disposition
+	// DeclaredBy names the human who made the standing declaration that
+	// this entry's reason cannot be mechanically re-checked. Required, and
+	// meaningful, only when Disposition is DispositionDeclaredExclusion.
+	DeclaredBy string
+	// Reconfirm is a re-confirmation cadence for a
+	// DispositionDeclaredExclusion entry — free-form text (a date, or an
+	// interval) naming when the declaration must be revisited. This
+	// package does not parse or enforce it as a schedule, only requires it
+	// be non-empty when Disposition is DispositionDeclaredExclusion.
+	Reconfirm string
 	// Legacy is true when this value was parsed from a bare free-prose
 	// string rather than a structured mapping.
 	Legacy bool
@@ -309,22 +386,30 @@ func (s SkipInfo) Present() bool {
 // verbatim, or a rendering of the structured reason and whatever companion
 // fields it carries.
 func (s SkipInfo) Describe() string {
+	var base string
 	switch {
 	case s.Legacy:
-		return s.LegacyText
+		base = s.LegacyText
 	case s.Reason == SkipUnionArm:
-		return fmt.Sprintf("union-arm (sibling: %s)", s.Sibling)
+		base = fmt.Sprintf("union-arm (sibling: %s)", s.Sibling)
 	case s.Reason == SkipCoveredElsewhere:
-		return fmt.Sprintf("covered-elsewhere (by: %s)", s.By)
+		base = fmt.Sprintf("covered-elsewhere (by: %s)", s.By)
 	case s.Reason == SkipVendorDefect:
-		return fmt.Sprintf("vendor-defect (%s; ticket: %s)", s.Evidence, s.Ticket)
+		base = fmt.Sprintf("vendor-defect (%s; ticket: %s)", s.Evidence, s.Ticket)
 	case s.Reason == SkipFixtureMissing:
-		return fmt.Sprintf("fixture-missing (%s; ticket: %s)", s.Evidence, s.Ticket)
+		base = fmt.Sprintf("fixture-missing (%s; ticket: %s)", s.Evidence, s.Ticket)
 	case s.Reason == SkipWriteOnly:
-		return "write-only"
+		base = "write-only"
 	default:
-		return string(s.Reason)
+		base = string(s.Reason)
 	}
+	// Disposition is optional and orthogonal to Reason — appended only when
+	// authored, so every pre-existing Describe() rendering (no disposition:
+	// key in the source) is byte-for-byte unchanged.
+	if s.Disposition == "" {
+		return base
+	}
+	return fmt.Sprintf("%s [disposition: %s]", base, s.Disposition)
 }
 
 // UnmarshalYAML implements yaml.Unmarshaler so a "skip:" key accepts either
@@ -347,21 +432,27 @@ func (s *SkipInfo) UnmarshalYAML(value *yaml.Node) error {
 		return nil
 	case yaml.MappingNode:
 		var m struct {
-			Reason   string `yaml:"reason"`
-			Sibling  string `yaml:"sibling"`
-			By       string `yaml:"by"`
-			Evidence string `yaml:"evidence"`
-			Ticket   string `yaml:"ticket"`
+			Reason      string `yaml:"reason"`
+			Sibling     string `yaml:"sibling"`
+			By          string `yaml:"by"`
+			Evidence    string `yaml:"evidence"`
+			Ticket      string `yaml:"ticket"`
+			Disposition string `yaml:"disposition"`
+			DeclaredBy  string `yaml:"declared-by"`
+			Reconfirm   string `yaml:"reconfirm"`
 		}
 		if err := value.Decode(&m); err != nil {
 			return fmt.Errorf("decoding skip: %w", err)
 		}
 		info := SkipInfo{
-			Reason:   SkipReason(m.Reason),
-			Sibling:  m.Sibling,
-			By:       m.By,
-			Evidence: m.Evidence,
-			Ticket:   m.Ticket,
+			Reason:      SkipReason(m.Reason),
+			Sibling:     m.Sibling,
+			By:          m.By,
+			Evidence:    m.Evidence,
+			Ticket:      m.Ticket,
+			Disposition: Disposition(m.Disposition),
+			DeclaredBy:  m.DeclaredBy,
+			Reconfirm:   m.Reconfirm,
 		}
 		if err := validateSkipInfo(info); err != nil {
 			return err
@@ -424,6 +515,29 @@ func validateSkipInfo(s SkipInfo) error {
 	case SkipWriteOnly:
 		// No required companion keys — see the SkipWriteOnly doc comment
 		// for why resolution is deferred rather than performed here.
+	}
+
+	// disposition: is optional and orthogonal to reason: — validated
+	// independently of which reason was chosen above. Nothing here ever
+	// derives a disposition from s.Reason or s.Evidence: it is authored,
+	// or it stays empty (see Disposition's own doc comment).
+	if s.Disposition == "" {
+		return nil
+	}
+	validDisposition := false
+	for _, d := range dispositions {
+		if s.Disposition == d {
+			validDisposition = true
+			break
+		}
+	}
+	if !validDisposition {
+		return fmt.Errorf("skip: disposition %q is not one of the valid dispositions (%s)", s.Disposition, validDispositionList())
+	}
+	if s.Disposition == DispositionDeclaredExclusion {
+		if s.DeclaredBy == "" || s.Reconfirm == "" {
+			return fmt.Errorf("skip: disposition %q requires both declared-by: and reconfirm: to be non-empty", s.Disposition)
+		}
 	}
 	return nil
 }

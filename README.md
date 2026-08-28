@@ -911,6 +911,48 @@ and still counts as coverage, but is reported under `validate`'s distinct
 `skipped-unstructured` status rather than `skipped` — see the status list
 above.
 
+#### `skip:` dispositions
+
+A structured `skip:` may also carry an optional `disposition:` — a second,
+independent axis alongside `reason:`. Where `reason:` says WHY no test
+exists, `disposition:` says HOW that reason could be — or already has
+been — checked, so a reader (or a future tool) can tell a claim that is
+mechanically re-checkable from one that is only a human's word. It is
+**authored, or it is absent** — nothing infers a disposition from `reason:`
+or `evidence:` prose, and an unrecognised value is a parse-time error naming
+the valid set.
+
+| disposition | means | required keys |
+|---|---|---|
+| `statically-provable` | decidable from the repo alone — a CRD schema validation rule, the resource's own controller source, or the example manifest's own data — with no cluster and no live call | none |
+| `one-live-patch` | a claim about backend runtime behaviour, resolvable by firing ONE request with no lasting consequence (a rejection leaves state unchanged; an acceptance is undoable by a further, similarly-priced request) — including a claim whose evidence was already gathered and is recorded in the reason's own prose | none |
+| `declared-exclusion` | firing the `one-live-patch`-shaped probe is ITSELF the irreversible or destructive act, or damages state shared with other runs, so no mechanical check can ever confirm it — a standing human commitment instead | `declared-by:` and `reconfirm:`, both required |
+| `defect` | the repo's own artifacts contradict the stated reason, or the reason names nothing checkable at all | none |
+
+```yaml
+crossplane.io/update-test: |
+  - field: osId
+    skip:
+      reason: vendor-defect
+      evidence: "os_id is structurally absent from the update request the controller sends"
+      ticket: VU-OSID-STATIC
+      disposition: statically-provable
+  - field: displayName
+    skip:
+      reason: vendor-defect
+      evidence: "HTTP 409, and the display name is permanently reserved regardless of response code"
+      ticket: IAM-DISPLAYNAME
+      disposition: declared-exclusion
+      declared-by: a human
+      reconfirm: "2027-01-01"
+```
+
+`disposition:` is currently report-only: `roundtrip-verify`'s
+`containerClear` findings surface, per uncovered container-typed leaf,
+whether its own `skip:` entry (if any) carries a disposition and which, but
+nothing folds it into an exit code today, and an absent `disposition:` is
+reported as absent rather than defaulted to any of the four values.
+
 #### Whole-field tombstones without a sibling field
 
 `clear:` folds a null for OTHER top-level fields into the merge patch that

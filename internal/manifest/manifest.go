@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -211,14 +212,20 @@ const (
 	// validator.CheckSkipReasons.
 	SkipCoveredElsewhere SkipReason = "covered-elsewhere"
 	// SkipVendorDefect marks a field whose update path cannot be tested
-	// because of an observed vendor/backend defect, recorded in Evidence
-	// and tracked in Ticket. Not resolvable offline — Evidence and Ticket
-	// are checked for presence only.
+	// because of an observed vendor/backend defect, recorded in Evidence.
+	// Ticket is optional and, when present, must be an externally
+	// resolvable reference (a vendor support case, an upstream issue
+	// URL) rather than an internal tracking identifier — see Ticket. Not
+	// resolvable offline — Evidence is checked for presence; Ticket, when
+	// present, is checked for shape only.
 	SkipVendorDefect SkipReason = "vendor-defect"
 	// SkipFixtureMissing marks a field that cannot be tested because the
-	// fixture data it needs does not exist yet, recorded in Evidence and
-	// tracked in Ticket. Not resolvable offline — Evidence and Ticket are
-	// checked for presence only.
+	// fixture data it needs does not exist yet, recorded in Evidence.
+	// Ticket is optional and, when present, must be an externally
+	// resolvable reference (a vendor support case, an upstream issue
+	// URL) rather than an internal tracking identifier — see Ticket. Not
+	// resolvable offline — Evidence is checked for presence; Ticket, when
+	// present, is checked for shape only.
 	SkipFixtureMissing SkipReason = "fixture-missing"
 	// SkipWriteOnly marks a field with no readable counterpart to assert
 	// against. Accepted here with no companion key, unlike the other four
@@ -317,15 +324,26 @@ func validDispositionList() string {
 // SkipInfo is a field's "skip:" declaration — the zero value means no
 // skip: key was present at all (see Present).
 //
-// Two shapes parse into it. The legacy shape is a bare string — a free-prose
-// reason with nothing to check — and is recorded as Legacy/LegacyText,
-// credited under a status distinct from the structured form's (see
-// validator's "covered (skipped, unstructured)" status) so the fleet's
-// existing free-prose entries keep working while carrying their own
+// Three shapes parse into it. The legacy shape is a bare string — a
+// free-prose reason with nothing to check — and is recorded as
+// Legacy/LegacyText, credited under a status distinct from the structured
+// form's (see validator's "covered (skipped, unstructured)" status) so the
+// fleet's existing free-prose entries keep working while carrying their own
 // burn-down count. The structured shape is a mapping with a Reason from the
 // closed SkipReason set above, plus whatever companion keys that reason
-// requires — see UnmarshalYAML and validateSkipInfo for the accepted shapes
-// and their required keys.
+// requires. The third shape is a mapping carrying a legacy: key instead of
+// reason: — the same free prose as the bare-string shape, decoded to the
+// same Legacy/LegacyText fields, but able to additionally carry
+// disposition: (and, when disposition: is declared-exclusion,
+// declared-by:/reconfirm:) alongside it:
+//
+//	skip:
+//	  legacy: "the original free-prose text, verbatim"
+//	  disposition: statically-provable
+//
+// legacy: and reason: are alternatives, never both on the same entry — see
+// UnmarshalYAML and validateSkipInfo for the accepted shapes and their
+// required keys.
 type SkipInfo struct {
 	// Reason is the structured reason code. Empty when Legacy is true.
 	Reason SkipReason
@@ -338,11 +356,17 @@ type SkipInfo struct {
 	// SkipCoveredElsewhere.
 	By string
 	// Evidence records what was observed that makes this field's update
-	// path untestable. Set when Reason is SkipVendorDefect or
+	// path untestable. Required whenever Reason is SkipVendorDefect or
 	// SkipFixtureMissing.
 	Evidence string
-	// Ticket names the ticket tracking why this field cannot be tested
-	// yet. Set when Reason is SkipVendorDefect or SkipFixtureMissing.
+	// Ticket is an optional externally resolvable reference for why this
+	// field cannot be tested yet — a vendor support case number, or an
+	// upstream issue URL. It is never a factory-internal ticket
+	// identifier: a provider repository is a shipped, published
+	// artifact, and an identifier meaningful only inside the factory
+	// that built it is unresolvable to anyone reading the shipped code.
+	// validateSkipInfo rejects a value shaped like a bare UUID or a
+	// factory ticket slug.
 	Ticket string
 	// Disposition is the optional evidence-tier disposition declared
 	// alongside Reason — see Disposition. Empty when no disposition: key
@@ -396,9 +420,9 @@ func (s SkipInfo) Describe() string {
 	case s.Reason == SkipCoveredElsewhere:
 		base = fmt.Sprintf("covered-elsewhere (by: %s)", s.By)
 	case s.Reason == SkipVendorDefect:
-		base = fmt.Sprintf("vendor-defect (%s; ticket: %s)", s.Evidence, s.Ticket)
+		base = describeEvidenceTicket("vendor-defect", s.Evidence, s.Ticket)
 	case s.Reason == SkipFixtureMissing:
-		base = fmt.Sprintf("fixture-missing (%s; ticket: %s)", s.Evidence, s.Ticket)
+		base = describeEvidenceTicket("fixture-missing", s.Evidence, s.Ticket)
 	case s.Reason == SkipWriteOnly:
 		base = "write-only"
 	default:
@@ -413,11 +437,24 @@ func (s SkipInfo) Describe() string {
 	return fmt.Sprintf("%s [disposition: %s]", base, s.Disposition)
 }
 
-// UnmarshalYAML implements yaml.Unmarshaler so a "skip:" key accepts either
-// its legacy free-prose string form or the structured mapping form — see
-// SkipInfo. An explicit `skip: ""` (or an entry with no skip: key at all)
-// decodes to the zero value, matching the pre-this-ticket behaviour where an
-// empty string meant "no skip declared".
+// describeEvidenceTicket renders the common "<reason> (<evidence>[; ticket:
+// <ticket>])" shape SkipVendorDefect and SkipFixtureMissing share. ticket is
+// omitted entirely when empty — it is optional, and an entry authored
+// without one must not render a dangling "; ticket: ".
+func describeEvidenceTicket(reason, evidence, ticket string) string {
+	if ticket == "" {
+		return fmt.Sprintf("%s (%s)", reason, evidence)
+	}
+	return fmt.Sprintf("%s (%s; ticket: %s)", reason, evidence, ticket)
+}
+
+// UnmarshalYAML implements yaml.Unmarshaler so a "skip:" key accepts any of
+// three shapes — see SkipInfo: the legacy free-prose string, the structured
+// mapping keyed on reason:, or the structured mapping keyed on legacy:
+// (the same free prose, but able to carry disposition: alongside it). An
+// explicit `skip: ""` (or an entry with no skip: key at all) decodes to the
+// zero value, matching the pre-this-ticket behaviour where an empty string
+// meant "no skip declared".
 func (s *SkipInfo) UnmarshalYAML(value *yaml.Node) error {
 	switch value.Kind {
 	case yaml.ScalarNode:
@@ -434,6 +471,7 @@ func (s *SkipInfo) UnmarshalYAML(value *yaml.Node) error {
 	case yaml.MappingNode:
 		var m struct {
 			Reason      string `yaml:"reason"`
+			Legacy      string `yaml:"legacy"`
 			Sibling     string `yaml:"sibling"`
 			By          string `yaml:"by"`
 			Evidence    string `yaml:"evidence"`
@@ -455,6 +493,10 @@ func (s *SkipInfo) UnmarshalYAML(value *yaml.Node) error {
 			DeclaredBy:  m.DeclaredBy,
 			Reconfirm:   m.Reconfirm,
 		}
+		if m.Legacy != "" {
+			info.Legacy = true
+			info.LegacyText = m.Legacy
+		}
 		if err := validateSkipInfo(info); err != nil {
 			return err
 		}
@@ -465,63 +507,43 @@ func (s *SkipInfo) UnmarshalYAML(value *yaml.Node) error {
 	}
 }
 
-// validateSkipInfo enforces the closed reason set and each reason's own
-// required companion keys, at parse time, before any cluster or generated
-// type is touched.
-//
-// It deliberately stops short of the two checks that need context this
-// package does not have: SkipUnionArm's sibling being a field actually
-// declared on the target Parameters struct, and SkipCoveredElsewhere's by:
-// target being itself directly tested. Both run in
-// validator.CheckSkipReasons, which has the generated-type field list (for
-// the first) and can load another manifest file (for the second).
-func validateSkipInfo(s SkipInfo) error {
-	if s.Reason == "immutable" {
-		return fmt.Errorf(
-			"skip: reason \"immutable\" is not a valid reason — immutability is derived mechanically from the " +
-				"`self == oldSelf` CEL validation marker on the field's own declaration; add that marker instead " +
-				"of declaring skip: here")
-	}
-	valid := false
-	for _, r := range skipReasons {
-		if s.Reason == r {
-			valid = true
-			break
-		}
-	}
-	if !valid {
-		return fmt.Errorf("skip: reason %q is not one of the valid reasons (%s)", s.Reason, validSkipReasonList())
-	}
+// ticketUUIDPattern matches a bare UUID (any RFC 4122 layout,
+// case-insensitive) — the shape a factory ticket identifier can take when
+// auto-generated rather than assigned a slug.
+var ticketUUIDPattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
-	switch s.Reason {
-	case SkipUnionArm:
-		if s.Sibling == "" {
-			return fmt.Errorf("skip: reason %q requires a non-empty sibling: naming the other union-arm field", s.Reason)
-		}
-	case SkipCoveredElsewhere:
-		if s.By == "" {
-			return fmt.Errorf("skip: reason %q requires a non-empty by: shaped \"<path>#<field>\"", s.Reason)
-		}
-		if !strings.Contains(s.By, "#") {
-			return fmt.Errorf("skip: reason %q by: %q must be shaped \"<path>#<field>\"", s.Reason, s.By)
-		}
-	case SkipVendorDefect:
-		if s.Evidence == "" || s.Ticket == "" {
-			return fmt.Errorf("skip: reason %q requires both evidence: and ticket: to be non-empty", s.Reason)
-		}
-	case SkipFixtureMissing:
-		if s.Evidence == "" || s.Ticket == "" {
-			return fmt.Errorf("skip: reason %q requires both evidence: and ticket: to be non-empty", s.Reason)
-		}
-	case SkipWriteOnly:
-		// No required companion keys — see the SkipWriteOnly doc comment
-		// for why resolution is deferred rather than performed here.
-	}
+// ticketFactorySlugPattern matches a factory ticket slug: an all-caps
+// project code of 2-5 letters, followed by two or more hyphen-separated
+// all-caps/digit segments (e.g. "FX-DNS-DELEGATION"). This is the shape the
+// factory's own ticket IDs take when a human names them by hand.
+var ticketFactorySlugPattern = regexp.MustCompile(`^[A-Z]{2,5}-[A-Z0-9]+(-[A-Z0-9]+)+$`)
 
-	// disposition: is optional and orthogonal to reason: — validated
-	// independently of which reason was chosen above. Nothing here ever
-	// derives a disposition from s.Reason or s.Evidence: it is authored,
-	// or it stays empty (see Disposition's own doc comment).
+// validateTicketReference rejects the two shapes a ticket: value can take
+// that are CERTAINLY not externally resolvable: a bare UUID, and a factory
+// ticket slug. This is a shape heuristic, not a resolvability proof — it
+// cannot confirm that some other shape IS a resolvable reference, only that
+// these two are not. It must accept a URL, a vendor support case number, and
+// a bare integer without complaint.
+func validateTicketReference(ticket string) error {
+	const reason = "a provider repository is a shipped, published artifact and a factory-internal identifier " +
+		"is meaningless to its readers; ticket: must be an externally resolvable reference (a vendor support " +
+		"case number, an upstream issue URL)"
+	if ticketUUIDPattern.MatchString(ticket) {
+		return fmt.Errorf("skip: ticket: %q looks like a bare UUID — %s", ticket, reason)
+	}
+	if ticketFactorySlugPattern.MatchString(ticket) {
+		return fmt.Errorf("skip: ticket: %q looks like a factory ticket slug — %s", ticket, reason)
+	}
+	return nil
+}
+
+// validateDisposition enforces the closed disposition set and
+// declared-exclusion's own required companion keys. disposition: is
+// optional and orthogonal to reason:/legacy: — this runs for both the
+// structured-reason shape and the legacy-mapping shape. Nothing here ever
+// derives a disposition from s.Reason, s.LegacyText or s.Evidence: it is
+// authored, or it stays empty (see Disposition's own doc comment).
+func validateDisposition(s SkipInfo) error {
 	if s.Disposition == "" {
 		return nil
 	}
@@ -541,6 +563,84 @@ func validateSkipInfo(s SkipInfo) error {
 		}
 	}
 	return nil
+}
+
+// validateSkipInfo enforces the closed reason set and each reason's own
+// required companion keys, at parse time, before any cluster or generated
+// type is touched.
+//
+// It deliberately stops short of the two checks that need context this
+// package does not have: SkipUnionArm's sibling being a field actually
+// declared on the target Parameters struct, and SkipCoveredElsewhere's by:
+// target being itself directly tested. Both run in
+// validator.CheckSkipReasons, which has the generated-type field list (for
+// the first) and can load another manifest file (for the second).
+func validateSkipInfo(s SkipInfo) error {
+	// legacy: and reason: are alternatives, never a merge — a mapping
+	// authoring both leaves last-one-wins ambiguity for every downstream
+	// reader (burn-down counts, Describe()) with no signal that it happened.
+	if s.Legacy && s.Reason != "" {
+		return fmt.Errorf(
+			"skip: mapping carries both legacy: and reason: — they are alternatives, not a merge; " +
+				"legacy: carries pre-migration free prose forward unchanged, reason: declares a structured " +
+				"closed-set reason, and a mapping may author only one of the two")
+	}
+
+	// The legacy: shape carries no reason code at all, so none of the
+	// reason-set/companion-key checks below apply to it — only the
+	// reason-independent ticket: and disposition: checks further down do.
+	if !s.Legacy {
+		if s.Reason == "immutable" {
+			return fmt.Errorf(
+				"skip: reason \"immutable\" is not a valid reason — immutability is derived mechanically from the " +
+					"`self == oldSelf` CEL validation marker on the field's own declaration; add that marker instead " +
+					"of declaring skip: here")
+		}
+		valid := false
+		for _, r := range skipReasons {
+			if s.Reason == r {
+				valid = true
+				break
+			}
+		}
+		if !valid {
+			return fmt.Errorf("skip: reason %q is not one of the valid reasons (%s)", s.Reason, validSkipReasonList())
+		}
+
+		switch s.Reason {
+		case SkipUnionArm:
+			if s.Sibling == "" {
+				return fmt.Errorf("skip: reason %q requires a non-empty sibling: naming the other union-arm field", s.Reason)
+			}
+		case SkipCoveredElsewhere:
+			if s.By == "" {
+				return fmt.Errorf("skip: reason %q requires a non-empty by: shaped \"<path>#<field>\"", s.Reason)
+			}
+			if !strings.Contains(s.By, "#") {
+				return fmt.Errorf("skip: reason %q by: %q must be shaped \"<path>#<field>\"", s.Reason, s.By)
+			}
+		case SkipVendorDefect, SkipFixtureMissing:
+			// ticket: used to be a required companion here too. It no longer
+			// is — see Ticket's own doc comment — so only evidence: is
+			// checked for presence.
+			if s.Evidence == "" {
+				return fmt.Errorf("skip: reason %q requires a non-empty evidence: to be recorded", s.Reason)
+			}
+		case SkipWriteOnly:
+			// No required companion keys — see the SkipWriteOnly doc comment
+			// for why resolution is deferred rather than performed here.
+		}
+	}
+
+	// ticket: is optional everywhere, but when authored it must be an
+	// externally resolvable reference, regardless of reason: vs legacy:.
+	if s.Ticket != "" {
+		if err := validateTicketReference(s.Ticket); err != nil {
+			return err
+		}
+	}
+
+	return validateDisposition(s)
 }
 
 // Manifest holds the parsed Kubernetes manifest metadata needed for testing.

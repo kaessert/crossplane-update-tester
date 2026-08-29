@@ -1165,33 +1165,56 @@ func TestParseAnnotationStructuredSkipAccepted(t *testing.T) {
 			want: SkipInfo{Reason: SkipCoveredElsewhere, By: "examples/x/y.yaml#comment"},
 		},
 		"VendorDefect": {
-			reason: "vendor-defect carries both evidence: and ticket:",
+			reason: "vendor-defect carries both evidence: and an externally resolvable ticket:",
 			annotation: `
 - field: dnsVolterraManaged
   skip:
     reason: vendor-defect
     evidence: "HTTP 400 'Change of domain type ... is not supported'"
-    ticket: FX-DNS-DELEGATION
+    ticket: https://support.f5.com/csp/case/00482113
 `,
 			want: SkipInfo{
 				Reason:   SkipVendorDefect,
 				Evidence: "HTTP 400 'Change of domain type ... is not supported'",
-				Ticket:   "FX-DNS-DELEGATION",
+				Ticket:   "https://support.f5.com/csp/case/00482113",
 			},
 		},
+		"VendorDefectEvidenceOnly": {
+			reason: "ticket: is optional — vendor-defect parses on evidence: alone",
+			annotation: `
+- field: comment
+  skip:
+    reason: vendor-defect
+    evidence: "observed a 400"
+`,
+			want: SkipInfo{Reason: SkipVendorDefect, Evidence: "observed a 400"},
+		},
 		"FixtureMissing": {
-			reason: "fixture-missing carries both evidence: and ticket:",
+			reason: "fixture-missing carries both evidence: and an externally resolvable ticket:",
 			annotation: `
 - field: firewallGroupId
   skip:
     reason: fixture-missing
     evidence: "no fixture backend exposes a second firewall group to move this field between"
-    ticket: VU-FW-FIXTURE
+    ticket: "8213021"
 `,
 			want: SkipInfo{
 				Reason:   SkipFixtureMissing,
 				Evidence: "no fixture backend exposes a second firewall group to move this field between",
-				Ticket:   "VU-FW-FIXTURE",
+				Ticket:   "8213021",
+			},
+		},
+		"FixtureMissingEvidenceOnly": {
+			reason: "ticket: is optional — fixture-missing parses on evidence: alone",
+			annotation: `
+- field: comment
+  skip:
+    reason: fixture-missing
+    evidence: "no fixture backend exposes a second firewall group to move this field between"
+`,
+			want: SkipInfo{
+				Reason:   SkipFixtureMissing,
+				Evidence: "no fixture backend exposes a second firewall group to move this field between",
 			},
 		},
 		"WriteOnly": {
@@ -1202,6 +1225,17 @@ func TestParseAnnotationStructuredSkipAccepted(t *testing.T) {
     reason: write-only
 `,
 			want: SkipInfo{Reason: SkipWriteOnly},
+		},
+		"TicketBareInteger": {
+			reason: "a bare integer ticket: is a plausible vendor case number and must be accepted",
+			annotation: `
+- field: comment
+  skip:
+    reason: vendor-defect
+    evidence: "observed a 400"
+    ticket: "482113"
+`,
+			want: SkipInfo{Reason: SkipVendorDefect, Evidence: "observed a 400", Ticket: "482113"},
 		},
 	}
 
@@ -1452,53 +1486,65 @@ func TestParseAnnotationStructuredSkipRejectsInvalidShapes(t *testing.T) {
 			wantErrSubstr: "must be shaped",
 		},
 		"VendorDefectMissingEvidence": {
-			reason: "vendor-defect requires both evidence: and ticket:",
+			reason: "vendor-defect requires a non-empty evidence: — ticket: is optional and does not substitute for it",
 			annotation: `
 - field: comment
   skip:
     reason: vendor-defect
-    ticket: FX-DNS-DELEGATION
+    ticket: "482113"
 `,
-			wantErrSubstr: "requires both evidence: and ticket:",
+			wantErrSubstr: "requires a non-empty evidence:",
 		},
-		"VendorDefectMissingTicket": {
-			reason: "vendor-defect requires both evidence: and ticket:",
+		"FixtureMissingNoTicketOrEvidence": {
+			reason: "fixture-missing requires a non-empty evidence:",
+			annotation: `
+- field: comment
+  skip:
+    reason: fixture-missing
+`,
+			wantErrSubstr: "requires a non-empty evidence:",
+		},
+		"FixtureMissingTicketOnly": {
+			reason: "ticket: alone does not substitute for the required evidence:",
+			annotation: `
+- field: comment
+  skip:
+    reason: fixture-missing
+    ticket: "8213021"
+`,
+			wantErrSubstr: "requires a non-empty evidence:",
+		},
+		"TicketUUIDRejected": {
+			reason: "a bare UUID is certainly not an externally resolvable reference",
 			annotation: `
 - field: comment
   skip:
     reason: vendor-defect
     evidence: "observed a 400"
+    ticket: 3f0f55de-1234-4321-89ab-1234567890ab
 `,
-			wantErrSubstr: "requires both evidence: and ticket:",
+			wantErrSubstr: "looks like a bare UUID",
 		},
-		"FixtureMissingNoTicketOrEvidence": {
-			reason: "fixture-missing requires both evidence: and ticket:",
+		"TicketFactorySlugRejected": {
+			reason: "a factory ticket slug is certainly not an externally resolvable reference",
 			annotation: `
 - field: comment
   skip:
-    reason: fixture-missing
+    reason: vendor-defect
+    evidence: "observed a 400"
+    ticket: FX-DNS-DELEGATION
 `,
-			wantErrSubstr: "requires both evidence: and ticket:",
+			wantErrSubstr: "looks like a factory ticket slug",
 		},
-		"FixtureMissingTicketOnly": {
-			reason: "fixture-missing requires evidence: as well as ticket:",
+		"LegacyAndReasonMutuallyExclusive": {
+			reason: "legacy: and reason: are alternatives, not a merge",
 			annotation: `
 - field: comment
   skip:
-    reason: fixture-missing
-    ticket: VU-FW-FIXTURE
+    legacy: "not exercised in this example"
+    reason: write-only
 `,
-			wantErrSubstr: "requires both evidence: and ticket:",
-		},
-		"FixtureMissingEvidenceOnly": {
-			reason: "fixture-missing requires ticket: as well as evidence:",
-			annotation: `
-- field: comment
-  skip:
-    reason: fixture-missing
-    evidence: "no fixture backend exposes a second firewall group to move this field between"
-`,
-			wantErrSubstr: "requires both evidence: and ticket:",
+			wantErrSubstr: "carries both legacy: and reason:",
 		},
 	}
 
@@ -1549,6 +1595,134 @@ func TestSkipInfoUnmarshalYAMLLegacyString(t *testing.T) {
 	}
 }
 
+// TestSkipInfoUnmarshalYAMLLegacyMapping pins the legacy: mapping shape: the
+// same free prose as the bare-string form, but able to additionally carry
+// disposition: (and, for declared-exclusion, declared-by:/reconfirm:)
+// alongside it — the shape change that decouples authoring a one-word
+// evidence tier from re-expressing the prose as a closed-set reason: code.
+func TestSkipInfoUnmarshalYAMLLegacyMapping(t *testing.T) {
+	cases := map[string]struct {
+		reason     string
+		annotation string
+		want       SkipInfo
+	}{
+		"LegacyWithDisposition": {
+			reason: "legacy: plus disposition: parses with Legacy true and LegacyText set verbatim",
+			annotation: `
+- field: comment
+  skip:
+    legacy: "the original free-prose text, verbatim"
+    disposition: statically-provable
+`,
+			want: SkipInfo{
+				Legacy:      true,
+				LegacyText:  "the original free-prose text, verbatim",
+				Disposition: DispositionStaticallyProvable,
+			},
+		},
+		"LegacyAlone": {
+			reason: "legacy: with no disposition: parses to exactly what the bare-string scalar form parses to",
+			annotation: `
+- field: comment
+  skip:
+    legacy: "not exercised in this example"
+`,
+			want: SkipInfo{Legacy: true, LegacyText: "not exercised in this example"},
+		},
+		"LegacyWithDeclaredExclusion": {
+			reason: "legacy: carries a declared-exclusion disposition alongside its own required declared-by:/reconfirm:",
+			annotation: `
+- field: comment
+  skip:
+    legacy: "firing this probe would delete the only paid-tier tenant fixture"
+    disposition: declared-exclusion
+    declared-by: platform-team
+    reconfirm: "2026-Q3"
+`,
+			want: SkipInfo{
+				Legacy:      true,
+				LegacyText:  "firing this probe would delete the only paid-tier tenant fixture",
+				Disposition: DispositionDeclaredExclusion,
+				DeclaredBy:  "platform-team",
+				Reconfirm:   "2026-Q3",
+			},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			tests, _, _, _, err := ParseAnnotation(tc.annotation)
+			if err != nil {
+				t.Fatalf("%s: ParseAnnotation() error = %v", tc.reason, err)
+			}
+			if len(tests) != 1 {
+				t.Fatalf("%s: got %d entries, want 1", tc.reason, len(tests))
+			}
+			if got := tests[0].Skip; got != tc.want {
+				t.Errorf("%s: Skip = %+v, want %+v", tc.reason, got, tc.want)
+			}
+			if !tests[0].Skip.Legacy {
+				t.Errorf("%s: Skip.Legacy = false, want true for a legacy: mapping entry", tc.reason)
+			}
+			if !tests[0].Skip.Present() {
+				t.Errorf("%s: Skip.Present() = false, want true", tc.reason)
+			}
+		})
+	}
+}
+
+// TestSkipInfoUnmarshalYAMLLegacyMappingVerbatimRoundTrip proves the
+// legacy: mapping shape is lossless on a REALISTIC waiver string — one
+// carrying a colon, an em dash and an embedded double quote, the three
+// characters a naive round-trip is most likely to mangle. The legacy:
+// mapping form must parse the prose to exactly the same LegacyText the
+// bare-string scalar form parses it to, and Describe() must render it
+// identically (aside from the disposition suffix the scalar form cannot
+// carry at all).
+func TestSkipInfoUnmarshalYAMLLegacyMappingVerbatimRoundTrip(t *testing.T) {
+	const prose = `Field: "region" cannot be updated — vendor API returns HTTP 409 "immutable field" on any PATCH containing it`
+
+	scalarTests, _, _, _, err := ParseAnnotation(`
+- field: region
+  skip: 'Field: "region" cannot be updated — vendor API returns HTTP 409 "immutable field" on any PATCH containing it'
+`)
+	if err != nil {
+		t.Fatalf("scalar form: ParseAnnotation() error = %v", err)
+	}
+	scalarSkip := scalarTests[0].Skip
+	if scalarSkip.LegacyText != prose {
+		t.Fatalf("scalar form: LegacyText = %q, want %q", scalarSkip.LegacyText, prose)
+	}
+
+	mappingTests, _, _, _, err := ParseAnnotation(`
+- field: region
+  skip:
+    legacy: 'Field: "region" cannot be updated — vendor API returns HTTP 409 "immutable field" on any PATCH containing it'
+    disposition: statically-provable
+`)
+	if err != nil {
+		t.Fatalf("legacy: mapping form: ParseAnnotation() error = %v", err)
+	}
+	mappingSkip := mappingTests[0].Skip
+
+	if !mappingSkip.Legacy {
+		t.Errorf("legacy: mapping form: Legacy = false, want true")
+	}
+	if mappingSkip.LegacyText != prose {
+		t.Errorf("legacy: mapping form: LegacyText = %q, want %q (verbatim, unmangled)", mappingSkip.LegacyText, prose)
+	}
+	if mappingSkip.Disposition != DispositionStaticallyProvable {
+		t.Errorf("legacy: mapping form: Disposition = %q, want %q", mappingSkip.Disposition, DispositionStaticallyProvable)
+	}
+
+	if got, want := scalarSkip.Describe(), prose; got != want {
+		t.Errorf("scalar form: Describe() = %q, want %q", got, want)
+	}
+	if got, want := mappingSkip.Describe(), prose+" [disposition: statically-provable]"; got != want {
+		t.Errorf("legacy: mapping form: Describe() = %q, want %q", got, want)
+	}
+}
+
 // TestSkipInfoDescribe pins the human-readable rendering SkipMsg (see
 // runner.TestResult) uses for each shape a SkipInfo can hold.
 func TestSkipInfoDescribe(t *testing.T) {
@@ -1574,22 +1748,32 @@ func TestSkipInfoDescribe(t *testing.T) {
 		},
 		"VendorDefect": {
 			reason: "vendor-defect names both evidence and ticket",
-			skip:   SkipInfo{Reason: SkipVendorDefect, Evidence: "observed a 400", Ticket: "FX-DNS-DELEGATION"},
-			want:   "vendor-defect (observed a 400; ticket: FX-DNS-DELEGATION)",
+			skip:   SkipInfo{Reason: SkipVendorDefect, Evidence: "observed a 400", Ticket: "https://support.f5.com/csp/case/00482113"},
+			want:   "vendor-defect (observed a 400; ticket: https://support.f5.com/csp/case/00482113)",
+		},
+		"VendorDefectNoTicket": {
+			reason: "ticket: is optional and omitted entirely from the rendering when empty",
+			skip:   SkipInfo{Reason: SkipVendorDefect, Evidence: "observed a 400"},
+			want:   "vendor-defect (observed a 400)",
 		},
 		"FixtureMissing": {
 			reason: "fixture-missing names both its evidence and its ticket",
 			skip: SkipInfo{
 				Reason:   SkipFixtureMissing,
 				Evidence: "no fixture backend exposes a second firewall group to move this field between",
-				Ticket:   "VU-FW-FIXTURE",
+				Ticket:   "8213021",
 			},
-			want: "fixture-missing (no fixture backend exposes a second firewall group to move this field between; ticket: VU-FW-FIXTURE)",
+			want: "fixture-missing (no fixture backend exposes a second firewall group to move this field between; ticket: 8213021)",
 		},
 		"WriteOnly": {
 			reason: "write-only carries no companion data to render",
 			skip:   SkipInfo{Reason: SkipWriteOnly},
 			want:   "write-only",
+		},
+		"LegacyWithDisposition": {
+			reason: "the legacy: mapping form renders its free-prose text verbatim, plus the disposition suffix",
+			skip:   SkipInfo{Legacy: true, LegacyText: "not exercised in this example", Disposition: DispositionStaticallyProvable},
+			want:   "not exercised in this example [disposition: statically-provable]",
 		},
 	}
 

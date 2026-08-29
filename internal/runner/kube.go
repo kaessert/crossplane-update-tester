@@ -6,18 +6,26 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/restmapper"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
+	watchtools "k8s.io/client-go/tools/watch"
 )
 
 // KubeClient is the typed seam over every kubectl operation Runner needs.
@@ -52,8 +60,11 @@ type KubeClient interface {
 	// subresource.
 	PatchMergeStatus(namespace, name, patchJSON string) (string, error)
 
-	// WaitForCondition blocks until condition (e.g. "condition=Ready") is
-	// satisfied or timeout elapses.
+	// WaitForCondition blocks until condition — kubectl wait's own
+	// "condition=<type>[=<status>]" syntax, e.g. "condition=Ready" or
+	// "condition=Ready=False" — is satisfied or timeout elapses. The
+	// condition status defaults to "True" when omitted, exactly as
+	// kubectl's own default does.
 	WaitForCondition(namespace, name, condition, timeout string) (string, error)
 
 	// ListEventsForObject returns cluster Events whose involvedObject
@@ -178,17 +189,21 @@ func eventFieldSelector(kind, name, namespace string) string {
 // on the next slice of the migration and has already done so once.
 const kubeBackendEnvVar = "UPDATE_TESTER_KUBE_BACKEND"
 
-// clientGoKubeClient overrides event listing, resource reads and the two
-// merge-patch operations with direct client-go calls. Every other KubeClient
-// operation is promoted from the embedded exec backend unchanged — this
-// type exists to migrate one operation at a time, not to grow into a second
-// full backend. A shared informer or watch cache is deliberately NOT used
-// for any override: the evidence check event listing and resource reads
-// feed is a before/after delta on the same object, and a lagging cache
-// would return a stale second read and manufacture a false negative: the
-// two patch overrides write rather than read, so a cache cannot go stale
-// under them, but they are still direct dynamic calls for the same reason
-// — no informer or watch cache is reached for anywhere in this type.
+// clientGoKubeClient overrides event listing, resource reads, the two
+// merge-patch operations, and the Ready wait with direct client-go calls.
+// Every other KubeClient operation is promoted from the embedded exec
+// backend unchanged — this type exists to migrate one operation at a time,
+// not to grow into a second full backend. A shared informer or watch cache
+// is deliberately NOT used for the event listing or resource read
+// overrides: the evidence check those feed is a before/after delta on the
+// same object, and a lagging cache would return a stale second read and
+// manufacture a false negative. The two patch overrides write rather than
+// read, so a cache cannot go stale under them, but they are still direct
+// dynamic calls for the same reason. WaitForCondition is the one exception
+// to "no watch cache reached for anywhere in this type": a wait for a
+// future transition is exactly what a watch is for, and its own doc
+// comment states the boundary that keeps that watch from ever becoming a
+// second, cached source for the two direct-read overrides above.
 // clientset is a func rather than a stored value so it can be resolved
 // lazily (a Runner is often built before a kubeconfig is needed) and
 // overridden by tests.
@@ -437,6 +452,170 @@ func (c *clientGoKubeClient) dynamicMergePatch(namespace, name, patchJSON string
 	return string(data), nil
 }
 
+// parseWaitCondition parses WaitForCondition's condition argument in
+// kubectl wait's own "condition=<type>[=<status>]" syntax, so an
+// implementation that ignores everything but "Ready" cannot silently pass
+// every existing caller while breaking the first one that names a
+// different condition. The status half defaults to "True" — kubectl's own
+// default when it is omitted — and is returned verbatim rather than
+// normalised: the case-insensitive comparison kubectl itself performs
+// happens once, in waitConditionMet, not here.
+func parseWaitCondition(condition string) (conditionType, conditionStatus string, err error) {
+	const prefix = "condition="
+	if !strings.HasPrefix(condition, prefix) {
+		return "", "", fmt.Errorf("parsing wait condition %q: expected the %q prefix", condition, prefix)
+	}
+	rest := strings.TrimPrefix(condition, prefix)
+	conditionType, conditionStatus = rest, "True"
+	if idx := strings.Index(rest, "="); idx != -1 {
+		conditionType, conditionStatus = rest[:idx], rest[idx+1:]
+	}
+	if conditionType == "" {
+		return "", "", fmt.Errorf("parsing wait condition %q: empty condition type", condition)
+	}
+	return conditionType, conditionStatus, nil
+}
+
+// waitConditionMet reports whether obj carries a status.conditions entry
+// whose type and status match conditionType/conditionStatus, compared
+// case-insensitively — the same "Unicode simple case folding" comparison
+// kubectl wait documents for its own --for=condition matching.
+func waitConditionMet(obj *unstructured.Unstructured, conditionType, conditionStatus string) (bool, error) {
+	conditions, found, err := unstructured.NestedSlice(obj.Object, "status", "conditions")
+	if err != nil {
+		return false, fmt.Errorf("reading status.conditions: %w", err)
+	}
+	if !found {
+		return false, nil
+	}
+	for _, raw := range conditions {
+		entry, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		entryType, _, _ := unstructured.NestedString(entry, "type")
+		if !strings.EqualFold(entryType, conditionType) {
+			continue
+		}
+		entryStatus, _, _ := unstructured.NestedString(entry, "status")
+		return strings.EqualFold(entryStatus, conditionStatus), nil
+	}
+	return false, nil
+}
+
+// WaitForCondition blocks until name's status.conditions satisfies
+// condition or timeout elapses, using k8s.io/client-go/tools/watch's
+// UntilWithSync over a ListWatch scoped to this one object by a
+// metadata.name field selector — the SAME primitive kubectl wait's own
+// implementation calls internally (k8s.io/kubectl/pkg/cmd/wait's
+// getObjAndCheckCondition), built the same way: a List-then-Watch
+// ListerWatcher, a store-existence precondition, and a ConditionFunc
+// evaluated over the resulting event stream.
+//
+// This is what makes the already-satisfied case correct without a special
+// case for it: UntilWithSync builds an informer, waits for that informer's
+// initial List to land in its store, and only then evaluates precondition
+// — but the informer's own event handler synthesizes an Added event for
+// every object the initial List already contained (see client-go's
+// NewIndexerInformerWatcher), so an object that reached the condition
+// before this call ever ran satisfies it on that synthetic event, through
+// the exact same ConditionFunc a genuine later transition would satisfy.
+// The watch itself is seeded from that same informer's reflector, which
+// re-lists from the resourceVersion its own initial List observed, so a
+// transition landing between the List and the Watch opening is a normal
+// watch event rather than a missed one — the guarantee this migration
+// needs, provided by the informer rather than hand-built here.
+//
+// precondition mirrors kubectl's own: once the store has synced, an empty
+// store means the object does not exist, and that is reported as an
+// immediate, non-nil error rather than a block until timeout — matching
+// kubectl wait's own fail-fast behaviour for a resource that is absent.
+//
+// The Watch this opens is never a source for anything but this wait:
+// ListEventsForObject and GetObjectJSON, this type's other two read
+// overrides, still take direct, uncached calls — see clientGoKubeClient's
+// own doc comment for that boundary.
+func (c *clientGoKubeClient) WaitForCondition(namespace, name, condition, timeout string) (string, error) {
+	conditionType, conditionStatus, err := parseWaitCondition(condition)
+	if err != nil {
+		return "", err
+	}
+	dur, err := time.ParseDuration(timeout)
+	if err != nil {
+		return "", fmt.Errorf("parsing wait timeout %q: %w", timeout, err)
+	}
+	gvr, err := c.resourceGVR(name)
+	if err != nil {
+		return "", err
+	}
+	dyn, err := c.r.goDynamicClient()
+	if err != nil {
+		return "", fmt.Errorf("resolving dynamic client: %w", err)
+	}
+	objName := objectNameOf(name)
+	res := dyn.Resource(gvr).Namespace(namespace)
+
+	ctx, cancel := context.WithTimeout(context.Background(), dur)
+	defer cancel()
+
+	fieldSelector := fields.OneTermEqualSelector("metadata.name", objName).String()
+	lw := &cache.ListWatch{
+		ListWithContextFunc: func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
+			opts.FieldSelector = fieldSelector
+			return res.List(ctx, opts)
+		},
+		WatchFuncWithContext: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+			opts.FieldSelector = fieldSelector
+			return res.Watch(ctx, opts)
+		},
+	}
+
+	precondition := func(store cache.Store) (bool, error) {
+		if len(store.List()) == 0 {
+			return true, apierrors.NewNotFound(gvr.GroupResource(), objName)
+		}
+		return false, nil
+	}
+
+	condFn := func(event watch.Event) (bool, error) {
+		switch event.Type {
+		case watch.Error:
+			// Matches kubectl wait's own ConditionalWait.isConditionMet:
+			// keep waiting rather than fail. The server is expected to
+			// close the watch immediately after an Error event, and
+			// UntilWithSync recovers by relisting.
+			return false, nil
+		case watch.Deleted:
+			// Also matches kubectl: a delete does not itself satisfy or
+			// fail the wait. It chains back to a relist, which the
+			// precondition above turns into a NotFound once the store is
+			// actually empty.
+			return false, nil
+		}
+		obj, ok := event.Object.(*unstructured.Unstructured)
+		if !ok {
+			return false, nil
+		}
+		return waitConditionMet(obj, conditionType, conditionStatus)
+	}
+
+	event, err := watchtools.UntilWithSync(ctx, lw, &unstructured.Unstructured{}, precondition, watchtools.ConditionFunc(condFn))
+	if err != nil {
+		if wait.Interrupted(err) {
+			return "", fmt.Errorf("timed out after %s waiting for %s on %s: %w", timeout, condition, name, err)
+		}
+		return "", fmt.Errorf("waiting for %s on %s via client-go: %w", condition, name, err)
+	}
+	if event == nil || event.Object == nil {
+		return "", fmt.Errorf("waiting for %s on %s via client-go: condition function returned no object", condition, name)
+	}
+	data, err := json.Marshal(event.Object)
+	if err != nil {
+		return "", fmt.Errorf("marshalling client-go wait result: %w", err)
+	}
+	return string(data), nil
+}
+
 // kube returns the KubeClient backend for this Runner. It is a method
 // rather than a field populated at construction so a Runner built as a bare
 // struct literal — every existing test constructs one this way, setting
@@ -451,11 +630,12 @@ func (c *clientGoKubeClient) dynamicMergePatch(namespace, name, patchJSON string
 //     would silently bypass that fake — no kubeconfig exists under test —
 //     rather than exercising it, so it stays on the exec backend it was
 //     already wired for.
-//  3. Otherwise: the client-go backend for event listing, resource reads
-//     and the two merge-patch operations (the default, production
-//     behaviour), built from kubeClientsetFunc/kubeDynamicFunc/restMapperFunc
-//     when a test has set them, or from the ambient kubeconfig otherwise.
-//     Every other operation still delegates to the embedded exec backend.
+//  3. Otherwise: the client-go backend for event listing, resource reads,
+//     the two merge-patch operations and the Ready wait (the default,
+//     production behaviour), built from
+//     kubeClientsetFunc/kubeDynamicFunc/restMapperFunc when a test has set
+//     them, or from the ambient kubeconfig otherwise. Every other
+//     operation still delegates to the embedded exec backend.
 //
 // Whichever branch is taken, the choice is recorded to stderr exactly once
 // per Runner (see kubeBackendLogOnce) — a parity run comparing the exec and
@@ -487,6 +667,6 @@ func kubeBackendSelectionLine(forcedExec, execFallback bool) string {
 	case execFallback:
 		return "kube backend: exec (all operations — test harness has no client-go override)"
 	default:
-		return "kube backend: client-go (event list, resource read, patch), exec (all other operations)"
+		return "kube backend: client-go (event list, resource read, patch, wait), exec (all other operations)"
 	}
 }

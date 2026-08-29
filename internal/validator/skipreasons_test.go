@@ -321,30 +321,33 @@ func TestCheckSkipReasonsCoveredElsewhereIsCWDIndependent(t *testing.T) {
 
 // TestCheckSkipReasonsCoveredElsewhereChainResolvesPerHop pins the chain
 // half of the fix: hop N of a covered-elsewhere chain must resolve its own
-// by: relative to hop N-1's directory, not the origin manifest's. mid.yaml
-// sits one directory level deeper than origin.yaml relative to final.yaml,
-// so a by: value that (incorrectly) stayed anchored to origin.yaml's
-// directory for every hop would walk one level too far up and fail to find
-// final.yaml at all.
+// by: relative to hop N-1's OWN directory, never the origin manifest's.
+// origin.yaml and mid.yaml are placed at DIFFERENT DEPTHS on purpose —
+// origin.yaml one level down (root/a/), mid.yaml three levels down
+// (root/a/deeper/b/) — so the two candidate base directories cannot resolve
+// mid's own by: to the same place. mid's by: ("../../final.yaml") walks up
+// two levels from mid's OWN directory to reach root/a/final.yaml. Walking up
+// two levels from origin's directory instead lands entirely outside the
+// temp tree (no such file), which manifest.Parse then reports as an error —
+// so a resolver that (incorrectly) reused origin's directory for every hop
+// fails this test loudly rather than passing it by coincidence.
 func TestCheckSkipReasonsCoveredElsewhereChainResolvesPerHop(t *testing.T) {
 	root := t.TempDir()
-	aDir := filepath.Join(root, "group", "a")
-	bDir := filepath.Join(root, "group", "b")
-	cDir := filepath.Join(root, "c")
-	mustMkdirAll(t, aDir)
-	mustMkdirAll(t, bDir)
-	mustMkdirAll(t, cDir)
+	originDir := filepath.Join(root, "a")
+	midDir := filepath.Join(root, "a", "deeper", "b")
+	mustMkdirAll(t, originDir)
+	mustMkdirAll(t, midDir)
 
-	writeSkipReasonFixture(t, cDir, "final.yaml", `      - field: comment
+	writeSkipReasonFixture(t, originDir, "final.yaml", `      - field: comment
         value: "directly tested here"`)
-	writeSkipReasonFixture(t, bDir, "mid.yaml", `      - field: comment
+	writeSkipReasonFixture(t, midDir, "mid.yaml", `      - field: comment
         skip:
           reason: covered-elsewhere
-          by: ../../c/final.yaml#comment`)
-	originPath := writeSkipReasonFixture(t, aDir, "origin.yaml", `      - field: comment
+          by: ../../final.yaml#comment`)
+	originPath := writeSkipReasonFixture(t, originDir, "origin.yaml", `      - field: comment
         skip:
           reason: covered-elsewhere
-          by: ../b/mid.yaml#comment`)
+          by: deeper/b/mid.yaml#comment`)
 
 	m, err := manifest.Parse(originPath)
 	if err != nil {
@@ -354,6 +357,96 @@ func TestCheckSkipReasonsCoveredElsewhereChainResolvesPerHop(t *testing.T) {
 	findings := CheckSkipReasons(m, nil)
 	if len(findings) != 0 {
 		t.Fatalf("expected the chain to resolve hop-by-hop, got %+v", findings)
+	}
+}
+
+// TestCheckSkipReasonsCoveredElsewhereReusedSpellingChainIsNotAFalseCycle is
+// the exact four-manifest reproduction of the false-cycle regression this
+// fix closes: a/origin.yaml and b/origin2.yaml both spell their by: as
+// "target.yaml#comment", but each resolves (per its own directory) to a
+// DIFFERENT target.yaml. A resolver keyed on the raw by: string reports a
+// cycle here even though the chain visits four distinct files and ends at
+// one that is genuinely directly tested.
+func TestCheckSkipReasonsCoveredElsewhereReusedSpellingChainIsNotAFalseCycle(t *testing.T) {
+	root := t.TempDir()
+	groupA := filepath.Join(root, "a")
+	groupB := filepath.Join(root, "b")
+	mustMkdirAll(t, groupA)
+	mustMkdirAll(t, groupB)
+
+	writeSkipReasonFixture(t, groupB, "target.yaml", `      - field: comment
+        value: "directly tested here"`)
+	writeSkipReasonFixture(t, groupB, "origin2.yaml", `      - field: comment
+        skip:
+          reason: covered-elsewhere
+          by: target.yaml#comment`)
+	writeSkipReasonFixture(t, groupA, "target.yaml", `      - field: comment
+        skip:
+          reason: covered-elsewhere
+          by: ../b/origin2.yaml#comment`)
+	originPath := writeSkipReasonFixture(t, groupA, "origin.yaml", `      - field: comment
+        skip:
+          reason: covered-elsewhere
+          by: target.yaml#comment`)
+
+	m, err := manifest.Parse(originPath)
+	if err != nil {
+		t.Fatalf("parsing origin manifest: %v", err)
+	}
+
+	findings := CheckSkipReasons(m, nil)
+	if len(findings) != 0 {
+		t.Fatalf("expected no findings — four distinct files, no real cycle — got %+v", findings)
+	}
+}
+
+// TestResolveCoveredElsewhereSameSpellingDifferentTargetIsNotACycle is a
+// white-box test of resolveCoveredElsewhere's seen-keying directly: it
+// pre-seeds seen with the RAW by: spelling "target.yaml#comment" — the key
+// the pre-fix code used — and then resolves that exact same spelling from a
+// DIFFERENT base directory, landing on a genuinely different, directly
+// tested file. A resolver keyed on the raw spelling would report this as a
+// cycle; one keyed on the resolved absolute path must not, because the two
+// "target.yaml#comment" occurrences never refer to the same file.
+func TestResolveCoveredElsewhereSameSpellingDifferentTargetIsNotACycle(t *testing.T) {
+	root := t.TempDir()
+	groupA := filepath.Join(root, "a")
+	mustMkdirAll(t, groupA)
+	writeSkipReasonFixture(t, groupA, "target.yaml", `      - field: comment
+        value: "directly tested here"`)
+
+	// Simulate a prior hop that visited a DIFFERENT "target.yaml" (e.g. one
+	// resolved from groupB) by seeding the pre-fix raw-string key alone —
+	// deliberately NOT the resolved absolute path of groupA's target.yaml.
+	seen := map[string]bool{"target.yaml#comment": true}
+
+	if err := resolveCoveredElsewhere("origin", "target.yaml#comment", groupA, seen); err != nil {
+		t.Fatalf("expected no cycle for a spelling that resolves to an unvisited file, got: %v", err)
+	}
+}
+
+// TestResolveCoveredElsewhereDifferentSpellingSameTargetIsACycle is the
+// other half: two DIFFERENT by: spellings that resolve to the SAME absolute
+// file+field must still be caught as a cycle. seen is pre-populated with the
+// RESOLVED absolute path a prior hop reached; resolving a differently
+// spelled relative by: that lands on that same absolute path must fail.
+func TestResolveCoveredElsewhereDifferentSpellingSameTargetIsACycle(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "sub")
+	mustMkdirAll(t, sub)
+	resolvedTarget := filepath.Join(sub, "target.yaml")
+
+	seen := map[string]bool{resolvedTarget + "#comment": true}
+
+	// baseDir + "../sub/target.yaml" resolves to the exact same absolute
+	// path already in seen, despite the by: string never having been
+	// spelled "target.yaml#comment" before.
+	err := resolveCoveredElsewhere("origin", "../sub/target.yaml#comment", filepath.Join(root, "other"), seen)
+	if err == nil {
+		t.Fatal("expected a cycle error for a differently-spelled by: resolving to an already-visited file, got nil")
+	}
+	if !strings.Contains(err.Error(), "cycle") {
+		t.Errorf("err = %q, want it to name a cycle", err.Error())
 	}
 }
 

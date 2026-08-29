@@ -79,17 +79,18 @@ func CheckSkipReasons(m *manifest.Manifest, fields []FieldInfo) []SkipReasonFind
 // hop of a chain (see the recursive call below) so hop N resolves against
 // hop N-1's own directory, not against the origin manifest's.
 //
-// seen accumulates "<path>#<field>" keys across the whole chain starting
-// from originField's own by:; pass nil on the initial call.
+// seen accumulates resolved "<absolute-path>#<field>" keys across the whole
+// chain starting from originField's own by:. Keying on the RESOLVED target
+// rather than the raw by: string is load-bearing: the same by: spelling
+// resolves to a different file at every hop (baseDir changes hop to hop, see
+// above), so keying on the raw string either misses a genuine cycle spelled
+// two different ways, or — worse — reports a cycle between two hops that
+// happen to reuse the same relative spelling but resolve to different
+// files. Pass nil on the initial call.
 func resolveCoveredElsewhere(originField, by, baseDir string, seen map[string]bool) error {
 	if seen == nil {
 		seen = map[string]bool{}
 	}
-	if seen[by] {
-		return fmt.Errorf(
-			"skip: reason covered-elsewhere on %q has a cycle: %q is already in this chain", originField, by)
-	}
-	seen[by] = true
 
 	path, field, ok := strings.Cut(by, "#")
 	if !ok || path == "" || field == "" {
@@ -101,6 +102,14 @@ func resolveCoveredElsewhere(originField, by, baseDir string, seen map[string]bo
 	if !filepath.IsAbs(path) {
 		resolvedPath = filepath.Join(baseDir, path)
 	}
+	resolvedPath = filepath.Clean(resolvedPath)
+
+	key := resolvedPath + "#" + field
+	if seen[key] {
+		return fmt.Errorf(
+			"skip: reason covered-elsewhere on %q has a cycle: %q is already in this chain", originField, by)
+	}
+	seen[key] = true
 
 	target, err := manifest.Parse(resolvedPath)
 	if err != nil {

@@ -888,6 +888,15 @@ than declared here.
 | `fixture-missing` | `evidence:` and `ticket:` | no — both keys are checked for presence only |
 | `write-only` | none | no |
 
+`covered-elsewhere`'s `<path>` is resolved relative to the directory of the
+manifest that CONTAINS the `by:` reference — never the `validate` process's
+own working directory — the same rule this same annotation block's
+`uptest.upbound.io/post-assert-hook` path already follows. An absolute
+`<path>` is used as given. When `by:` itself points at a manifest whose own
+skip: entry is `covered-elsewhere`, each further hop resolves relative to
+the manifest that hop's own `by:` lives in, not relative to the original
+manifest that started the chain.
+
 ```yaml
 crossplane.io/update-test: |
   - field: allowList

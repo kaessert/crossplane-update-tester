@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -599,6 +600,20 @@ type Manifest struct {
 	// live cluster — see validator.CheckMergePatchSiblings. Nil when the
 	// manifest has no spec.forProvider at all.
 	ForProvider map[string]interface{}
+	// Path is the absolute filesystem path this manifest was parsed from,
+	// set by Parse. A manifest built directly (ParseBytes, or a literal
+	// &Manifest{} in a test) carries an empty Path — every resolution that
+	// consumes Path treats empty the same as "this process's own working
+	// directory", which is exactly the old, pre-manifest-relative
+	// behaviour.
+	//
+	// It is stored absolute rather than as the raw CLI argument so that a
+	// covered-elsewhere chain (see validator.resolveCoveredElsewhere)
+	// resolves identically regardless of which working directory the
+	// process was started from, or how many hops deep the chain runs — a
+	// relative Path would re-anchor at each hop to whatever the process
+	// CWD happened to be, not to the referring manifest's own directory.
+	Path string
 }
 
 // manifestDoc is the intermediate YAML structure for parsing.
@@ -624,7 +639,20 @@ func Parse(path string) (*Manifest, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading manifest: %w", err)
 	}
-	return ParseBytes(data)
+	m, err := ParseBytes(data)
+	if err != nil {
+		return nil, err
+	}
+	// Absolute so every later resolution anchored on m.Path (directly, or
+	// via filepath.Dir) is immune to a working-directory change that
+	// happens after this call returns — see the Path field's own doc
+	// comment for why that matters for a covered-elsewhere chain.
+	if abs, absErr := filepath.Abs(path); absErr == nil {
+		m.Path = abs
+	} else {
+		m.Path = path
+	}
+	return m, nil
 }
 
 // ParseBytes parses manifest YAML bytes.

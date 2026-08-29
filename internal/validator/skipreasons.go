@@ -2,6 +2,7 @@ package validator
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/kaessert/crossplane-update-tester/internal/manifest"
@@ -56,7 +57,7 @@ func CheckSkipReasons(m *manifest.Manifest, fields []FieldInfo) []SkipReasonFind
 				})
 			}
 		case manifest.SkipCoveredElsewhere:
-			if err := resolveCoveredElsewhere(t.Field, t.Skip.By, nil); err != nil {
+			if err := resolveCoveredElsewhere(t.Field, t.Skip.By, filepath.Dir(m.Path), nil); err != nil {
 				findings = append(findings, SkipReasonFinding{Field: t.Field, Detail: err.Error()})
 			}
 		}
@@ -70,9 +71,17 @@ func CheckSkipReasons(m *manifest.Manifest, fields []FieldInfo) []SkipReasonFind
 // in any form, or the chain revisits a "<path>#<field>" pair already seen —
 // a cycle.
 //
+// by's <path> is resolved relative to baseDir — the directory of the
+// manifest that CONTAINS this by: reference, never the update-tester
+// process's own working directory — exactly like this same annotation
+// block's uptest.upbound.io/post-assert-hook paths already are. An absolute
+// <path> is used as-is regardless of baseDir. baseDir is recomputed at every
+// hop of a chain (see the recursive call below) so hop N resolves against
+// hop N-1's own directory, not against the origin manifest's.
+//
 // seen accumulates "<path>#<field>" keys across the whole chain starting
 // from originField's own by:; pass nil on the initial call.
-func resolveCoveredElsewhere(originField, by string, seen map[string]bool) error {
+func resolveCoveredElsewhere(originField, by, baseDir string, seen map[string]bool) error {
 	if seen == nil {
 		seen = map[string]bool{}
 	}
@@ -88,7 +97,12 @@ func resolveCoveredElsewhere(originField, by string, seen map[string]bool) error
 			"skip: reason covered-elsewhere on %q: by: %q must be shaped \"<path>#<field>\"", originField, by)
 	}
 
-	target, err := manifest.Parse(path)
+	resolvedPath := path
+	if !filepath.IsAbs(path) {
+		resolvedPath = filepath.Join(baseDir, path)
+	}
+
+	target, err := manifest.Parse(resolvedPath)
 	if err != nil {
 		return fmt.Errorf("skip: reason covered-elsewhere on %q: resolving by: %q: %w", originField, by, err)
 	}
@@ -109,7 +123,7 @@ func resolveCoveredElsewhere(originField, by string, seen map[string]bool) error
 		return nil // directly tested — the chain resolves.
 	}
 	if !entry.Skip.Legacy && entry.Skip.Reason == manifest.SkipCoveredElsewhere {
-		return resolveCoveredElsewhere(originField, entry.Skip.By, seen)
+		return resolveCoveredElsewhere(originField, entry.Skip.By, filepath.Dir(target.Path), seen)
 	}
 	return fmt.Errorf(
 		"skip: reason covered-elsewhere on %q: %s is itself skipped (not directly tested)", originField, by)

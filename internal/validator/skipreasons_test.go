@@ -220,3 +220,148 @@ func TestCheckSkipReasonsIgnoresLegacyAndOtherReasons(t *testing.T) {
 		t.Errorf("expected no findings for legacy/vendor-defect/fixture-missing/write-only entries, got %+v", findings)
 	}
 }
+
+// TestCheckSkipReasonsCoveredElsewhereManifestRelative covers the defect
+// this resolution rule was rewritten to fix: a "by:" value written the way
+// every provider example manifest actually writes it — "../<sibling
+// dir>/<file>.yaml#field", relative to the manifest THAT CONTAINS the
+// reference — must resolve, exactly like a
+// uptest.upbound.io/post-assert-hook path in the same annotation block
+// already does. Before the fix, "by:" was resolved against the
+// update-tester process's own working directory instead, so this exact
+// shape failed whenever the process was not started from the referring
+// manifest's own directory.
+func TestCheckSkipReasonsCoveredElsewhereManifestRelative(t *testing.T) {
+	root := t.TempDir()
+	group1 := filepath.Join(root, "examples", "group1")
+	group2 := filepath.Join(root, "examples", "group2")
+	mustMkdirAll(t, group1)
+	mustMkdirAll(t, group2)
+
+	writeSkipReasonFixture(t, group2, "target.yaml", `      - field: comment
+        value: "already exercised here"`)
+	originPath := writeSkipReasonFixture(t, group1, "origin.yaml", `      - field: comment
+        skip:
+          reason: covered-elsewhere
+          by: ../group2/target.yaml#comment`)
+
+	m, err := manifest.Parse(originPath)
+	if err != nil {
+		t.Fatalf("parsing origin manifest: %v", err)
+	}
+
+	if findings := CheckSkipReasons(m, nil); len(findings) != 0 {
+		t.Fatalf("expected the manifest-relative by: to resolve cleanly, got %+v", findings)
+	}
+}
+
+// TestCheckSkipReasonsCoveredElsewhereIsCWDIndependent pins the specific
+// regression this rewrite closes: the SAME manifest, reached via two
+// differently-shaped relative arguments from two different process working
+// directories, must resolve identically. Before the fix, "by:" resolution
+// depended on the process's own working directory rather than on the
+// referring manifest's location, so this test would previously pass from
+// one of the two working directories and fail from the other — see the
+// resolveCoveredElsewhere doc comment for why manifest-relative resolution
+// removes that dependency.
+func TestCheckSkipReasonsCoveredElsewhereIsCWDIndependent(t *testing.T) {
+	root := t.TempDir()
+	group1 := filepath.Join(root, "examples", "group1")
+	group2 := filepath.Join(root, "examples", "group2")
+	mustMkdirAll(t, group1)
+	mustMkdirAll(t, group2)
+
+	writeSkipReasonFixture(t, group2, "target.yaml", `      - field: comment
+        value: "already exercised here"`)
+	writeSkipReasonFixture(t, group1, "origin.yaml", `      - field: comment
+        skip:
+          reason: covered-elsewhere
+          by: ../group2/target.yaml#comment`)
+
+	origWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getting starting working directory: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(origWD); err != nil {
+			t.Fatalf("restoring working directory to %s: %v", origWD, err)
+		}
+	})
+
+	cases := map[string]struct {
+		cwd     string
+		relPath string
+	}{
+		"FromRepoRoot":     {cwd: root, relPath: filepath.Join("examples", "group1", "origin.yaml")},
+		"FromExamplesDir":  {cwd: filepath.Join(root, "examples"), relPath: filepath.Join("group1", "origin.yaml")},
+		"FromReferringDir": {cwd: group1, relPath: "origin.yaml"},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if err := os.Chdir(tc.cwd); err != nil {
+				t.Fatalf("chdir to %s: %v", tc.cwd, err)
+			}
+			defer func() {
+				if err := os.Chdir(origWD); err != nil {
+					t.Fatalf("restoring working directory to %s: %v", origWD, err)
+				}
+			}()
+
+			m, err := manifest.Parse(tc.relPath)
+			if err != nil {
+				t.Fatalf("parsing %s from cwd %s: %v", tc.relPath, tc.cwd, err)
+			}
+			if findings := CheckSkipReasons(m, nil); len(findings) != 0 {
+				t.Fatalf("cwd=%s: expected no findings, got %+v", tc.cwd, findings)
+			}
+		})
+	}
+}
+
+// TestCheckSkipReasonsCoveredElsewhereChainResolvesPerHop pins the chain
+// half of the fix: hop N of a covered-elsewhere chain must resolve its own
+// by: relative to hop N-1's directory, not the origin manifest's. mid.yaml
+// sits one directory level deeper than origin.yaml relative to final.yaml,
+// so a by: value that (incorrectly) stayed anchored to origin.yaml's
+// directory for every hop would walk one level too far up and fail to find
+// final.yaml at all.
+func TestCheckSkipReasonsCoveredElsewhereChainResolvesPerHop(t *testing.T) {
+	root := t.TempDir()
+	aDir := filepath.Join(root, "group", "a")
+	bDir := filepath.Join(root, "group", "b")
+	cDir := filepath.Join(root, "c")
+	mustMkdirAll(t, aDir)
+	mustMkdirAll(t, bDir)
+	mustMkdirAll(t, cDir)
+
+	writeSkipReasonFixture(t, cDir, "final.yaml", `      - field: comment
+        value: "directly tested here"`)
+	writeSkipReasonFixture(t, bDir, "mid.yaml", `      - field: comment
+        skip:
+          reason: covered-elsewhere
+          by: ../../c/final.yaml#comment`)
+	originPath := writeSkipReasonFixture(t, aDir, "origin.yaml", `      - field: comment
+        skip:
+          reason: covered-elsewhere
+          by: ../b/mid.yaml#comment`)
+
+	m, err := manifest.Parse(originPath)
+	if err != nil {
+		t.Fatalf("parsing origin manifest: %v", err)
+	}
+
+	findings := CheckSkipReasons(m, nil)
+	if len(findings) != 0 {
+		t.Fatalf("expected the chain to resolve hop-by-hop, got %+v", findings)
+	}
+}
+
+// mustMkdirAll creates dir (and any missing parents), failing the test on
+// error.
+func mustMkdirAll(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("creating directory %s: %v", dir, err)
+	}
+}

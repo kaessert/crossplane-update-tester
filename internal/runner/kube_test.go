@@ -3,6 +3,7 @@ package runner
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -382,5 +383,79 @@ func TestCountEventsByReasonClientGoDoesNotCrossMatchNamespacedSibling(t *testin
 	if gotNamespaced != namespacedCount {
 		t.Errorf("namespaced: countEventsByReason() = %d, want %d (must not include the cluster-scoped sibling's %d)",
 			gotNamespaced, namespacedCount, clusterScopedCount)
+	}
+}
+
+// TestKubeBackendSelectionLineDiffersBetweenForcedAndDefault is the parity
+// proof's own precondition: a forced-exec Runner's recorded backend line
+// must be distinguishable from a default Runner's, or the record cannot
+// answer the question it exists for — which backend actually served a
+// given run.
+func TestKubeBackendSelectionLineDiffersBetweenForcedAndDefault(t *testing.T) {
+	forced := kubeBackendSelectionLine(true, false)
+	fallback := kubeBackendSelectionLine(false, true)
+	deflt := kubeBackendSelectionLine(false, false)
+
+	if forced == deflt {
+		t.Fatalf("forced-exec and default lines are identical: %q", forced)
+	}
+	if forced == fallback {
+		t.Fatalf("forced-exec and test-harness-fallback lines are identical: %q", forced)
+	}
+	if fallback == deflt {
+		t.Fatalf("test-harness-fallback and default lines are identical: %q", fallback)
+	}
+	if !strings.Contains(forced, kubeBackendEnvVar) {
+		t.Errorf("forced-exec line = %q, want it to name %s", forced, kubeBackendEnvVar)
+	}
+}
+
+// TestKubeLogsBackendSelectionOncePerRunner proves kube() records its
+// backend choice to stderr exactly once per Runner, no matter how many
+// times kube() is subsequently called — a full catalog run calls it on the
+// order of a thousand times for event reads alone (see
+// kubeBackendLogOnce), and the review that motivated this record needs the
+// line to be a single reliable marker, not one buried in a thousand
+// duplicates.
+func TestKubeLogsBackendSelectionOncePerRunner(t *testing.T) {
+	t.Setenv(kubeBackendEnvVar, "exec")
+	r := &Runner{execFunc: func(args []string) (string, error) { return "", nil }}
+
+	out := captureOSStderr(t, func() {
+		for i := 0; i < 5; i++ {
+			if _, err := r.kube().ListEventsForObject(testKindExample, testNameExample, ""); err != nil {
+				t.Fatalf("call %d: unexpected error: %v", i, err)
+			}
+		}
+	})
+
+	if got := strings.Count(out, "kube backend:"); got != 1 {
+		t.Fatalf("kube backend line appeared %d time(s) across 5 kube() calls on one Runner, want exactly 1:\n%s", got, out)
+	}
+	if !strings.Contains(out, "forced by "+kubeBackendEnvVar+"=exec") {
+		t.Errorf("logged line = %q, want it to say the choice was forced by %s", out, kubeBackendEnvVar)
+	}
+}
+
+// TestKubeLogsClientGoBackendByDefault proves the default (unforced,
+// non-test-fallback) Runner's recorded line names the client-go backend,
+// mirroring TestRunnerKubeDefaultsToClientGoForEvents but asserting on the
+// record rather than on which func got called.
+func TestKubeLogsClientGoBackendByDefault(t *testing.T) {
+	r := &Runner{
+		kubeClientsetFunc: func() (kubernetes.Interface, error) { return fake.NewSimpleClientset(), nil },
+	}
+
+	out := captureOSStderr(t, func() {
+		if _, err := r.kube().ListEventsForObject(testKindExample, testNameExample, ""); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	if !strings.Contains(out, "client-go") {
+		t.Errorf("logged line = %q, want it to name the client-go backend", out)
+	}
+	if strings.Contains(out, "forced by") {
+		t.Errorf("logged line = %q, an unforced default Runner must not claim to be forced", out)
 	}
 }

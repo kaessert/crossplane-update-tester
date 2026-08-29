@@ -112,6 +112,12 @@ type Runner struct {
 	// inject a fake clientset constructor here; production code leaves it
 	// nil and goClientset builds one from the ambient kubeconfig.
 	kubeClientsetFunc func() (kubernetes.Interface, error)
+
+	// kubeBackendLogOnce guards the one-line record of which KubeClient
+	// backend this Runner resolved to (see kube()) so a full catalog run
+	// — which calls kube() on the order of a thousand times for event
+	// reads alone — emits that record exactly once, not once per call.
+	kubeBackendLogOnce sync.Once
 }
 
 // sleep waits d, calling sleepFunc instead of time.Sleep when a test has

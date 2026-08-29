@@ -248,13 +248,37 @@ func (r *Runner) goClientset() (kubernetes.Interface, error) {
 //     production behaviour), built from kubeClientsetFunc when a test has
 //     set one, or from the ambient kubeconfig otherwise. Every other
 //     operation still delegates to the embedded exec backend.
+//
+// Whichever branch is taken, the choice is recorded to stderr exactly once
+// per Runner (see kubeBackendLogOnce) — a parity run comparing the exec and
+// client-go backends is otherwise unverifiable from its own output: a run
+// where the env var never reached the process produces artifacts
+// indistinguishable from one where it did.
 func (r *Runner) kube() KubeClient {
 	exec := &execKubeClient{r: r}
-	if os.Getenv(kubeBackendEnvVar) == "exec" {
-		return exec
-	}
-	if r.execFunc != nil && r.kubeClientsetFunc == nil {
+	forcedExec := os.Getenv(kubeBackendEnvVar) == "exec"
+	execFallback := !forcedExec && r.execFunc != nil && r.kubeClientsetFunc == nil
+	r.kubeBackendLogOnce.Do(func() {
+		fmt.Fprintln(os.Stderr, "    "+kubeBackendSelectionLine(forcedExec, execFallback))
+	})
+	if forcedExec || execFallback {
 		return exec
 	}
 	return &clientGoKubeClient{execKubeClient: exec, clientset: r.goClientset}
+}
+
+// kubeBackendSelectionLine formats the one-line record kube() emits, naming
+// which operation(s) each backend serves and whether kubeBackendEnvVar
+// forced the choice. It is a standalone function, rather than inlined into
+// kube(), so a unit test can assert on its output directly instead of
+// parsing captured stderr text out of a live Runner.
+func kubeBackendSelectionLine(forcedExec, execFallback bool) string {
+	switch {
+	case forcedExec:
+		return fmt.Sprintf("kube backend: exec (all operations — forced by %s=exec)", kubeBackendEnvVar)
+	case execFallback:
+		return "kube backend: exec (all operations — test harness has no client-go override)"
+	default:
+		return "kube backend: client-go (event list), exec (all other operations)"
+	}
 }

@@ -19,6 +19,8 @@ import (
 	"sync"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/kaessert/crossplane-update-tester/internal/differ"
@@ -112,6 +114,36 @@ type Runner struct {
 	// inject a fake clientset constructor here; production code leaves it
 	// nil and goClientset builds one from the ambient kubeconfig.
 	kubeClientsetFunc func() (kubernetes.Interface, error)
+
+	// kubeDynamicOnce, kubeDynamic and kubeDynamicErr memoize the dynamic
+	// client the client-go KubeClient backend uses to read a resource with
+	// no compiled-in Go type — a provider CR, exactly like the managed
+	// resource GetObjectJSON's own call site reads (see goDynamicClient).
+	kubeDynamicOnce sync.Once
+	kubeDynamic     dynamic.Interface
+	kubeDynamicErr  error
+
+	// kubeDynamicFunc, when set, overrides goDynamicClient the same way
+	// kubeClientsetFunc overrides goClientset. Tests inject a fake dynamic
+	// client constructor here; production code leaves it nil and
+	// goDynamicClient builds one from the ambient kubeconfig.
+	kubeDynamicFunc func() (dynamic.Interface, error)
+
+	// restMapperOnce, kubeRESTMapper and kubeRESTMapperErr memoize the
+	// discovery-backed RESTMapper the client-go KubeClient backend uses to
+	// resolve a kubectl `-o name` resource/group pair into a full
+	// GroupVersionResource — built at most once per Runner, since the
+	// discovery round trip behind it is the ~16ms-per-call cost
+	// GetObjectJSON's migration exists to remove (see restMapper).
+	restMapperOnce    sync.Once
+	kubeRESTMapper    meta.RESTMapper
+	kubeRESTMapperErr error
+
+	// restMapperFunc, when set, overrides the discovery-based construction
+	// restMapper() otherwise performs. Unlike kubeClientsetFunc/
+	// kubeDynamicFunc, this override is invoked FROM INSIDE restMapperOnce
+	// rather than as a bypass — see restMapper's doc comment for why.
+	restMapperFunc func() (meta.RESTMapper, error)
 
 	// kubeBackendLogOnce guards the one-line record of which KubeClient
 	// backend this Runner resolved to (see kube()) so a full catalog run

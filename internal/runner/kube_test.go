@@ -4,12 +4,23 @@ import (
 	"encoding/json"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/discovery/cached/memory"
+	discoveryfake "k8s.io/client-go/discovery/fake"
+	"k8s.io/client-go/dynamic"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/restmapper"
 	ktesting "k8s.io/client-go/testing"
 )
 
@@ -457,5 +468,327 @@ func TestKubeLogsClientGoBackendByDefault(t *testing.T) {
 	}
 	if strings.Contains(out, "forced by") {
 		t.Errorf("logged line = %q, an unforced default Runner must not claim to be forced", out)
+	}
+}
+
+// testGVRGroup, testGVRVersion and testGVRResource are the group, version
+// and properly pluralized resource name GetObjectJSON's client-go backend
+// resolves testKindExample's kubectl `-o name` type segment to — distinct
+// from the generic "name" fixture the argv-equivalence tests above use,
+// which is never resolved against a real RESTMapper.
+const (
+	testGVRGroup    = "example.crossplane.io"
+	testGVRVersion  = "v1alpha1"
+	testGVRResource = "exampleresources"
+)
+
+// testGetObjectName is the kubectl `-o name` identifier GetObjectJSON's
+// tests below resolve through a RESTMapper into testGVR.
+var testGetObjectName = testGVRResource + "." + testGVRGroup + "/" + testNameExample
+
+// testGVR is the fully-resolved GroupVersionResource testGetObjectName maps
+// to, shared by every test below that needs a working RESTMapper stand-in.
+var testGVR = schema.GroupVersionResource{Group: testGVRGroup, Version: testGVRVersion, Resource: testGVRResource}
+
+// newTestUnstructuredExample builds an unstructured object matching
+// testKindExample/testGVRGroup/testGVRVersion, for seeding a fake dynamic
+// client. namespace == "" builds a cluster-scoped object.
+func newTestUnstructuredExample(namespace, name, atProviderField string) *unstructured.Unstructured {
+	metadata := map[string]interface{}{"name": name}
+	if namespace != "" {
+		metadata["namespace"] = namespace
+	}
+	return &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": testGVRGroup + "/" + testGVRVersion,
+		"kind":       testKindExample,
+		"metadata":   metadata,
+		"status": map[string]interface{}{
+			"atProvider": map[string]interface{}{"field": atProviderField},
+		},
+	}}
+}
+
+// fakeRESTMapper is a minimal meta.RESTMapper stand-in for tests that only
+// exercise ResourceFor — the sole method resourceGVR calls. Every other
+// method panics: a test that reaches one has exercised a resolution path
+// this migration does not use.
+type fakeRESTMapper struct {
+	gvr schema.GroupVersionResource
+	err error
+}
+
+func (m *fakeRESTMapper) ResourceFor(schema.GroupVersionResource) (schema.GroupVersionResource, error) {
+	return m.gvr, m.err
+}
+
+func (m *fakeRESTMapper) KindFor(schema.GroupVersionResource) (schema.GroupVersionKind, error) {
+	panic("KindFor: not used by the GetObjectJSON migration")
+}
+
+func (m *fakeRESTMapper) KindsFor(schema.GroupVersionResource) ([]schema.GroupVersionKind, error) {
+	panic("KindsFor: not used by the GetObjectJSON migration")
+}
+
+func (m *fakeRESTMapper) ResourcesFor(schema.GroupVersionResource) ([]schema.GroupVersionResource, error) {
+	panic("ResourcesFor: not used by the GetObjectJSON migration")
+}
+
+func (m *fakeRESTMapper) RESTMapping(schema.GroupKind, ...string) (*meta.RESTMapping, error) {
+	panic("RESTMapping: not used by the GetObjectJSON migration")
+}
+
+func (m *fakeRESTMapper) RESTMappings(schema.GroupKind, ...string) ([]*meta.RESTMapping, error) {
+	panic("RESTMappings: not used by the GetObjectJSON migration")
+}
+
+func (m *fakeRESTMapper) ResourceSingularizer(string) (string, error) {
+	panic("ResourceSingularizer: not used by the GetObjectJSON migration")
+}
+
+// TestGetObjectJSONResolvesGVRAndReadsViaDynamicClient proves the DEFAULT
+// routing (no env var, no execFunc) serves GetObjectJSON through the
+// client-go backend: the kubectl `-o name` identifier is resolved to a GVR
+// via the RESTMapper, and the dynamic Get is issued against the BARE object
+// name (never the "type/name" string, which is not a valid API object
+// name) scoped to the caller's namespace exactly — empty for cluster-scoped,
+// never a guessed default.
+func TestGetObjectJSONResolvesGVRAndReadsViaDynamicClient(t *testing.T) {
+	cases := map[string]struct {
+		reason    string
+		namespace string
+	}{
+		"cluster-scoped": {
+			reason:    "a cluster-scoped read passes namespace through as the empty string",
+			namespace: "",
+		},
+		"namespaced": {
+			reason:    "a namespaced read scopes the dynamic Get to the caller's namespace",
+			namespace: testNamespaceExample,
+		},
+	}
+
+	for tn, tc := range cases {
+		t.Run(tn, func(t *testing.T) {
+			obj := newTestUnstructuredExample(tc.namespace, testNameExample, "resolved-via-client-go")
+			dynClient := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), obj)
+
+			r := &Runner{
+				restMapperFunc:  func() (meta.RESTMapper, error) { return &fakeRESTMapper{gvr: testGVR}, nil },
+				kubeDynamicFunc: func() (dynamic.Interface, error) { return dynClient, nil },
+			}
+
+			out, err := r.kube().GetObjectJSON(tc.namespace, testGetObjectName)
+			if err != nil {
+				t.Fatalf("%s: unexpected error: %v", tc.reason, err)
+			}
+
+			var got map[string]interface{}
+			if err := json.Unmarshal([]byte(out), &got); err != nil {
+				t.Fatalf("%s: decoding GetObjectJSON output: %v", tc.reason, err)
+			}
+			metadata, _ := got["metadata"].(map[string]interface{})
+			if metadata["name"] != testNameExample {
+				t.Errorf("%s: metadata.name = %v, want %q", tc.reason, metadata["name"], testNameExample)
+			}
+
+			var getAction ktesting.GetAction
+			for _, action := range dynClient.Actions() {
+				if a, ok := action.(ktesting.GetAction); ok {
+					getAction = a
+				}
+			}
+			if getAction == nil {
+				t.Fatalf("%s: no Get action recorded against the fake dynamic client", tc.reason)
+			}
+			if getAction.GetName() != testNameExample {
+				t.Errorf("%s: dynamic Get name = %q, want the BARE object name %q, not the type/name identifier",
+					tc.reason, getAction.GetName(), testNameExample)
+			}
+			if getAction.GetNamespace() != tc.namespace {
+				t.Errorf("%s: dynamic Get namespace = %q, want %q", tc.reason, getAction.GetNamespace(), tc.namespace)
+			}
+			if getAction.GetResource() != testGVR {
+				t.Errorf("%s: dynamic Get GVR = %#v, want %#v", tc.reason, getAction.GetResource(), testGVR)
+			}
+		})
+	}
+}
+
+// TestGetObjectJSONExecAndClientGoAgreeOnDecodedMap is the AC's load-bearing
+// parity proof: for the SAME logical object, the exec backend (parsing
+// canned kubectl JSON) and the client-go backend (parsing a dynamic Get's
+// unstructured result, marshalled back to JSON) must decode to the
+// IDENTICAL map[string]interface{} — never compared as bytes, since
+// Runner.GetObject unmarshals immediately and field ordering carries no
+// meaning to any caller.
+func TestGetObjectJSONExecAndClientGoAgreeOnDecodedMap(t *testing.T) {
+	const execJSON = `{"apiVersion":"example.crossplane.io/v1alpha1","kind":"ExampleResource","metadata":{"name":"example-resource","namespace":"default"},"status":{"atProvider":{"field":"parity-value"}}}`
+
+	// Exec path: canned kubectl JSON, forced onto the exec backend via the
+	// escape hatch so this Runner's default routing cannot mask the
+	// comparison.
+	t.Setenv(kubeBackendEnvVar, "exec")
+	execRunner := &Runner{execFunc: func(args []string) (string, error) { return execJSON, nil }}
+	execOut, err := execRunner.kube().GetObjectJSON(testNamespaceExample, testGetObjectName)
+	if err != nil {
+		t.Fatalf("exec path: unexpected error: %v", err)
+	}
+	var execDecoded map[string]interface{}
+	if err := json.Unmarshal([]byte(execOut), &execDecoded); err != nil {
+		t.Fatalf("exec path: decoding: %v", err)
+	}
+
+	// client-go path: the same logical object, seeded into a fake dynamic
+	// client — no env var, proving the DEFAULT routing serves this.
+	t.Setenv(kubeBackendEnvVar, "")
+	obj := newTestUnstructuredExample(testNamespaceExample, testNameExample, "parity-value")
+	goRunner := &Runner{
+		restMapperFunc: func() (meta.RESTMapper, error) { return &fakeRESTMapper{gvr: testGVR}, nil },
+		kubeDynamicFunc: func() (dynamic.Interface, error) {
+			return dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), obj), nil
+		},
+	}
+	goOut, err := goRunner.kube().GetObjectJSON(testNamespaceExample, testGetObjectName)
+	if err != nil {
+		t.Fatalf("client-go path: unexpected error: %v", err)
+	}
+	var goDecoded map[string]interface{}
+	if err := json.Unmarshal([]byte(goOut), &goDecoded); err != nil {
+		t.Fatalf("client-go path: decoding: %v", err)
+	}
+
+	if !reflect.DeepEqual(execDecoded, goDecoded) {
+		t.Errorf("exec and client-go paths disagree for the same logical object:\n exec     = %#v\n client-go = %#v", execDecoded, goDecoded)
+	}
+}
+
+// TestGetObjectJSONSurfacesNotFoundAsError proves a not-found read reaches
+// the caller as a non-nil error — exactly how kubectl's non-zero exit on a
+// missing resource reaches Runner.GetObject's callers today. No caller
+// inspects the error's text or type for this operation (unlike
+// ResolveManifestName's disambiguation logic), so "returns a non-nil error"
+// is the entire preserved contract.
+func TestGetObjectJSONSurfacesNotFoundAsError(t *testing.T) {
+	dynClient := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme())
+	dynClient.PrependReactor("get", testGVRResource, func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewNotFound(schema.GroupResource{Group: testGVRGroup, Resource: testGVRResource}, testNameExample)
+	})
+
+	r := &Runner{
+		restMapperFunc:  func() (meta.RESTMapper, error) { return &fakeRESTMapper{gvr: testGVR}, nil },
+		kubeDynamicFunc: func() (dynamic.Interface, error) { return dynClient, nil },
+	}
+
+	if _, err := r.kube().GetObjectJSON(testNamespaceExample, testGetObjectName); err == nil {
+		t.Fatal("GetObjectJSON() error = nil for a not-found read, want a non-nil error")
+	}
+}
+
+// TestRunnerKubeBackendEnvVarForcesExecForGetObjectJSONSpecifically proves
+// UPDATE_TESTER_KUBE_BACKEND=exec forces GetObjectJSON specifically back
+// onto the exec backend, mirroring
+// TestRunnerKubeBackendEnvVarForcesExec but for the operation this ticket
+// migrates rather than event listing.
+func TestRunnerKubeBackendEnvVarForcesExecForGetObjectJSONSpecifically(t *testing.T) {
+	t.Setenv(kubeBackendEnvVar, "exec")
+
+	execCalled := false
+	mapperCalled := false
+	dynamicCalled := false
+	r := &Runner{
+		execFunc: func(args []string) (string, error) {
+			execCalled = true
+			return `{"status":{}}`, nil
+		},
+		restMapperFunc: func() (meta.RESTMapper, error) {
+			mapperCalled = true
+			return &fakeRESTMapper{gvr: testGVR}, nil
+		},
+		kubeDynamicFunc: func() (dynamic.Interface, error) {
+			dynamicCalled = true
+			return dynamicfake.NewSimpleDynamicClient(runtime.NewScheme()), nil
+		},
+	}
+
+	if _, err := r.kube().GetObjectJSON(testNamespaceExample, testGetObjectName); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !execCalled {
+		t.Error("execFunc was not invoked; UPDATE_TESTER_KUBE_BACKEND=exec did not force the exec backend for GetObjectJSON")
+	}
+	if mapperCalled || dynamicCalled {
+		t.Error("restMapperFunc/kubeDynamicFunc were invoked; UPDATE_TESTER_KUBE_BACKEND=exec must bypass the client-go backend entirely")
+	}
+}
+
+// TestRESTMapperResolvedAtMostOncePerRunner is the AC's memoization proof:
+// a Runner backed by a REAL discovery-based RESTMapper (a fake discovery
+// client wrapped exactly the way production code wraps one) answers TWO
+// GetObjectJSON calls with exactly ONE discovery round trip — proving the
+// RESTMapper itself, not merely restMapperFunc's return value, is built at
+// most once per Runner. Un-memoized, a second GetObjectJSON call would
+// construct a fresh DeferredDiscoveryRESTMapper with a cold cache and
+// re-pay the discovery round trip this migration exists to remove.
+func TestRESTMapperResolvedAtMostOncePerRunner(t *testing.T) {
+	fakeClientset := fake.NewSimpleClientset()
+	fakeDisc, ok := fakeClientset.Discovery().(*discoveryfake.FakeDiscovery)
+	if !ok {
+		t.Fatalf("fake clientset Discovery() is %T, want *discoveryfake.FakeDiscovery", fakeClientset.Discovery())
+	}
+	fakeDisc.Resources = []*metav1.APIResourceList{
+		{
+			GroupVersion: testGVRGroup + "/" + testGVRVersion,
+			APIResources: []metav1.APIResource{
+				{Name: testGVRResource, Namespaced: false, Kind: testKindExample, SingularName: "exampleresource"},
+			},
+		},
+	}
+
+	var restMapperBuilds int32
+	obj := newTestUnstructuredExample("", testNameExample, "memoized")
+	r := &Runner{
+		restMapperFunc: func() (meta.RESTMapper, error) {
+			atomic.AddInt32(&restMapperBuilds, 1)
+			return restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(fakeDisc)), nil
+		},
+		kubeDynamicFunc: func() (dynamic.Interface, error) {
+			return dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), obj), nil
+		},
+	}
+
+	if _, err := r.kube().GetObjectJSON("", testGetObjectName); err != nil {
+		t.Fatalf("first GetObjectJSON: unexpected error: %v", err)
+	}
+	if _, err := r.kube().GetObjectJSON("", testGetObjectName); err != nil {
+		t.Fatalf("second GetObjectJSON: unexpected error: %v", err)
+	}
+
+	if got := atomic.LoadInt32(&restMapperBuilds); got != 1 {
+		t.Errorf("restMapperFunc invoked %d time(s) across 2 GetObjectJSON calls on the same Runner, want exactly 1", got)
+	}
+
+	var discoveryRoundTrips int
+	for _, action := range fakeClientset.Actions() {
+		if action.GetResource().Resource == "group" || action.GetResource().Resource == "resource" {
+			discoveryRoundTrips++
+		}
+	}
+	// ServerGroupsAndResources issues exactly 2 recorded actions per round
+	// trip (one for "group", one for "resource" — see FakeDiscovery). A
+	// second GetObjectJSON call recording MORE than that is a second
+	// discovery round trip, the exact defect this test exists to catch.
+	if discoveryRoundTrips != 2 {
+		t.Errorf("fake discovery client recorded %d discovery action(s) across 2 GetObjectJSON calls, want exactly 2 (one round trip) — a higher count means the RESTMapper was rebuilt per call", discoveryRoundTrips)
+	}
+}
+
+// TestResourceGVRRejectsNameWithNoTypeSegment proves resourceGVR reports an
+// error rather than resolving garbage when handed a bare name with no
+// "type/name" structure — a defensive check against a future call site that
+// does not go through Runner.resourceName's kubectl `-o name` convention.
+func TestResourceGVRRejectsNameWithNoTypeSegment(t *testing.T) {
+	c := &clientGoKubeClient{execKubeClient: &execKubeClient{r: &Runner{}}}
+	if _, err := c.resourceGVR(testNameExample); err == nil {
+		t.Fatal("resourceGVR() error = nil for a name with no type segment, want a non-nil error")
 	}
 }

@@ -5,10 +5,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/discovery/cached/memory"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
@@ -21,7 +28,11 @@ import (
 // it off a shared field, because the backend has no notion of "the current
 // Runner" to read it from.
 type KubeClient interface {
-	// GetObjectJSON returns the full resource, rendered as JSON.
+	// GetObjectJSON returns the full resource, rendered as JSON. name is a
+	// kubectl `-o name` identifier — "<plural-resource>[.<group>]/<name>",
+	// e.g. "dnsviews.dns.infoblox.crossplane.io/example" for a custom
+	// resource or "secrets/example" for a core-group one — never a bare
+	// object name.
 	GetObjectJSON(namespace, name string) (string, error)
 
 	// ResolveManifestName resolves a manifest FILE to the resource name(s)
@@ -162,16 +173,17 @@ func eventFieldSelector(kind, name, namespace string) string {
 // leaves every other operation on the exec backend.
 const kubeBackendEnvVar = "UPDATE_TESTER_KUBE_BACKEND"
 
-// clientGoKubeClient overrides ONLY event listing with a direct,
-// field-selected client-go List call. Every other KubeClient operation is
-// promoted from the embedded exec backend unchanged — this type exists to
-// migrate exactly one operation at a time, not to grow into a second full
-// backend. A shared informer or watch cache is deliberately NOT used here:
-// the evidence check this feeds is a before/after delta on the same
+// clientGoKubeClient overrides event listing and resource reads with direct
+// client-go calls. Every other KubeClient operation is promoted from the
+// embedded exec backend unchanged — this type exists to migrate one
+// operation at a time, not to grow into a second full backend. A shared
+// informer or watch cache is deliberately NOT used for either override: the
+// evidence check event listing feeds is a before/after delta on the same
 // object, and a lagging cache would return a stale second read and
-// manufacture a false negative. clientset is a func rather than a stored
-// value so it can be resolved lazily (a Runner is often built before a
-// kubeconfig is needed) and overridden by tests.
+// manufacture a false negative — the same hazard applies to a resource read
+// used for the same before/after comparison. clientset is a func rather
+// than a stored value so it can be resolved lazily (a Runner is often built
+// before a kubeconfig is needed) and overridden by tests.
 type clientGoKubeClient struct {
 	*execKubeClient
 	clientset func() (kubernetes.Interface, error)
@@ -230,6 +242,135 @@ func (r *Runner) goClientset() (kubernetes.Interface, error) {
 	return r.kubeClientset, r.kubeClientsetErr
 }
 
+// goDynamicClient returns the dynamic client the client-go KubeClient
+// backend uses to read objects with no compiled-in Go type — every
+// provider CR this tool reads is one of these. Built from the same ambient
+// kubeconfig resolution goClientset uses. kubeDynamicFunc, when set,
+// overrides this for tests, exactly like kubeClientsetFunc overrides
+// goClientset: constructing a dynamic client carries no discovery cost of
+// its own, so — unlike restMapper below — there is nothing to prove
+// memoized here, and the override bypasses the Once the same way
+// kubeClientsetFunc does.
+func (r *Runner) goDynamicClient() (dynamic.Interface, error) {
+	if r.kubeDynamicFunc != nil {
+		return r.kubeDynamicFunc()
+	}
+	r.kubeDynamicOnce.Do(func() {
+		cfg, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+			clientcmd.NewDefaultClientConfigLoadingRules(),
+			&clientcmd.ConfigOverrides{},
+		).ClientConfig()
+		if err != nil {
+			r.kubeDynamicErr = fmt.Errorf("resolving kubeconfig: %w", err)
+			return
+		}
+		dyn, err := dynamic.NewForConfig(cfg)
+		if err != nil {
+			r.kubeDynamicErr = fmt.Errorf("building dynamic client: %w", err)
+			return
+		}
+		r.kubeDynamic = dyn
+	})
+	return r.kubeDynamic, r.kubeDynamicErr
+}
+
+// restMapper returns the discovery-backed RESTMapper the client-go
+// KubeClient backend uses to resolve a kubectl `-o name` resource/group
+// pair into a full GroupVersionResource, built at most once per Runner.
+//
+// Unlike goClientset/goDynamicClient, restMapperFunc (when set) is called
+// FROM INSIDE restMapperOnce rather than bypassing it: a discovery round
+// trip — not just a kubeconfig read — is the cost this memoization exists
+// to remove, so the test proving "resolved at most once" needs the override
+// itself gated by the same Once production code runs through, or the test
+// would only prove the override function is cheap to call, never that a
+// second logical call is actually skipped.
+func (r *Runner) restMapper() (meta.RESTMapper, error) {
+	r.restMapperOnce.Do(func() {
+		if r.restMapperFunc != nil {
+			r.kubeRESTMapper, r.kubeRESTMapperErr = r.restMapperFunc()
+			return
+		}
+		cfg, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+			clientcmd.NewDefaultClientConfigLoadingRules(),
+			&clientcmd.ConfigOverrides{},
+		).ClientConfig()
+		if err != nil {
+			r.kubeRESTMapperErr = fmt.Errorf("resolving kubeconfig for discovery: %w", err)
+			return
+		}
+		dc, err := discovery.NewDiscoveryClientForConfig(cfg)
+		if err != nil {
+			r.kubeRESTMapperErr = fmt.Errorf("building discovery client: %w", err)
+			return
+		}
+		r.kubeRESTMapper = restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(dc))
+	})
+	return r.kubeRESTMapper, r.kubeRESTMapperErr
+}
+
+// resourceGVR resolves a kubectl `-o name` identifier's TYPE segment —
+// "<plural-resource>.<group>" for a custom resource, or a bare
+// "<plural-resource>" for a core-group one — into a full
+// GroupVersionResource via the memoized RESTMapper. The type segment never
+// carries a Version, exactly like `kubectl get <type>/<name>` never names
+// one either: ResourceFor resolves the served version from discovery the
+// same way kubectl's own discovery-backed resolution does, which is
+// correct for a custom resource served by an unaggregated CRD — its
+// resource/group pair maps to exactly one registered GroupVersionResource,
+// with no typed Go client involved anywhere in the resolution.
+func (c *clientGoKubeClient) resourceGVR(resourceName string) (schema.GroupVersionResource, error) {
+	resourceType := resourceTypeOf(resourceName)
+	if resourceType == "" {
+		return schema.GroupVersionResource{}, fmt.Errorf(
+			"resolving %q: no type segment (expected <resource>[.<group>]/<name>)", resourceName)
+	}
+	resource, group := resourceType, ""
+	if idx := strings.Index(resourceType, "."); idx != -1 {
+		resource, group = resourceType[:idx], resourceType[idx+1:]
+	}
+	mapper, err := c.r.restMapper()
+	if err != nil {
+		return schema.GroupVersionResource{}, fmt.Errorf("resolving RESTMapper: %w", err)
+	}
+	gvr, err := mapper.ResourceFor(schema.GroupVersionResource{Group: group, Resource: resource})
+	if err != nil {
+		return schema.GroupVersionResource{}, fmt.Errorf("mapping %q to a GroupVersionResource: %w", resourceType, err)
+	}
+	return gvr, nil
+}
+
+// GetObjectJSON reads name (a kubectl `-o name` identifier) with a direct
+// dynamic Get — never an informer, a watch cache, or any other client that
+// could serve a stale read — and marshals the result straight back to
+// JSON. unstructured.Unstructured's JSON encoding is exactly the object's
+// own apiVersion/kind/metadata/spec/status shape, the same shape
+// GetObject's json.Unmarshal already expects from the exec backend, so no
+// caller-visible contract changes. A not-found read or any other API error
+// is returned as a non-nil error, unwrapped into no special case: that is
+// exactly how a kubectl non-zero exit reaches this method's caller today,
+// and every existing caller (GetObject, and everything built on it) already
+// treats a non-nil error as failure without inspecting its text.
+func (c *clientGoKubeClient) GetObjectJSON(namespace, name string) (string, error) {
+	gvr, err := c.resourceGVR(name)
+	if err != nil {
+		return "", err
+	}
+	dyn, err := c.r.goDynamicClient()
+	if err != nil {
+		return "", fmt.Errorf("resolving dynamic client: %w", err)
+	}
+	obj, err := dyn.Resource(gvr).Namespace(namespace).Get(context.Background(), objectNameOf(name), metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("getting %s via client-go: %w", name, err)
+	}
+	data, err := json.Marshal(obj)
+	if err != nil {
+		return "", fmt.Errorf("marshalling client-go object: %w", err)
+	}
+	return string(data), nil
+}
+
 // kube returns the KubeClient backend for this Runner. It is a method
 // rather than a field populated at construction so a Runner built as a bare
 // struct literal — every existing test constructs one this way, setting
@@ -244,9 +385,10 @@ func (r *Runner) goClientset() (kubernetes.Interface, error) {
 //     would silently bypass that fake — no kubeconfig exists under test —
 //     rather than exercising it, so it stays on the exec backend it was
 //     already wired for.
-//  3. Otherwise: the client-go backend for event listing (the default,
-//     production behaviour), built from kubeClientsetFunc when a test has
-//     set one, or from the ambient kubeconfig otherwise. Every other
+//  3. Otherwise: the client-go backend for event listing and resource
+//     reads (the default, production behaviour), built from
+//     kubeClientsetFunc/kubeDynamicFunc/restMapperFunc when a test has set
+//     them, or from the ambient kubeconfig otherwise. Every other
 //     operation still delegates to the embedded exec backend.
 //
 // Whichever branch is taken, the choice is recorded to stderr exactly once
@@ -279,6 +421,6 @@ func kubeBackendSelectionLine(forcedExec, execFallback bool) string {
 	case execFallback:
 		return "kube backend: exec (all operations — test harness has no client-go override)"
 	default:
-		return "kube backend: client-go (event list), exec (all other operations)"
+		return "kube backend: client-go (event list, resource read), exec (all other operations)"
 	}
 }

@@ -903,7 +903,7 @@ three top-level directive lines: `converge-skip:`, `assert-unchanged:` and
 | `field` | Required. Field name under `spec.forProvider`; dot-separated for nested fields. |
 | `value` | The value to patch in. Required unless `skip` is set — but "required" means the `value:` key must be PRESENT, not non-null: an explicit `value: null` (or a bare `value:` with nothing after the colon) is accepted as a deliberate whole-field tombstone in its own right, distinct from the key being absent entirely — see "Whole-field tombstones without a sibling field" below. |
 | `expect` | Optional. The value expected in `status.atProvider` when the backend normalises what it stores. Defaults to `value`. |
-| `skip` | Optional. One of three shapes: a free-prose string (the legacy form, reported as `SKIPPED` and credited under `validate`'s `skipped-unstructured` status); a structured mapping with a `reason:` from a closed set (reported as `SKIPPED` and credited under `validate`'s `skipped` status — see "`skip:` reasons" below); or a structured mapping with a `legacy:` key carrying that same free prose, used instead of a bare string only when a `disposition:` needs to be attached alongside it (reported the same as the free-prose form). `legacy:` and `reason:` are mutually exclusive within one mapping. Every shape still counts as coverage for `validate`. |
+| `skip` | Optional. One of three shapes: a free-prose string (the legacy form, reported as `SKIPPED` and credited under `validate`'s `skipped-unstructured` status); a structured mapping with a `reason:` from a closed set (reported as `SKIPPED` and credited under `validate`'s `skipped` status — see "`skip:` reasons" below); or a structured mapping with a `legacy:` key carrying that same free prose, used instead of a bare string only when a `disposition:` needs to be attached alongside it (reported the same as the free-prose form). `legacy:` and `reason:` are mutually exclusive within one mapping. Every shape still counts as coverage for `validate`. Mutually exclusive, within a SINGLE entry, with `value`/`expect`/`clear`/`withValues` — see below the table. |
 | `clear` | Optional. A list of OTHER top-level `spec.forProvider` field names nulled in the SAME merge patch that sets `field`'s value, so a union modeled as separate top-level fields switches arms atomically. Only valid when `field` itself is top-level (not dotted); a dotted entry, or one naming `field` itself, is rejected at parse time — even for a `field` with no other sibling to name; see "Whole-field tombstones without a sibling field" for that case's own route. |
 | `withValues` | Optional. A mapping of OTHER top-level `spec.forProvider` field names to an explicit, non-null literal value set in the SAME merge patch that sets `field`'s value — see "Backend-coupled fields: converging a source field and its derived field in one patch" below. Only valid when `field` itself is top-level (not dotted); a dotted key, a key naming `field` itself, or a key also present in this entry's own `clear` list is rejected at parse time. |
 | `ignoreMapKeys` | Optional. A list of top-level member keys excluded, on BOTH sides, from `run`'s equality check between `expect` (or `value`, when `expect` is unset) and the live `status.atProvider` value — see "`ignoreMapKeys:` — excluding a provider-injected map member" below. Mutually exclusive with `skip` (there is no comparison left for it to affect). |
@@ -921,14 +921,25 @@ sibling union arm. Any number of such TESTED entries for one field is fine;
 it is the established way to test a field's value axis and its
 `clear:`/`withValues:` axis separately.
 
-A field's entries may **not** mix a `skip:` entry with a tested entry,
-though. `validate`'s coverage report and the container-clear check both
-resolve a field's status by scanning its entries in order and keeping only
-the last one seen for that `field:` name — so when one entry skips the field
-and another tests it, whichever entry was authored last silently overwrites
-the other's status, with nothing reporting that the discarded entry's result
-was thrown away. This is rejected at parse time, naming the field and both
-entry kinds.
+A `skip:` may **not** be mixed with a tested assertion
+(`value:`/`expect:`/`clear:`/`withValues:`), though — in either of the two
+shapes that mix can take, both rejected at parse time.
+
+Across TWO entries for one field, `validate`'s coverage report and the
+container-clear check both resolve a field's status by scanning its entries
+in order and keeping only the last one seen for that `field:` name — so when
+one entry skips the field and another tests it, whichever entry was authored
+last silently overwrites the other's status, with nothing reporting that the
+discarded entry's result was thrown away. The rejection names the field and
+both entry kinds.
+
+Within a SINGLE entry carrying both, `run`'s per-field loop checks `skip:`
+first and moves on to the next field before the tested half of that same
+entry is ever considered — so the entry executes as a no-op skip, the tested
+assertion never fires, and every coverage consumer still reports the field
+as covered. The rejection names the field and this short-circuit. Split the
+two into separate entries, or drop whichever of `skip:`/the tested assertion
+does not belong.
 
 #### `skip:` reasons
 

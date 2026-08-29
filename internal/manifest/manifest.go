@@ -820,6 +820,9 @@ func ParseAnnotation(annotation string) ([]UpdateTest, string, []string, []strin
 		}
 		testedFields[t.Field] = true
 	}
+	if err := ValidateFieldEntryMix(tests); err != nil {
+		return nil, "", nil, nil, err
+	}
 	for _, f := range assertUnchanged {
 		if testedFields[f] {
 			return nil, "", nil, nil, fmt.Errorf(
@@ -1148,6 +1151,51 @@ func ValidateIgnoreListElementKeys(t UpdateTest) error {
 						k, source, source, source, source)
 				}
 			}
+		}
+	}
+	return nil
+}
+
+// ValidateFieldEntryMix rejects a field whose entries in one update-test
+// block mix a skip: entry with a tested entry (an entry that carries no
+// skip:, asserting a real value/expect/clear/withValues instead).
+//
+// A field legitimately carrying SEVERAL tested entries in one block is the
+// established idiom — testing its own value axis and its clear:/withValues:
+// axis as separate entries — and is never rejected here. What is rejected
+// is the OTHER combination: every consumer that resolves a field's coverage
+// status (the mutable-field coverage report, and the container-clear
+// disposition lookup) does it through a map keyed on field name, built by
+// iterating m.Tests in order with each entry overwriting the last. When
+// every entry for a field is tested, last-wins is harmless — the status is
+// "tested" whichever entry happens to win. When a skip: entry sits beside a
+// tested one, last-wins silently downgrades (or upgrades) the field's
+// reported coverage depending on which entry was authored last, with
+// nothing anywhere reporting that a test result was discarded.
+//
+// Exported so both parse-time sources of a tests slice (ParseAnnotation
+// above, and any offline validator that wants to check a slice it built
+// itself) share this one check.
+func ValidateFieldEntryMix(tests []UpdateTest) error {
+	kindByField := make(map[string]string, len(tests))
+	for _, t := range tests {
+		kind := "tested"
+		if t.Skip.Present() {
+			kind = "skip"
+		}
+		prev, seen := kindByField[t.Field]
+		if !seen {
+			kindByField[t.Field] = kind
+			continue
+		}
+		if prev != kind {
+			return fmt.Errorf(
+				"field %q carries both a skip: entry and a tested entry (value:/expect:/clear:/withValues:) "+
+					"in the same %s block — a field's coverage status is resolved through a map keyed on "+
+					"field name with last-entry-wins semantics, so the skip: entry would silently discard "+
+					"the tested entry's coverage (or the reverse); remove the skip: entry if the field is "+
+					"genuinely tested, or remove the tested entry if it is not",
+				t.Field, AnnotationKey)
 		}
 	}
 	return nil

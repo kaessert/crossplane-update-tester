@@ -1987,3 +1987,153 @@ func TestParseAnnotationIgnoreListElementKeys(t *testing.T) {
 		}
 	})
 }
+
+// TestValidateFieldEntryMix pins ValidateFieldEntryMix's own rejection and
+// acceptance rules directly, without going through YAML parsing: a field
+// whose entries mix a skip: entry with a tested one is rejected, while any
+// number of tested-only or skip-only entries for one field is accepted —
+// including the established multi-tested-entry idiom (a value axis and a
+// clear:/withValues: axis tested as separate entries for the same field).
+func TestValidateFieldEntryMix(t *testing.T) {
+	cases := map[string]struct {
+		reason        string
+		tests         []UpdateTest
+		wantErrSubstr string // empty means ValidateFieldEntryMix must return nil
+	}{
+		"SingleTestedEntry": {
+			reason: "the ordinary, overwhelmingly common shape: one tested entry per field",
+			tests: []UpdateTest{
+				{Field: "name", Value: "updated"},
+			},
+		},
+		"SingleSkipEntry": {
+			reason: "a lone skip: entry has no sibling to conflict with",
+			tests: []UpdateTest{
+				{Field: "name", Skip: LegacySkip("no test written yet")},
+			},
+		},
+		"MultipleTestedEntriesSameField": {
+			reason: "the established idiom: a field's value axis and its clear:/withValues: " +
+				"axis tested as two separate TESTED entries — must stay accepted",
+			tests: []UpdateTest{
+				{Field: "options", Value: map[string]interface{}{"a": "1"}},
+				{Field: "options", Value: map[string]interface{}{"a": "1"}, Clear: []string{"otherArm"}},
+			},
+		},
+		"ThreeTestedEntriesSameField": {
+			reason: "three tested entries for one field (the fleet's other measured shape) also stays accepted",
+			tests: []UpdateTest{
+				{Field: "options", Value: "v1"},
+				{Field: "options", Value: "v2", Clear: []string{"otherArm"}},
+				{Field: "options", Value: "v3", WithValues: map[string]interface{}{"derivedFrom": "v3"}},
+			},
+		},
+		"DifferentFieldsMixed": {
+			reason: "a skip: entry on one field and a tested entry on a DIFFERENT field never conflict",
+			tests: []UpdateTest{
+				{Field: "name", Value: "updated"},
+				{Field: "legacyField", Skip: LegacySkip("deprecated")},
+			},
+		},
+		"TestedThenSkipSameField": {
+			reason: "the measured defect shape: a skip: entry appended after a tested entry for the " +
+				"same field silently downgrades the field's coverage through the last-wins field-keyed map",
+			tests: []UpdateTest{
+				{Field: "options", Value: "v1"},
+				{Field: "options", Skip: LegacySkip("appended by a disposition wave")},
+			},
+			wantErrSubstr: `field "options" carries both a skip: entry and a tested entry`,
+		},
+		"SkipThenTestedSameField": {
+			reason: "the mix is rejected regardless of which order the two entries appear in",
+			tests: []UpdateTest{
+				{Field: "options", Skip: LegacySkip("appended by a disposition wave")},
+				{Field: "options", Value: "v1"},
+			},
+			wantErrSubstr: `field "options" carries both a skip: entry and a tested entry`,
+		},
+		"Empty": {
+			reason: "no entries at all is not a mix",
+			tests:  nil,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := ValidateFieldEntryMix(tc.tests)
+			if tc.wantErrSubstr == "" {
+				if err != nil {
+					t.Fatalf("%s: ValidateFieldEntryMix() error = %v, want nil", tc.reason, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("%s: ValidateFieldEntryMix() error = nil, want an error containing %q", tc.reason, tc.wantErrSubstr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrSubstr) {
+				t.Errorf("%s: ValidateFieldEntryMix() error = %q, want it to contain %q", tc.reason, err.Error(), tc.wantErrSubstr)
+			}
+		})
+	}
+}
+
+// TestParseAnnotationRejectsSkipTestedMix proves ParseAnnotation itself
+// wires ValidateFieldEntryMix in — the real annotation parse path a
+// manifest actually goes through, not just the helper in isolation — and
+// that the established multi-tested-entry idiom still parses cleanly
+// through that same path.
+func TestParseAnnotationRejectsSkipTestedMix(t *testing.T) {
+	t.Run("RejectsTestedThenSkip", func(t *testing.T) {
+		_, _, _, _, err := ParseAnnotation(`
+- field: options
+  value: "v1"
+- field: options
+  skip:
+    reason: fixture-missing
+    evidence: "no second fixture to move this field to"
+    ticket: TEST-1234
+`)
+		if err == nil {
+			t.Fatal("ParseAnnotation() error = nil, want an error rejecting the skip/tested mix")
+		}
+		wantErrSubstr := `field "options" carries both a skip: entry and a tested entry`
+		if !strings.Contains(err.Error(), wantErrSubstr) {
+			t.Errorf("ParseAnnotation() error = %q, want it to contain %q", err.Error(), wantErrSubstr)
+		}
+	})
+
+	t.Run("AcceptsMultipleTestedEntriesSameField", func(t *testing.T) {
+		tests, _, _, _, err := ParseAnnotation(`
+- field: options
+  value: {a: "1"}
+- field: options
+  value: {a: "1"}
+  clear: [otherArm]
+`)
+		if err != nil {
+			t.Fatalf("ParseAnnotation() error = %v, want nil — multiple TESTED entries for one field is the established idiom", err)
+		}
+		if len(tests) != 2 {
+			t.Fatalf("len(tests) = %d, want 2", len(tests))
+		}
+	})
+
+	t.Run("AcceptsThreeTestedEntriesSameField", func(t *testing.T) {
+		tests, _, _, _, err := ParseAnnotation(`
+- field: options
+  value: "v1"
+- field: options
+  value: "v2"
+  clear: [otherArm]
+- field: options
+  value: "v3"
+  withValues: {derivedFrom: "v3"}
+`)
+		if err != nil {
+			t.Fatalf("ParseAnnotation() error = %v, want nil", err)
+		}
+		if len(tests) != 3 {
+			t.Fatalf("len(tests) = %d, want 3", len(tests))
+		}
+	})
+}

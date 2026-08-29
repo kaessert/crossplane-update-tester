@@ -872,6 +872,22 @@ None of `converge-skip: <reason>`, `assert-unchanged: <fields>` or
 items, so all three lines are extracted before the rest of the block is
 parsed as a sequence. Each must be unindented.
 
+A `field:` may appear in more than one entry within the same block — for
+example, one entry asserting its own `value:` and a second entry that reuses
+the same `field:` only to carry a `clear:` or `withValues:` list for a
+sibling union arm. Any number of such TESTED entries for one field is fine;
+it is the established way to test a field's value axis and its
+`clear:`/`withValues:` axis separately.
+
+A field's entries may **not** mix a `skip:` entry with a tested entry,
+though. `validate`'s coverage report and the container-clear check both
+resolve a field's status by scanning its entries in order and keeping only
+the last one seen for that `field:` name — so when one entry skips the field
+and another tests it, whichever entry was authored last silently overwrites
+the other's status, with nothing reporting that the discarded entry's result
+was thrown away. This is rejected at parse time, naming the field and both
+entry kinds.
+
 #### `skip:` reasons
 
 A structured `skip:` is a mapping with a `reason:` from a closed set. An

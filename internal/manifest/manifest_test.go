@@ -2240,6 +2240,46 @@ func TestValidateFieldEntryMix(t *testing.T) {
 			reason: "no entries at all is not a mix",
 			tests:  nil,
 		},
+		"SingleEntryValueAndSkipCombined": {
+			reason: "the combined-entry trap: one entry carrying BOTH value: and skip: has nothing to " +
+				"compare it against — ValidateFieldEntryMix's cross-entry comparison alone would parse " +
+				"this clean, then the runner's skip-first check would silently discard the value: half " +
+				"and the field would still be reported as covered; this is the shape a dedicated per-entry " +
+				"check on top of the cross-entry comparison exists to catch",
+			tests: []UpdateTest{
+				{Field: "name", Value: "updated", Skip: LegacySkip("appended by a disposition wave")},
+			},
+			wantErrSubstr: `field "name"'s entry carries both a skip: and a tested assertion`,
+		},
+		"SingleEntryExpectAndSkipCombined": {
+			reason: "expect: alone (no value:) makes the same single entry tested — must also be caught",
+			tests: []UpdateTest{
+				{Field: "name", Expect: "updated", Skip: LegacySkip("appended by a disposition wave")},
+			},
+			wantErrSubstr: `field "name"'s entry carries both a skip: and a tested assertion`,
+		},
+		"SingleEntryClearAndSkipCombined": {
+			reason: "clear: alone (no value:/expect:) also makes the entry tested — must also be caught",
+			tests: []UpdateTest{
+				{Field: "options", Clear: []string{"otherArm"}, Skip: LegacySkip("appended by a disposition wave")},
+			},
+			wantErrSubstr: `field "options"'s entry carries both a skip: and a tested assertion`,
+		},
+		"SingleEntryWithValuesAndSkipCombined": {
+			reason: "withValues: alone also makes the entry tested — must also be caught",
+			tests: []UpdateTest{
+				{Field: "options", WithValues: map[string]interface{}{"derivedFrom": "v1"}, Skip: LegacySkip("appended by a disposition wave")},
+			},
+			wantErrSubstr: `field "options"'s entry carries both a skip: and a tested assertion`,
+		},
+		"SingleEntryExplicitNullValueAndSkipCombined": {
+			reason: "an explicit `value: null` (ValueExplicit true, Value nil) is still a real tested " +
+				"assertion — a whole-field tombstone — and must also be caught when paired with skip:",
+			tests: []UpdateTest{
+				{Field: "name", ValueExplicit: true, Skip: LegacySkip("appended by a disposition wave")},
+			},
+			wantErrSubstr: `field "name"'s entry carries both a skip: and a tested assertion`,
+		},
 	}
 
 	for name, tc := range cases {
@@ -2318,6 +2358,31 @@ func TestParseAnnotationRejectsSkipTestedMix(t *testing.T) {
 		}
 		if len(tests) != 3 {
 			t.Fatalf("len(tests) = %d, want 3", len(tests))
+		}
+	})
+
+	// RejectsCombinedSingleEntry replays the cell-denominator gap through
+	// the real YAML parse path: ONE entry carrying both value: and skip:
+	// has no sibling entry for ValidateFieldEntryMix's cross-entry
+	// comparison to compare it against, so that comparison alone would
+	// parse this clean — the runner would then silently skip the field
+	// and the value: assertion would never fire. The per-entry check
+	// added on top of the cross-entry comparison must catch it here too,
+	// not only when built directly as a Go literal.
+	t.Run("RejectsCombinedSingleEntry", func(t *testing.T) {
+		_, _, _, _, err := ParseAnnotation(`
+- field: name
+  value: "updated"
+  skip:
+    reason: fixture-missing
+    evidence: "appended by a disposition wave without removing the tested value"
+`)
+		if err == nil {
+			t.Fatal("ParseAnnotation() error = nil, want an error rejecting the single-entry skip/value combination")
+		}
+		wantErrSubstr := `field "name"'s entry carries both a skip: and a tested assertion`
+		if !strings.Contains(err.Error(), wantErrSubstr) {
+			t.Errorf("ParseAnnotation() error = %q, want it to contain %q", err.Error(), wantErrSubstr)
 		}
 	})
 }

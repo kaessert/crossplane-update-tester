@@ -1260,9 +1260,20 @@ func ValidateIgnoreListElementKeys(t UpdateTest) error {
 	return nil
 }
 
+// entryCarriesTestedContent reports whether a single UpdateTest entry
+// asserts a real value/expect/clear/withValues, regardless of whether the
+// SAME entry also carries a skip:. It exists to catch the combined shape
+// ValidateFieldEntryMix's cross-entry comparison cannot see — see that
+// function's doc comment.
+func entryCarriesTestedContent(t UpdateTest) bool {
+	return t.Value != nil || t.ValueExplicit || t.Expect != nil || len(t.Clear) > 0 || len(t.WithValues) > 0
+}
+
 // ValidateFieldEntryMix rejects a field whose entries in one update-test
 // block mix a skip: entry with a tested entry (an entry that carries no
-// skip:, asserting a real value/expect/clear/withValues instead).
+// skip:, asserting a real value/expect/clear/withValues instead) — whether
+// the two live in separate entries for the same field, or BOTH are written
+// into one single entry.
 //
 // A field legitimately carrying SEVERAL tested entries in one block is the
 // established idiom — testing its own value axis and its clear:/withValues:
@@ -1277,10 +1288,31 @@ func ValidateIgnoreListElementKeys(t UpdateTest) error {
 // reported coverage depending on which entry was authored last, with
 // nothing anywhere reporting that a test result was discarded.
 //
+// The single-entry combined shape is checked first and separately, because
+// it cannot be caught by comparing entries against each other: with only
+// one entry for the field there is nothing to compare it to, so it would
+// otherwise parse clean. It is also the more dangerous of the two shapes —
+// the per-field execution loop checks skip: first and moves on to the next
+// field before the tested half of the SAME entry is ever considered, so the
+// entry would silently run as a no-op skip while the tested assertion never
+// fires, and every coverage consumer still reports the field as tested.
+//
 // Exported so both parse-time sources of a tests slice (ParseAnnotation
 // above, and any offline validator that wants to check a slice it built
 // itself) share this one check.
 func ValidateFieldEntryMix(tests []UpdateTest) error {
+	for _, t := range tests {
+		if t.Skip.Present() && entryCarriesTestedContent(t) {
+			return fmt.Errorf(
+				"field %q's entry carries both a skip: and a tested assertion (value:/expect:/clear:/withValues:) "+
+					"in the SAME entry — the runner checks skip: first and moves on before the tested half is ever "+
+					"considered, so this entry would silently execute as a no-op skip, the tested assertion would "+
+					"never fire, and the field would still be reported as covered; split the two into separate "+
+					"entries, or remove whichever of skip:/the tested assertion does not belong",
+				t.Field)
+		}
+	}
+
 	kindByField := make(map[string]string, len(tests))
 	for _, t := range tests {
 		kind := "tested"

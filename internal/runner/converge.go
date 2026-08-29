@@ -824,19 +824,17 @@ func (r *Runner) countUpdateLogCalls(m *manifest.Manifest, window time.Duration)
 	if since < 1 {
 		since = 1
 	}
-	out, err := r.runRaw("logs",
-		"-n", providerDeploymentNamespace,
-		"-l", providerDeploymentSelector,
-		// --tail=-1 is NOT redundant. kubectl defaults --tail to 10
-		// whenever a SELECTOR is used, and to -1 only for a single named
-		// pod — so the obvious `logs -l ... --since=Ns` returns the last
-		// ten lines of the controller's output rather than the window,
-		// silently and with a zero exit. Measured against a live looping
-		// resource, that default alone turned detection in every window
-		// into detection in two windows out of three, because the ten most
-		// recent lines are mostly other resources' reconcile chatter.
-		"--tail=-1",
-		fmt.Sprintf("--since=%ds", since))
+	// --tail=-1 is NOT redundant. kubectl defaults --tail to 10 whenever a
+	// SELECTOR is used, and to -1 only for a single named pod — so the
+	// obvious `logs -l ... --since=Ns` returns the last ten lines of the
+	// controller's output rather than the window, silently and with a
+	// zero exit. Measured against a live looping resource, that default
+	// alone turned detection in every window into detection in two
+	// windows out of three, because the ten most recent lines are mostly
+	// other resources' reconcile chatter. ProviderLogs always sends
+	// --tail=-1 for exactly this reason.
+	out, err := r.kube().ProviderLogs(providerDeploymentNamespace, providerDeploymentSelector,
+		fmt.Sprintf("%ds", since))
 	if err != nil {
 		return 0, 0, fmt.Errorf("reading controller log: %w", err)
 	}
@@ -911,7 +909,7 @@ func reconcileRequestOf(line string) (reconcileRequest, bool) {
 // namespace argument then filters the decoded list down to the one
 // involvedObject the caller means (see sumEventOccurrencesByReason).
 func (r *Runner) countEventsByReason(kind, name, namespace, apiVersion string, reasons ...string) (int, error) {
-	out, err := r.runRaw("get", "events", "--all-namespaces", "-o", "json")
+	out, err := r.kube().ListEventsAllNamespaces()
 	if err != nil {
 		return 0, fmt.Errorf("listing events: %w", err)
 	}

@@ -164,7 +164,7 @@ func (r *Runner) WithPollInterval(d time.Duration) *Runner {
 // an output that cannot be resolved unambiguously is an error rather than a
 // guess.
 func (r *Runner) ResolveResource(m *manifest.Manifest) error {
-	out, err := r.run("get", "-f", r.manifestPath, "-o", "name")
+	out, err := r.kube().ResolveManifestName(r.namespace, r.manifestPath)
 	if err != nil {
 		return fmt.Errorf("resolving resource from manifest: %w", err)
 	}
@@ -315,8 +315,7 @@ func (r *Runner) Snapshot() ([]byte, error) {
 // the same technique uptest uses in 01-update.yaml.tmpl — it creates
 // a reliable signal without timing assumptions.
 func (r *Runner) ClearConditions() error {
-	_, err := r.run("patch", r.resourceName, "--subresource=status",
-		"--type=merge", "-p", `{"status":{"conditions":[]}}`)
+	_, err := r.kube().PatchMergeStatus(r.namespace, r.resourceName, `{"status":{"conditions":[]}}`)
 	if err != nil {
 		return fmt.Errorf("clearing conditions: %w", err)
 	}
@@ -344,7 +343,7 @@ const updateTesterNudgeAnnotation = "update-tester.crossplane.io/nudge"
 func (r *Runner) NudgeReconcile() error {
 	patch := fmt.Sprintf(`{"metadata":{"annotations":{%q:%q}}}`,
 		updateTesterNudgeAnnotation, strconv.FormatInt(time.Now().UnixNano(), 10))
-	if _, err := r.run("patch", r.resourceName, "--type=merge", "-p", patch); err != nil {
+	if _, err := r.kube().PatchMerge(r.namespace, r.resourceName, patch); err != nil {
 		return fmt.Errorf("nudging reconcile: %w", err)
 	}
 	return nil
@@ -362,7 +361,7 @@ func (r *Runner) Patch(field string, value interface{}, clear []string, withValu
 	if err != nil {
 		return fmt.Errorf("building patch: %w", err)
 	}
-	_, err = r.run("patch", r.resourceName, "--type=merge", "-p", patchJSON)
+	_, err = r.kube().PatchMerge(r.namespace, r.resourceName, patchJSON)
 	if err != nil {
 		return fmt.Errorf("patching %s: %w", field, err)
 	}
@@ -371,7 +370,7 @@ func (r *Runner) Patch(field string, value interface{}, clear []string, withValu
 
 // WaitReady waits for the resource to become Ready.
 func (r *Runner) WaitReady() error {
-	_, err := r.run("wait", r.resourceName, "--for=condition=Ready", "--timeout="+r.timeout)
+	_, err := r.kube().WaitForCondition(r.namespace, r.resourceName, "condition=Ready", r.timeout)
 	if err != nil {
 		return fmt.Errorf("waiting for Ready: %w", err)
 	}
@@ -380,7 +379,7 @@ func (r *Runner) WaitReady() error {
 
 // GetObject reads the full resource as a decoded JSON object.
 func (r *Runner) GetObject() (map[string]interface{}, error) {
-	out, err := r.run("get", r.resourceName, "-o", "json")
+	out, err := r.kube().GetObjectJSON(r.namespace, r.resourceName)
 	if err != nil {
 		return nil, fmt.Errorf("reading resource: %w", err)
 	}
@@ -1104,11 +1103,11 @@ func (r *Runner) restartControllerDeployment() error {
 	}
 	target := "deploy/" + name
 
-	if _, err := r.runRaw("rollout", "restart", target, "-n", providerDeploymentNamespace); err != nil {
+	if _, err := r.kube().RolloutRestart(providerDeploymentNamespace, target); err != nil {
 		return fmt.Errorf("restarting %s: %w", target, err)
 	}
-	if _, err := r.runRaw("rollout", "status", target, "-n", providerDeploymentNamespace,
-		"--timeout="+controllerRestartTimeout.String()); err != nil {
+	if _, err := r.kube().RolloutStatus(providerDeploymentNamespace, target,
+		controllerRestartTimeout.String()); err != nil {
 		return fmt.Errorf("waiting for %s rollout: %w", target, err)
 	}
 	return nil
@@ -1138,9 +1137,8 @@ func (r *Runner) resolveControllerDeploymentName() (string, error) {
 		return override, nil
 	}
 
-	out, err := r.runRaw("get", "pods", "-n", providerDeploymentNamespace,
-		"-l", providerDeploymentSelector,
-		"-o", `jsonpath={range .items[*]}{.metadata.labels.pkg\.crossplane\.io/revision}{"\n"}{end}`)
+	out, err := r.kube().GetPodsJSONPath(providerDeploymentNamespace, providerDeploymentSelector,
+		`jsonpath={range .items[*]}{.metadata.labels.pkg\.crossplane\.io/revision}{"\n"}{end}`)
 	if err != nil {
 		return "", err
 	}
@@ -1217,9 +1215,8 @@ func (r *Runner) resolveControllerPodIdentityLive() (controllerPodIdentity, erro
 		return controllerPodIdentity{}, fmt.Errorf("resolving provider deployment: %w", err)
 	}
 
-	out, err := r.runRaw("get", "pods", "-n", providerDeploymentNamespace,
-		"-l", providerDeploymentSelector+"="+name,
-		"-o", `jsonpath={range .items[*]}{.metadata.name}{"\t"}{.metadata.creationTimestamp}{"\n"}{end}`)
+	out, err := r.kube().GetPodsJSONPath(providerDeploymentNamespace, providerDeploymentSelector+"="+name,
+		`jsonpath={range .items[*]}{.metadata.name}{"\t"}{.metadata.creationTimestamp}{"\n"}{end}`)
 	if err != nil {
 		return controllerPodIdentity{}, fmt.Errorf("listing controller pods for deployment %s: %w", name, err)
 	}
@@ -1608,22 +1605,6 @@ func (r *Runner) pollField(field string, expectedVal interface{}, start time.Tim
 			field, actual, formatExpected(expectedVal), readRetryInterval)
 		time.Sleep(readRetryInterval)
 	}
-}
-
-// run executes a kubectl command scoped to the resource's namespace (if any)
-// and returns combined stdout.
-func (r *Runner) run(args ...string) (string, error) {
-	if r.namespace != "" {
-		args = append(args, "-n", r.namespace)
-	}
-	return r.exec(args...)
-}
-
-// runRaw executes a kubectl command without appending a namespace flag. Used
-// for cluster-wide queries (e.g. listing events across all namespaces) where
-// namespace-scoping the command would miss events recorded elsewhere.
-func (r *Runner) runRaw(args ...string) (string, error) {
-	return r.exec(args...)
 }
 
 // exec runs the configured kubectl binary with args and returns stdout. If

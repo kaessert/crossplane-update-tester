@@ -133,7 +133,7 @@ func buildResolveRecoverResult(before, after, expectedPrefix string, createEvent
 // no in-flight reconcile racing it.
 func (r *Runner) pause() error {
 	patch := fmt.Sprintf(`{"metadata":{"annotations":{%q:"true"}}}`, pausedAnnotation)
-	_, err := r.run("patch", r.resourceName, "--type=merge", "-p", patch)
+	_, err := r.kube().PatchMerge(r.namespace, r.resourceName, patch)
 	return err
 }
 
@@ -146,7 +146,7 @@ func (r *Runner) pause() error {
 // reconcile.
 func (r *Runner) stripExternalName() error {
 	patch := fmt.Sprintf(`{"metadata":{"annotations":{%q:null}}}`, externalNameAnnotation)
-	_, err := r.run("patch", r.resourceName, "--type=merge", "-p", patch)
+	_, err := r.kube().PatchMerge(r.namespace, r.resourceName, patch)
 	return err
 }
 
@@ -173,6 +173,6 @@ func (r *Runner) waitForRecoveryReconcile() error {
 // reconciliation.
 func (r *Runner) unpause() error {
 	patch := fmt.Sprintf(`{"metadata":{"annotations":{%q:null}}}`, pausedAnnotation)
-	_, err := r.run("patch", r.resourceName, "--type=merge", "-p", patch)
+	_, err := r.kube().PatchMerge(r.namespace, r.resourceName, patch)
 	return err
 }

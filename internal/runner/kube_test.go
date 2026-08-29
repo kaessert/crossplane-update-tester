@@ -493,6 +493,14 @@ var testGVR = schema.GroupVersionResource{Group: testGVRGroup, Version: testGVRV
 // newTestUnstructuredExample builds an unstructured object matching
 // testKindExample/testGVRGroup/testGVRVersion, for seeding a fake dynamic
 // client. namespace == "" builds a cluster-scoped object.
+//
+// status.atProvider deliberately carries more than one scalar field — a
+// nested object, a list and a null-valued key alongside atProviderField —
+// so a decoded-map comparison against it actually exercises a non-scalar
+// decode. A fixture with only a top-level string cannot distinguish a
+// correct decode from one that silently drops a null key or flattens a
+// nested value, which is exactly the shape every container-clear update
+// test in this package depends on being decoded faithfully.
 func newTestUnstructuredExample(namespace, name, atProviderField string) *unstructured.Unstructured {
 	metadata := map[string]interface{}{"name": name}
 	if namespace != "" {
@@ -503,7 +511,12 @@ func newTestUnstructuredExample(namespace, name, atProviderField string) *unstru
 		"kind":       testKindExample,
 		"metadata":   metadata,
 		"status": map[string]interface{}{
-			"atProvider": map[string]interface{}{"field": atProviderField},
+			"atProvider": map[string]interface{}{
+				"field":    atProviderField,
+				"tags":     []interface{}{"tag-a", "tag-b"},
+				"nested":   map[string]interface{}{"inner": "inner-value"},
+				"nullable": nil,
+			},
 		},
 	}}
 }
@@ -622,7 +635,7 @@ func TestGetObjectJSONResolvesGVRAndReadsViaDynamicClient(t *testing.T) {
 // Runner.GetObject unmarshals immediately and field ordering carries no
 // meaning to any caller.
 func TestGetObjectJSONExecAndClientGoAgreeOnDecodedMap(t *testing.T) {
-	const execJSON = `{"apiVersion":"example.crossplane.io/v1alpha1","kind":"ExampleResource","metadata":{"name":"example-resource","namespace":"default"},"status":{"atProvider":{"field":"parity-value"}}}`
+	const execJSON = `{"apiVersion":"example.crossplane.io/v1alpha1","kind":"ExampleResource","metadata":{"name":"example-resource","namespace":"default"},"status":{"atProvider":{"field":"parity-value","tags":["tag-a","tag-b"],"nested":{"inner":"inner-value"},"nullable":null}}}`
 
 	// Exec path: canned kubectl JSON, forced onto the exec backend via the
 	// escape hatch so this Runner's default routing cannot mask the

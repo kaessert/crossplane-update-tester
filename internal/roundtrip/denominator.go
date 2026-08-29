@@ -139,9 +139,9 @@ func isWriteOnly(t manifest.UpdateTest) bool {
 //     other companion key from it), so a no-row field gives it nothing to
 //     resolve against. The other four structured reasons (union-arm,
 //     covered-elsewhere, vendor-defect, fixture-missing) are accepted here —
-//     each carries its own citation (sibling:/by:/evidence:+ticket:/
-//     ticket:) that validator.CheckSkipReasons resolves independently of any
-//     live row.
+//     each carries its own citation (sibling:/by:/evidence: with an
+//     optional ticket:) that validator.CheckSkipReasons resolves
+//     independently of any live row.
 //
 // A field with no skip: entry at all (directly tested, or genuinely
 // uncovered) is untouched here — direct testing is already proven by `run`,
@@ -205,9 +205,10 @@ func DenominatorReport(m *manifest.Manifest, rows []Row) (findings []MustTestFin
 			}
 			// Every other structured reason (union-arm, covered-elsewhere,
 			// vendor-defect, fixture-missing) carries its own citation
-			// (sibling:/by:/evidence:+ticket:/ticket:) that validator's
-			// offline checks resolve independently of any live row — see
-			// validator.CheckSkipReasons and manifest.validateSkipInfo.
+			// (sibling:/by:/evidence: with an optional ticket:) that
+			// validator's offline checks resolve independently of any live
+			// row — see validator.CheckSkipReasons and
+			// manifest.validateSkipInfo.
 			continue
 		}
 

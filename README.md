@@ -672,9 +672,9 @@ The must-test set is derived from the classification, not asserted by hand:
   `present-in-spec-absent-from-mirror` row, and a no-row field gives it
   nothing to resolve against. The other four structured reasons
   (`union-arm`, `covered-elsewhere`, `vendor-defect`, `fixture-missing`) are
-  accepted — each carries its own citation (`sibling:`, `by:`,
-  `evidence:` + `ticket:` for either of the last two) resolved elsewhere
-  (see `validate`'s `skip: reasons` checks below).
+  accepted — each carries its own citation (`sibling:`, `by:`, or
+  `evidence:` with an optional `ticket:` for either of the last two)
+  resolved elsewhere (see `validate`'s `skip: reasons` checks below).
 
 CEL-immutability never excuses `value-changed` or `defaulted-by-server`: a
 backend that changes or defaults a field the CRD declares immutable is a
@@ -903,7 +903,7 @@ three top-level directive lines: `converge-skip:`, `assert-unchanged:` and
 | `field` | Required. Field name under `spec.forProvider`; dot-separated for nested fields. |
 | `value` | The value to patch in. Required unless `skip` is set — but "required" means the `value:` key must be PRESENT, not non-null: an explicit `value: null` (or a bare `value:` with nothing after the colon) is accepted as a deliberate whole-field tombstone in its own right, distinct from the key being absent entirely — see "Whole-field tombstones without a sibling field" below. |
 | `expect` | Optional. The value expected in `status.atProvider` when the backend normalises what it stores. Defaults to `value`. |
-| `skip` | Optional. Either a free-prose string (the legacy form, reported as `SKIPPED` and credited under `validate`'s `skipped-unstructured` status) or a structured mapping with a `reason:` from a closed set (reported as `SKIPPED` and credited under `validate`'s `skipped` status — see "`skip:` reasons" below). Either way the entry still counts as coverage for `validate`. |
+| `skip` | Optional. One of three shapes: a free-prose string (the legacy form, reported as `SKIPPED` and credited under `validate`'s `skipped-unstructured` status); a structured mapping with a `reason:` from a closed set (reported as `SKIPPED` and credited under `validate`'s `skipped` status — see "`skip:` reasons" below); or a structured mapping with a `legacy:` key carrying that same free prose, used instead of a bare string only when a `disposition:` needs to be attached alongside it (reported the same as the free-prose form). `legacy:` and `reason:` are mutually exclusive within one mapping. Every shape still counts as coverage for `validate`. |
 | `clear` | Optional. A list of OTHER top-level `spec.forProvider` field names nulled in the SAME merge patch that sets `field`'s value, so a union modeled as separate top-level fields switches arms atomically. Only valid when `field` itself is top-level (not dotted); a dotted entry, or one naming `field` itself, is rejected at parse time — even for a `field` with no other sibling to name; see "Whole-field tombstones without a sibling field" for that case's own route. |
 | `withValues` | Optional. A mapping of OTHER top-level `spec.forProvider` field names to an explicit, non-null literal value set in the SAME merge patch that sets `field`'s value — see "Backend-coupled fields: converging a source field and its derived field in one patch" below. Only valid when `field` itself is top-level (not dotted); a dotted key, a key naming `field` itself, or a key also present in this entry's own `clear` list is rejected at parse time. |
 | `ignoreMapKeys` | Optional. A list of top-level member keys excluded, on BOTH sides, from `run`'s equality check between `expect` (or `value`, when `expect` is unset) and the live `status.atProvider` value — see "`ignoreMapKeys:` — excluding a provider-injected map member" below. Mutually exclusive with `skip` (there is no comparison left for it to affect). |
@@ -942,8 +942,8 @@ than declared here.
 |---|---|---|
 | `union-arm` | `sibling:` naming another field | yes — `sibling:` must be a field declared on the same `<Kind>Parameters` struct |
 | `covered-elsewhere` | `by:` as `<path>#<field>` | yes — that manifest and field must exist, and the named entry must itself be directly tested (not skipped, not missing, and not a `covered-elsewhere` cycle) |
-| `vendor-defect` | `evidence:` and `ticket:` | no — both keys are checked for presence only |
-| `fixture-missing` | `evidence:` and `ticket:` | no — both keys are checked for presence only |
+| `vendor-defect` | `evidence:`; `ticket:` optional | no — `evidence:` is checked for presence; `ticket:`, when present, is checked for shape, not presence |
+| `fixture-missing` | `evidence:`; `ticket:` optional | no — `evidence:` is checked for presence; `ticket:`, when present, is checked for shape, not presence |
 | `write-only` | none | no |
 
 `covered-elsewhere`'s `<path>` is resolved relative to the directory of the
@@ -965,18 +965,26 @@ crossplane.io/update-test: |
     skip:
       reason: fixture-missing
       evidence: "no fixture backend exposes a second firewall group to move this field between"
-      ticket: VU-FW-FIXTURE
+      ticket: "8213021"
   - field: dnsVolterraManaged
     skip:
       reason: vendor-defect
       evidence: "HTTP 400 'Change of domain type ... is not supported'"
-      ticket: FX-DNS-DELEGATION
+      ticket: "https://support.f5.com/csp/case/00482113"
 ```
 
 The pre-existing free-prose string form (`skip: "some reason"`) still parses
 and still counts as coverage, but is reported under `validate`'s distinct
 `skipped-unstructured` status rather than `skipped` — see the status list
 above.
+
+A third shape wraps that same free prose in a mapping instead of a bare
+scalar: `skip: {legacy: "some reason"}`. It parses to the identical
+`skipped-unstructured` status as the bare-string form — the mapping wrapper
+exists only so a `disposition:` (see "`skip:` dispositions" below) can be
+attached alongside the free-prose reason, which the bare-string form has no
+room for. `legacy:` and `reason:` are mutually exclusive within one mapping
+— a `skip:` entry authors one or the other, never both.
 
 #### `skip:` dispositions
 
@@ -1002,13 +1010,13 @@ crossplane.io/update-test: |
     skip:
       reason: vendor-defect
       evidence: "os_id is structurally absent from the update request the controller sends"
-      ticket: VU-OSID-STATIC
+      ticket: "482113"
       disposition: statically-provable
   - field: displayName
     skip:
       reason: vendor-defect
       evidence: "HTTP 409, and the display name is permanently reserved regardless of response code"
-      ticket: IAM-DISPLAYNAME
+      ticket: "INC0012345"
       disposition: declared-exclusion
       declared-by: a human
       reconfirm: "2027-01-01"

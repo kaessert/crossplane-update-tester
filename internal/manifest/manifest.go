@@ -156,17 +156,21 @@ func (t *UpdateTest) UnmarshalYAML(node *yaml.Node) error {
 	// unknown key: the mechanism it named has been removed, and letting an
 	// existing manifest keep parsing while its entry quietly stopped
 	// enforcing anything it used to would trade a loud stopgap for an
-	// invisible one. File the defect ticket, then express the field's test
-	// with skip: (reason vendor-defect or fixture-missing, naming the
-	// ticket) if it genuinely cannot be tested, or withValues: if it can be
-	// tested once a coupled sibling field also carries a literal value.
+	// invisible one. Record what was observed in skip: (reason
+	// vendor-defect or fixture-missing, with evidence: describing the
+	// observation; ticket: is optional and, when present, must be an
+	// externally resolvable reference — never a factory-internal
+	// identifier) if the field genuinely cannot be tested, or withValues:
+	// if it can be tested once a coupled sibling field also carries a
+	// literal value.
 	for i := 0; i+1 < len(node.Content); i += 2 {
 		if node.Content[i].Value == "knownDefect" {
 			return fmt.Errorf(
-				"update-test entry carries a \"knownDefect:\" key, which no longer exists — file the defect ticket, "+
-					"then use skip: with reason vendor-defect or fixture-missing (naming the ticket) if the field's "+
-					"update path genuinely cannot be tested, or withValues: if the test can be expressed once a "+
-					"coupled sibling field also carries a literal value in the same patch; valid skip: reasons are %s",
+				"update-test entry carries a \"knownDefect:\" key, which no longer exists — use skip: with reason "+
+					"vendor-defect or fixture-missing, recording what was observed in evidence: (ticket: is "+
+					"optional and, when present, must be an externally resolvable reference), or withValues: if "+
+					"the test can be expressed once a coupled sibling field also carries a literal value in the "+
+					"same patch; valid skip: reasons are %s",
 				validSkipReasonList())
 		}
 	}

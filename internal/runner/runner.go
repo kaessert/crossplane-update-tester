@@ -150,6 +150,15 @@ type Runner struct {
 	// — which calls kube() on the order of a thousand times for event
 	// reads alone — emits that record exactly once, not once per call.
 	kubeBackendLogOnce sync.Once
+
+	// podLogStreamFunc, when set, overrides podLogStream as the mechanism
+	// the client-go KubeClient backend uses to open one pod/container's
+	// log stream for ProviderLogs. Tests inject a fake here: the built-in
+	// fake Clientset's GetLogs always returns identical canned content
+	// with a 200 status for every pod, so it cannot express either
+	// distinct per-pod content or a mid-stream failure. Production code
+	// leaves it nil and podLogStream opens a real client-go log stream.
+	podLogStreamFunc func(namespace, podName, container string, sinceSeconds int64) (io.ReadCloser, error)
 }
 
 // sleep waits d, calling sleepFunc instead of time.Sleep when a test has

@@ -3,11 +3,14 @@ package runner
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -147,6 +150,20 @@ func (c *execKubeClient) ProviderLogs(namespace, selector, since string) (string
 	return c.r.exec("logs", "-n", namespace, "-l", selector, "--tail=-1", "--since="+since)
 }
 
+// parseSinceSeconds converts ProviderLogs' since argument — kubectl --since
+// syntax, e.g. "30s" — into the whole-second count
+// corev1.PodLogOptions.SinceSeconds takes. The sole caller
+// (countUpdateLogCalls) always builds this as an integer-second Go duration
+// string, so truncating a fractional remainder here never loses precision
+// for any caller this project has today.
+func parseSinceSeconds(since string) (int64, error) {
+	dur, err := time.ParseDuration(since)
+	if err != nil {
+		return 0, fmt.Errorf("parsing since duration %q: %w", since, err)
+	}
+	return int64(dur.Seconds()), nil
+}
+
 func (c *execKubeClient) RolloutRestart(namespace, target string) (string, error) {
 	return c.r.exec("rollout", "restart", target, "-n", namespace)
 }
@@ -190,20 +207,22 @@ func eventFieldSelector(kind, name, namespace string) string {
 const kubeBackendEnvVar = "UPDATE_TESTER_KUBE_BACKEND"
 
 // clientGoKubeClient overrides event listing, resource reads, the two
-// merge-patch operations, and the Ready wait with direct client-go calls.
-// Every other KubeClient operation is promoted from the embedded exec
-// backend unchanged — this type exists to migrate one operation at a time,
-// not to grow into a second full backend. A shared informer or watch cache
-// is deliberately NOT used for the event listing or resource read
-// overrides: the evidence check those feed is a before/after delta on the
-// same object, and a lagging cache would return a stale second read and
-// manufacture a false negative. The two patch overrides write rather than
-// read, so a cache cannot go stale under them, but they are still direct
-// dynamic calls for the same reason. WaitForCondition is the one exception
-// to "no watch cache reached for anywhere in this type": a wait for a
-// future transition is exactly what a watch is for, and its own doc
-// comment states the boundary that keeps that watch from ever becoming a
-// second, cached source for the two direct-read overrides above.
+// merge-patch operations, the Ready wait, and the controller-log read with
+// direct client-go calls. Every other KubeClient operation is promoted from
+// the embedded exec backend unchanged — this type exists to migrate one
+// operation at a time, not to grow into a second full backend. A shared
+// informer or watch cache is deliberately NOT used for the event listing or
+// resource read overrides: the evidence check those feed is a before/after
+// delta on the same object, and a lagging cache would return a stale second
+// read and manufacture a false negative. The two patch overrides write
+// rather than read, so a cache cannot go stale under them, but they are
+// still direct dynamic calls for the same reason. WaitForCondition is the
+// one exception to "no watch cache reached for anywhere in this type": a
+// wait for a future transition is exactly what a watch is for, and its own
+// doc comment states the boundary that keeps that watch from ever becoming
+// a second, cached source for the two direct-read overrides above.
+// ProviderLogs opens a fresh log stream per pod on every call, exactly like
+// the event/resource-read overrides — nothing here is cached either.
 // clientset is a func rather than a stored value so it can be resolved
 // lazily (a Runner is often built before a kubeconfig is needed) and
 // overridden by tests.
@@ -616,6 +635,107 @@ func (c *clientGoKubeClient) WaitForCondition(namespace, name, condition, timeou
 	return string(data), nil
 }
 
+// ProviderLogs reads controller log lines for every pod selector matches in
+// namespace, covering the last `since` duration, via a direct client-go log
+// stream per pod — never a shared cache, and never a `--tail` limit.
+// PodLogOptions.TailLines is left nil unconditionally: kubectl defaults
+// --tail to 10 whenever a selector is used, and countUpdateLogCalls's own
+// doc comment records what that default did once measured live — loop
+// detection firing in every window collapsed to firing in two windows out
+// of three, silently and with a zero exit. Leaving TailLines nil is what
+// "--tail=-1" means, and is the one thing this method must never change.
+//
+// Container selection mirrors the exec backend's own invocation (a bare
+// `kubectl logs -l <selector>`, no `--container` flag): the pod's FIRST
+// container is read, matching kubectl's own default-container behaviour —
+// kubectl warns to stderr and proceeds for a multi-container pod rather
+// than refusing, so this does too, with nothing to warn to since no caller
+// reads this backend's stderr.
+//
+// A pod whose log stream cannot be opened or fully read is recorded and
+// skipped rather than aborting the whole call, so one unreadable pod never
+// costs the others their lines: kubectl's own sequential log consumption
+// already streams each matched pod's content to stdout as it goes, and it
+// is only the exec backend's os/exec wrapper — which discards a command's
+// entire stdout the moment its exit code is non-zero — that turns one
+// failing pod into zero bytes of evidence for every pod. This backend reads
+// each pod's stream directly and has no reason to inherit that limitation.
+// Only when EVERY matched pod failed is the call itself reported as an
+// error, matching the one outcome the exec backend can still produce today:
+// nothing observed, nothing to attribute a call count to.
+func (c *clientGoKubeClient) ProviderLogs(namespace, selector, since string) (string, error) {
+	sinceSeconds, err := parseSinceSeconds(since)
+	if err != nil {
+		return "", err
+	}
+	cs, err := c.clientset()
+	if err != nil {
+		return "", fmt.Errorf("resolving client-go client: %w", err)
+	}
+	pods, err := cs.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return "", fmt.Errorf("listing pods for %q via client-go: %w", selector, err)
+	}
+
+	var out strings.Builder
+	var failures []error
+	for _, pod := range pods.Items {
+		if err := c.appendPodLog(&out, cs, namespace, pod, sinceSeconds); err != nil {
+			failures = append(failures, fmt.Errorf("pod %s: %w", pod.Name, err))
+		}
+	}
+	if len(pods.Items) > 0 && len(failures) == len(pods.Items) {
+		return "", fmt.Errorf("reading controller log via client-go: every matched pod failed: %w", errors.Join(failures...))
+	}
+	return out.String(), nil
+}
+
+// appendPodLog opens and fully reads one pod's log stream and writes its
+// content to out. The stream is closed on every exit path — including a
+// Read that fails partway through — so a mid-stream error on one pod can
+// never leak its connection into the next pod's read.
+func (c *clientGoKubeClient) appendPodLog(out *strings.Builder, cs kubernetes.Interface, namespace string, pod corev1.Pod, sinceSeconds int64) error {
+	container, err := firstContainerName(pod)
+	if err != nil {
+		return err
+	}
+	stream, err := c.r.podLogStream(cs, namespace, pod.Name, container, sinceSeconds)
+	if err != nil {
+		return fmt.Errorf("opening log stream: %w", err)
+	}
+	defer stream.Close() //nolint:errcheck // the read below is what determines success; a close error on an already-fully-read stream carries nothing actionable
+	data, err := io.ReadAll(stream)
+	if err != nil {
+		return fmt.Errorf("reading log stream: %w", err)
+	}
+	out.Write(data)
+	return nil
+}
+
+// firstContainerName returns pod's first container name — the same
+// container kubectl logs selects by default when no --container flag is
+// given, whether the pod carries one container or several.
+func firstContainerName(pod corev1.Pod) (string, error) {
+	if len(pod.Spec.Containers) == 0 {
+		return "", fmt.Errorf("pod %s carries no containers", pod.Name)
+	}
+	return pod.Spec.Containers[0].Name, nil
+}
+
+// podLogStream opens one pod/container's log stream — the mechanism
+// ProviderLogs' client-go backend reads through. podLogStreamFunc, when
+// set, overrides this for tests: the built-in fake Clientset's GetLogs
+// always returns identical canned content with a 200 status for every pod
+// and cannot express either distinct per-pod content or a mid-stream
+// failure, so a test proving either needs this seam instead.
+func (r *Runner) podLogStream(cs kubernetes.Interface, namespace, podName, container string, sinceSeconds int64) (io.ReadCloser, error) {
+	if r.podLogStreamFunc != nil {
+		return r.podLogStreamFunc(namespace, podName, container, sinceSeconds)
+	}
+	opts := &corev1.PodLogOptions{Container: container, SinceSeconds: &sinceSeconds}
+	return cs.CoreV1().Pods(namespace).GetLogs(podName, opts).Stream(context.Background())
+}
+
 // kube returns the KubeClient backend for this Runner. It is a method
 // rather than a field populated at construction so a Runner built as a bare
 // struct literal — every existing test constructs one this way, setting
@@ -631,8 +751,8 @@ func (c *clientGoKubeClient) WaitForCondition(namespace, name, condition, timeou
 //     rather than exercising it, so it stays on the exec backend it was
 //     already wired for.
 //  3. Otherwise: the client-go backend for event listing, resource reads,
-//     the two merge-patch operations and the Ready wait (the default,
-//     production behaviour), built from
+//     the two merge-patch operations, the Ready wait, and the
+//     controller-log read (the default, production behaviour), built from
 //     kubeClientsetFunc/kubeDynamicFunc/restMapperFunc when a test has set
 //     them, or from the ambient kubeconfig otherwise. Every other
 //     operation still delegates to the embedded exec backend.
@@ -667,6 +787,6 @@ func kubeBackendSelectionLine(forcedExec, execFallback bool) string {
 	case execFallback:
 		return "kube backend: exec (all operations — test harness has no client-go override)"
 	default:
-		return "kube backend: client-go (event list, resource read, patch, wait), exec (all other operations)"
+		return "kube backend: client-go (event list, resource read, patch, wait, log), exec (all other operations)"
 	}
 }

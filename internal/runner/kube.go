@@ -165,12 +165,16 @@ func eventFieldSelector(kind, name, namespace string) string {
 	}.String()
 }
 
-// kubeBackendEnvVar selects which backend serves the event-list operation.
-// "exec" forces every KubeClient operation, including events, onto the exec
-// backend — the rollback path if the client-go path misbehaves on a
-// provider this migration's own live run did not cover. Any other value,
-// including unset, routes event listing through the client-go backend and
-// leaves every other operation on the exec backend.
+// kubeBackendEnvVar selects which backend serves the operations that have
+// been migrated to client-go so far. "exec" forces every KubeClient
+// operation, migrated ones included, onto the exec backend — the rollback
+// path if the client-go path misbehaves on a provider this migration's own
+// live run did not cover. Any other value, including unset, routes the
+// migrated operations through the client-go backend and leaves every other
+// operation on the exec backend. kubeBackendSelectionLine below is the
+// single authoritative statement of which operations that is; this comment
+// deliberately does not repeat the list, because a second copy goes stale
+// on the next slice of the migration and has already done so once.
 const kubeBackendEnvVar = "UPDATE_TESTER_KUBE_BACKEND"
 
 // clientGoKubeClient overrides event listing and resource reads with direct

@@ -41,6 +41,7 @@ update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
 update-tester resolve-recover <manifest.yaml> [--timeout 120]
 update-tester roundtrip-diff <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30]
 update-tester roundtrip-verify <m1.yaml,m2.yaml,...> --backend <real|simulator> [--root <dir>] [--timeout 30]
+update-tester residual <examples-dir>
 update-tester hook <invocation-name> [--root <dir>] [--manifest <path>] [--skip-converge]
 update-tester version
 ```
@@ -799,6 +800,47 @@ decision:
   reproduced.
 
 Like `roundtrip-diff`, this command is entirely read-only.
+
+### `residual` — repo-scope cell-denominator residual
+
+```
+update-tester residual <examples-dir>
+```
+
+Walks a directory tree of example manifests and reports the repo-scope
+cell-denominator residual: every `skip:` entry across every fixture that
+declares an evidence-tier `disposition:` (`statically-provable`,
+`one-live-patch`, `declared-exclusion`, or `defect`), enumerated one row per
+field per fixture.
+
+It exists because every ad-hoc script that has taken this measurement by hand
+parsed the `crossplane.io/update-test` annotation itself. The annotation body
+is a YAML list optionally preceded by directive lines
+(`converge-skip:`, `assert-unchanged:`, `ignore-fields:`), which is not valid
+as a single plain YAML document, so a bare `yaml.safe_load` raises on every
+fixture using that form — and a blanket "skip on error" drops the fixture from
+both the numerator and the denominator in the same step, while the output
+still looks internally consistent.
+
+`residual` goes through the tool's own manifest parser instead, so it can
+never diverge from what the tool itself considers a valid annotation, and a
+fixture that fails to parse is named rather than silently dropped:
+
+- `fixtures_with_annotation` and `parsed_ok` are printed as a pair on the
+  first line. The command exits non-zero whenever they differ — a residual
+  count with no denominator beside it is unfalsifiable.
+- Every fixture that carries the annotation but fails to parse is printed by
+  path, with the underlying error. It is never folded into "no annotation
+  found".
+- Rows are grouped by disposition, then by fixture, then by field — never
+  collapsed into a bare total. `declared-exclusion` (a standing human
+  declaration that can never be mechanically re-checked) is always its own
+  group, distinct from the other three dispositions, which are re-checkable
+  claims.
+
+This command is entirely offline and read-only: no cluster is touched, and it
+never asserts whether a waiver still holds against live behaviour — that is
+`roundtrip-verify`'s job.
 
 ### `hook` — the post-assert entry point
 

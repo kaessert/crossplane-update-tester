@@ -1638,6 +1638,120 @@ func TestParseRoundtripVerifyArgsBackendFlag(t *testing.T) {
 	}
 }
 
+// ─── residual ─────────────────────────────────────────────────────────────
+
+// TestRunCommandDispatchesResidual mirrors TestRunCommandDispatchesRoundtripDiff:
+// calling residual with no directory argument must fail with residual's OWN
+// usage error, not errUnknownCommand — the failure mode that would appear if
+// the "case residual" line were ever accidentally removed or misspelled.
+func TestRunCommandDispatchesResidual(t *testing.T) {
+	err := runCommand("residual", nil)
+	if err == nil {
+		t.Fatal("residual with no directory accepted, want a usage error")
+	}
+	if errors.Is(err, errUnknownCommand) {
+		t.Errorf("error %v wraps errUnknownCommand — residual is not wired into the dispatch switch", err)
+	}
+	if !strings.Contains(err.Error(), "residual") {
+		t.Errorf("error %q does not name the residual usage", err)
+	}
+}
+
+// TestParseResidualArgsRequiresDirectory confirms the one positional
+// argument is mandatory and is carried through unchanged.
+func TestParseResidualArgsRequiresDirectory(t *testing.T) {
+	if _, err := parseResidualArgs(nil); err == nil {
+		t.Error("parseResidualArgs with no directory accepted, want an error")
+	}
+
+	got, err := parseResidualArgs([]string{"/repo/examples"})
+	if err != nil {
+		t.Fatalf("parseResidualArgs: %v", err)
+	}
+	if got.root != "/repo/examples" {
+		t.Errorf("root = %q, want %q", got.root, "/repo/examples")
+	}
+}
+
+// TestCmdResidualEndToEnd exercises cmdResidual against a small tree on
+// disk: one fixture with two disposition-carrying skip: entries, and one
+// fixture whose annotation fails to parse. The counts pair must be
+// printed, the malformed fixture must be named, and the command's error
+// must reflect the mismatch — this is the same contract the CLI's own
+// reference measurement leans on, exercised here without touching a real
+// provider checkout.
+func TestCmdResidualEndToEnd(t *testing.T) {
+	root := t.TempDir()
+
+	good := filepath.Join(root, "widget.yaml")
+	goodSrc := `apiVersion: widget.example.crossplane.io/v1alpha1
+kind: Widget
+metadata:
+  name: example-widget
+  annotations:
+    crossplane.io/update-test: |
+      - field: privateKey
+        skip:
+          reason: write-only
+          disposition: statically-provable
+      - field: region
+        skip:
+          reason: write-only
+          disposition: one-live-patch
+`
+	if err := os.WriteFile(good, []byte(goodSrc), 0o600); err != nil {
+		t.Fatalf("writing %s: %v", good, err)
+	}
+
+	bad := filepath.Join(root, "broken-widget.yaml")
+	badSrc := `apiVersion: widget.example.crossplane.io/v1alpha1
+kind: Widget
+metadata:
+  name: broken-widget
+  annotations:
+    crossplane.io/update-test: [ - field: x
+`
+	if err := os.WriteFile(bad, []byte(badSrc), 0o600); err != nil {
+		t.Fatalf("writing %s: %v", bad, err)
+	}
+
+	err := cmdResidual([]string{root})
+	if err == nil {
+		t.Fatal("cmdResidual with a malformed fixture returned nil, want a non-zero-exit error")
+	}
+	if !strings.Contains(err.Error(), bad) {
+		t.Errorf("error %q does not name the malformed fixture %s", err.Error(), bad)
+	}
+	if !strings.Contains(err.Error(), "fixtures_with_annotation=2") || !strings.Contains(err.Error(), "parsed_ok=1") {
+		t.Errorf("error %q does not report the fixtures_with_annotation/parsed_ok pair", err.Error())
+	}
+}
+
+// TestCmdResidualAllFixturesParseIsClean confirms a tree with no malformed
+// fixtures produces a nil error — the mismatch check must never fire on
+// its own when there is nothing to report.
+func TestCmdResidualAllFixturesParseIsClean(t *testing.T) {
+	root := t.TempDir()
+	src := `apiVersion: widget.example.crossplane.io/v1alpha1
+kind: Widget
+metadata:
+  name: example-widget
+  annotations:
+    crossplane.io/update-test: |
+      - field: privateKey
+        skip:
+          reason: write-only
+          disposition: statically-provable
+`
+	if err := os.WriteFile(filepath.Join(root, "widget.yaml"), []byte(src), 0o600); err != nil {
+		t.Fatalf("writing fixture: %v", err)
+	}
+
+	if err := cmdResidual([]string{root}); err != nil {
+		t.Errorf("cmdResidual over an all-clean tree returned %v, want nil", err)
+	}
+}
+
 // containerClearFixtureCRDForMain mirrors the roundtrip package's own
 // fixture shape (one scalar, one list, one map leaf) so
 // buildRoundtripVerifyReport can be tested end to end without a live

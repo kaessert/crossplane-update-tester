@@ -49,6 +49,7 @@
 //	update-tester resolve-recover <manifest.yaml> [--timeout 120]
 //	update-tester roundtrip-diff <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30]
 //	update-tester roundtrip-verify <m1.yaml,m2.yaml,...> --backend <real|simulator> [--root <dir>] [--timeout 30]
+//	update-tester residual <examples-dir>
 //	update-tester hook <invocation-name> [--root <dir>] [--manifest <path>] [--skip-converge]
 //	update-tester version
 package main
@@ -71,6 +72,7 @@ import (
 	"github.com/kaessert/crossplane-update-tester/internal/differ"
 	"github.com/kaessert/crossplane-update-tester/internal/hook"
 	"github.com/kaessert/crossplane-update-tester/internal/manifest"
+	"github.com/kaessert/crossplane-update-tester/internal/residual"
 	"github.com/kaessert/crossplane-update-tester/internal/roundtrip"
 	"github.com/kaessert/crossplane-update-tester/internal/runner"
 	"github.com/kaessert/crossplane-update-tester/internal/validator"
@@ -131,6 +133,8 @@ func runCommand(name string, args []string) error {
 		return cmdRoundtripDiff(args)
 	case "roundtrip-verify":
 		return cmdRoundtripVerify(args)
+	case "residual":
+		return cmdResidual(args)
 	case "hook":
 		return cmdHook(args)
 	case "version":
@@ -156,6 +160,7 @@ update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
 update-tester resolve-recover <manifest.yaml> [--timeout 120]
 update-tester roundtrip-diff <m1.yaml,m2.yaml,...> [--root <dir>] [--timeout 30]
 update-tester roundtrip-verify <m1.yaml,m2.yaml,...> --backend <real|simulator> [--root <dir>] [--timeout 30]
+update-tester residual <examples-dir>
 update-tester hook <invocation-name> [--root <dir>] [--manifest <path>] [--skip-converge]
 update-tester version`
 
@@ -226,6 +231,12 @@ Commands:
              provenance for those additive fields and is REQUIRED — there
              is no default and no inference from a provider name or
              endpoint.
+  residual   Walk a whole examples/ tree and report the repo-scope
+             cell-denominator residual: every disposition-carrying skip:
+             entry, parsed through the tool's own manifest parser. Prints
+             fixtures_with_annotation and parsed_ok as a pair and exits
+             non-zero when they differ — offline and read-only, no
+             cluster touched
   hook       Derive a manifest from the name this binary was invoked
              under and run the full post-assert sequence for it
   version    Print the version of the tool in use
@@ -1609,6 +1620,61 @@ func cmdRoundtripVerify(args []string) error {
 	}
 	if anyFindings {
 		return errors.New("one or more must-test fields carry a skip: waiver this live run could not confirm")
+	}
+	return nil
+}
+
+// ─── residual ─────────────────────────────────────────────────────────────
+
+// residualOptions holds the parsed command line of the `residual` subcommand.
+type residualOptions struct {
+	root string
+}
+
+func parseResidualArgs(args []string) (residualOptions, error) {
+	fs := flag.NewFlagSet("residual", flag.ContinueOnError)
+	if err := fs.Parse(cli.ReorderArgs(fs, args)); err != nil {
+		return residualOptions{}, err
+	}
+	if fs.NArg() < 1 {
+		return residualOptions{}, errors.New("usage: update-tester residual <examples-dir>")
+	}
+	return residualOptions{root: fs.Arg(0)}, nil
+}
+
+// cmdResidual walks a provider's whole examples/ tree and reports the
+// repo-scope cell-denominator residual: every disposition-carrying skip:
+// entry, parsed through the tool's own manifest parser rather than a
+// caller-written re-implementation — see package residual's own doc
+// comment for why every ad-hoc script taking this measurement by hand has
+// under-reported it.
+//
+// This is offline and read-only: no cluster is touched, and nothing here
+// is a live check of whether a waiver still holds (that is
+// roundtrip-verify's job). Its own exit status reflects only whether every
+// fixture carrying the annotation actually parsed — fixtures_with_annotation
+// and parsed_ok are printed as a pair, and a fixture that fails to parse is
+// named rather than silently folded into "no annotation".
+func cmdResidual(args []string) error {
+	opts, err := parseResidualArgs(args)
+	if err != nil {
+		return err
+	}
+
+	res, err := residual.Scan(opts.root)
+	if err != nil {
+		return fmt.Errorf("residual: %w", err)
+	}
+
+	residual.PrintReport(os.Stdout, res)
+
+	if res.Counts.FixturesWithAnnotation != res.Counts.ParsedOK {
+		names := make([]string, len(res.Failures))
+		for i, f := range res.Failures {
+			names[i] = f.Path
+		}
+		return fmt.Errorf("residual: fixtures_with_annotation=%d parsed_ok=%d — %d fixture(s) failed to parse: %s",
+			res.Counts.FixturesWithAnnotation, res.Counts.ParsedOK, len(res.Failures), strings.Join(names, ", "))
 	}
 	return nil
 }

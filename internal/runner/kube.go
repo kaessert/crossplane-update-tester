@@ -46,7 +46,8 @@ type KubeClient interface {
 	// resolveControllerDeploymentName). They are expected to be deleted,
 	// not ported to a future client-go backend, once the fleet-wide
 	// event-burst-size flip lands everywhere and this workaround is no
-	// longer needed.
+	// longer needed — tickets IN-EVENT-BURST-ON (provider-infobloxnios)
+	// and FLEET-EVENT-BURST-ON (the remaining providers).
 	RolloutRestart(namespace, target string) (string, error)
 	RolloutStatus(namespace, target, timeout string) (string, error)
 	GetPodsJSONPath(namespace, selector, jsonPath string) (string, error)

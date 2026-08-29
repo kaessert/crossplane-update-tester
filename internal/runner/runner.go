@@ -16,7 +16,10 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"k8s.io/client-go/kubernetes"
 
 	"github.com/kaessert/crossplane-update-tester/internal/differ"
 	"github.com/kaessert/crossplane-update-tester/internal/manifest"
@@ -94,6 +97,21 @@ type Runner struct {
 	// default", read through the eventBurstCeiling accessor rather than
 	// this field directly.
 	burstCeiling int
+
+	// kubeClientsetOnce, kubeClientset and kubeClientsetErr memoize the
+	// client-go Clientset the client-go KubeClient backend resolves from
+	// the ambient kubeconfig (see goClientset) — built at most once per
+	// Runner, since ListEventsForObject is called once per event read
+	// rather than once per Runner.
+	kubeClientsetOnce sync.Once
+	kubeClientset     kubernetes.Interface
+	kubeClientsetErr  error
+
+	// kubeClientsetFunc, when set, overrides goClientset as the mechanism
+	// the client-go KubeClient backend uses to obtain a Clientset. Tests
+	// inject a fake clientset constructor here; production code leaves it
+	// nil and goClientset builds one from the ambient kubeconfig.
+	kubeClientsetFunc func() (kubernetes.Interface, error)
 }
 
 // sleep waits d, calling sleepFunc instead of time.Sleep when a test has

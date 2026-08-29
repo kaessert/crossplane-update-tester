@@ -1,8 +1,15 @@
 package runner
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 )
 
 // TestKubeClientArgvEquivalence captures the exact kubectl argv the
@@ -73,10 +80,17 @@ func TestKubeClientArgvEquivalence(t *testing.T) {
 			call:     func(c KubeClient) (string, error) { return c.WaitForCondition(ns, name, condition, timeout) },
 			wantArgs: []string{"wait", name, "--for=condition=Ready", "--timeout=300s", "-n", ns},
 		},
-		"ListEventsAllNamespaces": {
-			reason:   "countEventsByReason listed events across every namespace, and never carried a -n flag",
-			call:     func(c KubeClient) (string, error) { return c.ListEventsAllNamespaces() },
-			wantArgs: []string{"get", "events", "--all-namespaces", "-o", "json"},
+		"ListEventsForObject namespaced": {
+			reason: "countEventsByReason's exec backend lists events across every namespace, narrowed by a field selector on involvedObject, and never carries a -n flag",
+			call:   func(c KubeClient) (string, error) { return c.ListEventsForObject(testKindExample, name, ns) },
+			wantArgs: []string{"get", "events", "--all-namespaces", "-o", "json", "--field-selector",
+				"involvedObject.kind=" + testKindExample + ",involvedObject.name=" + name + ",involvedObject.namespace=" + ns},
+		},
+		"ListEventsForObject cluster-scoped": {
+			reason: "a cluster-scoped resource's field selector carries an explicit EMPTY involvedObject.namespace term, never an omitted one — omitting it would match ANY namespace, including a namespaced sibling's",
+			call:   func(c KubeClient) (string, error) { return c.ListEventsForObject(testKindExample, name, "") },
+			wantArgs: []string{"get", "events", "--all-namespaces", "-o", "json", "--field-selector",
+				"involvedObject.kind=" + testKindExample + ",involvedObject.name=" + name + ",involvedObject.namespace="},
 		},
 		"ProviderLogs": {
 			reason: "countUpdateLogCalls always sent --tail=-1 ahead of --since, scoped to the PROVIDER namespace by an explicit -n rather than the resource's own namespace",
@@ -131,9 +145,11 @@ func TestKubeClientArgvEquivalence(t *testing.T) {
 }
 
 // TestRunnerKubeUsesExecFunc proves the existing execFunc test seam still
-// governs KubeClient's exec backend: a Runner built as a bare struct
-// literal with execFunc set (exactly how every pre-existing test in this
-// package constructs one) never shells out to a real kubectl binary.
+// governs KubeClient's exec backend for a test Runner that has not opted
+// into the client-go path: a Runner built as a bare struct literal with
+// execFunc set and no kubeClientsetFunc (exactly how every pre-existing
+// test in this package constructs one) never shells out to a real kubectl
+// binary, and never attempts to build a real client-go client either.
 func TestRunnerKubeUsesExecFunc(t *testing.T) {
 	called := false
 	r := &Runner{execFunc: func(args []string) (string, error) {
@@ -141,7 +157,7 @@ func TestRunnerKubeUsesExecFunc(t *testing.T) {
 		return "ok", nil
 	}}
 
-	out, err := r.kube().ListEventsAllNamespaces()
+	out, err := r.kube().ListEventsForObject(testKindExample, testNameExample, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -150,5 +166,221 @@ func TestRunnerKubeUsesExecFunc(t *testing.T) {
 	}
 	if out != "ok" {
 		t.Fatalf("got %q, want %q", out, "ok")
+	}
+}
+
+// TestRunnerKubeBackendEnvVarForcesExec proves UPDATE_TESTER_KUBE_BACKEND=exec
+// overrides EVEN a Runner that HAS a working client-go override — the escape
+// hatch must win over the default routing rule, not merely apply when no
+// client-go client is available.
+func TestRunnerKubeBackendEnvVarForcesExec(t *testing.T) {
+	t.Setenv(kubeBackendEnvVar, "exec")
+
+	execCalled := false
+	clientsetCalled := false
+	r := &Runner{
+		execFunc: func(args []string) (string, error) {
+			execCalled = true
+			return `{"items":[]}`, nil
+		},
+		kubeClientsetFunc: func() (kubernetes.Interface, error) {
+			clientsetCalled = true
+			return fake.NewSimpleClientset(), nil
+		},
+	}
+
+	if _, err := r.kube().ListEventsForObject(testKindExample, testNameExample, ""); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !execCalled {
+		t.Error("execFunc was not invoked; UPDATE_TESTER_KUBE_BACKEND=exec did not force the exec backend")
+	}
+	if clientsetCalled {
+		t.Error("kubeClientsetFunc was invoked; UPDATE_TESTER_KUBE_BACKEND=exec must bypass the client-go backend entirely")
+	}
+}
+
+// TestRunnerKubeDefaultsToClientGoForEvents proves the DEFAULT routing (no
+// env var, no execFunc) serves ListEventsForObject through the client-go
+// backend — "this operation defaults to the Go backend once parity is
+// proven" is the routing rule under test, not merely something the escape
+// hatch can opt into.
+func TestRunnerKubeDefaultsToClientGoForEvents(t *testing.T) {
+	clientsetCalled := false
+	r := &Runner{
+		kubeClientsetFunc: func() (kubernetes.Interface, error) {
+			clientsetCalled = true
+			return fake.NewSimpleClientset(), nil
+		},
+	}
+
+	if _, err := r.kube().ListEventsForObject(testKindExample, testNameExample, ""); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !clientsetCalled {
+		t.Fatal("kubeClientsetFunc was not invoked; ListEventsForObject did not default to the client-go backend")
+	}
+}
+
+// TestEventFieldSelectorIsDeterministic proves eventFieldSelector's output
+// does not depend on Go's randomised map iteration order: fields.Set.String()
+// sorts its terms, but fields.Set.AsSelector().String() does not, and using
+// the wrong one would make this seam's argv-equivalence assertions and the
+// client-go FieldSelector both flaky across runs.
+func TestEventFieldSelectorIsDeterministic(t *testing.T) {
+	want := eventFieldSelector(testKindExample, testNameExample, testNamespaceExample)
+	for i := 0; i < 20; i++ {
+		if got := eventFieldSelector(testKindExample, testNameExample, testNamespaceExample); got != want {
+			t.Fatalf("call %d: eventFieldSelector() = %q, want %q (non-deterministic term order)", i, got, want)
+		}
+	}
+}
+
+// newTestClientGoEvent builds a corev1.Event for seeding a fake clientset,
+// mirroring newTestEventItemScoped's fields but as the native client-go
+// type ListEventsForObject actually queries. name must be unique within
+// namespace for the fake object tracker.
+func newTestClientGoEvent(name, namespace, reason string, count int32, kind, involvedName, involvedNamespace, apiVersion string) *corev1.Event {
+	objNamespace := namespace
+	if objNamespace == "" {
+		objNamespace = "crossplane-system"
+	}
+	return &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: objNamespace},
+		Reason:     reason,
+		Count:      count,
+		InvolvedObject: corev1.ObjectReference{
+			Kind:       kind,
+			Name:       involvedName,
+			Namespace:  involvedNamespace,
+			APIVersion: apiVersion,
+		},
+	}
+}
+
+// TestClientGoKubeClientListEventsForObjectSendsFieldSelector proves the
+// client-go backend actually issues the SAME field selector the exec
+// backend builds (see TestKubeClientArgvEquivalence's ListEventsForObject
+// cases), by capturing the fake clientset's recorded List action rather
+// than trusting the return value alone — the fake ignores FieldSelector
+// when deciding what to return, so only inspecting the action proves the
+// selector was actually sent.
+func TestClientGoKubeClientListEventsForObjectSendsFieldSelector(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	r := &Runner{kubeClientsetFunc: func() (kubernetes.Interface, error) { return cs, nil }}
+
+	if _, err := r.kube().ListEventsForObject(testKindExample, testNameExample, testNamespaceExample); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	want := eventFieldSelector(testKindExample, testNameExample, testNamespaceExample)
+	var gotSelector string
+	var found bool
+	for _, action := range cs.Actions() {
+		listAction, ok := action.(ktesting.ListAction)
+		if !ok {
+			continue
+		}
+		found = true
+		gotSelector = listAction.GetListRestrictions().Fields.String()
+	}
+	if !found {
+		t.Fatal("no List action recorded against the fake clientset")
+	}
+	if gotSelector != want {
+		t.Errorf("FieldSelector = %q, want %q", gotSelector, want)
+	}
+}
+
+// TestCountEventsByReasonExecAndClientGoAgreeOnAggregatedCount is the AC's
+// load-bearing parity proof: for the SAME cluster state — one aggregated
+// Event whose .count is 7, i.e. greater than 1 — the exec backend (parsing
+// kubectl's JSON) and the client-go backend (parsing a corev1.EventList
+// marshalled back to the same JSON shape) must report the identical
+// occurrence count. A backend that counted Items instead of summing .count
+// would silently report 1 instead of 7 on whichever path had the bug.
+func TestCountEventsByReasonExecAndClientGoAgreeOnAggregatedCount(t *testing.T) {
+	const wantCount = 7
+
+	// Exec path: canned kubectl JSON, forced onto the exec backend via the
+	// escape hatch so this Runner's default routing cannot mask the
+	// comparison.
+	t.Setenv(kubeBackendEnvVar, "exec")
+	execRunner := &Runner{execFunc: func(args []string) (string, error) {
+		list := eventList{Items: []eventItem{
+			newTestEventItem(eventReasonUpdated, wantCount, testKindExample, testNameExample),
+		}}
+		b, err := json.Marshal(list)
+		if err != nil {
+			return "", err
+		}
+		return string(b), nil
+	}}
+	gotExec, err := execRunner.countEventsByReason(testKindExample, testNameExample, "", "", eventReasonUpdated)
+	if err != nil {
+		t.Fatalf("exec path: countEventsByReason() error = %v", err)
+	}
+
+	// client-go path: the same logical event, seeded as a native
+	// corev1.Event into a fake clientset — no env var, proving the
+	// DEFAULT routing serves this.
+	t.Setenv(kubeBackendEnvVar, "")
+	cs := fake.NewSimpleClientset(
+		newTestClientGoEvent("evt-1", "", eventReasonUpdated, wantCount, testKindExample, testNameExample, "", ""),
+	)
+	goRunner := &Runner{kubeClientsetFunc: func() (kubernetes.Interface, error) { return cs, nil }}
+	gotGo, err := goRunner.countEventsByReason(testKindExample, testNameExample, "", "", eventReasonUpdated)
+	if err != nil {
+		t.Fatalf("client-go path: countEventsByReason() error = %v", err)
+	}
+
+	if gotExec != wantCount {
+		t.Errorf("exec path: countEventsByReason() = %d, want %d", gotExec, wantCount)
+	}
+	if gotGo != wantCount {
+		t.Errorf("client-go path: countEventsByReason() = %d, want %d", gotGo, wantCount)
+	}
+	if gotExec != gotGo {
+		t.Errorf("exec and client-go paths disagree for identical cluster state: exec=%d, client-go=%d", gotExec, gotGo)
+	}
+}
+
+// TestCountEventsByReasonClientGoDoesNotCrossMatchNamespacedSibling proves
+// the client-go path preserves the invariant that a cluster-scoped resource
+// matches only events whose involvedObject carries no namespace, even
+// though the fake clientset (like a defensive real backend would not be
+// relied upon to do this alone) returns every seeded event regardless of
+// the field selector — the client-side re-check in
+// sumEventOccurrencesByReason is what actually enforces the invariant, and
+// this test proves it still fires on events sourced from client-go.
+func TestCountEventsByReasonClientGoDoesNotCrossMatchNamespacedSibling(t *testing.T) {
+	const (
+		clusterScopedCount = 3
+		namespacedCount    = 40
+	)
+	cs := fake.NewSimpleClientset(
+		newTestClientGoEvent("evt-cluster", "", eventReasonUpdated, clusterScopedCount,
+			testKindExample, testNameExample, "", testAPIVersionClusterScoped),
+		newTestClientGoEvent("evt-namespaced", testNamespaceExample, eventReasonUpdated, namespacedCount,
+			testKindExample, testNameExample, testNamespaceExample, testAPIVersionNamespaced),
+	)
+	r := &Runner{kubeClientsetFunc: func() (kubernetes.Interface, error) { return cs, nil }}
+
+	gotClusterScoped, err := r.countEventsByReason(testKindExample, testNameExample, "", testAPIVersionClusterScoped, eventReasonUpdated)
+	if err != nil {
+		t.Fatalf("cluster-scoped: countEventsByReason() error = %v", err)
+	}
+	if gotClusterScoped != clusterScopedCount {
+		t.Errorf("cluster-scoped: countEventsByReason() = %d, want %d (must not include the namespaced sibling's %d)",
+			gotClusterScoped, clusterScopedCount, namespacedCount)
+	}
+
+	gotNamespaced, err := r.countEventsByReason(testKindExample, testNameExample, testNamespaceExample, testAPIVersionNamespaced, eventReasonUpdated)
+	if err != nil {
+		t.Fatalf("namespaced: countEventsByReason() error = %v", err)
+	}
+	if gotNamespaced != namespacedCount {
+		t.Errorf("namespaced: countEventsByReason() = %d, want %d (must not include the cluster-scoped sibling's %d)",
+			gotNamespaced, namespacedCount, clusterScopedCount)
 	}
 }

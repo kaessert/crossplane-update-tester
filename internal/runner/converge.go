@@ -903,13 +903,16 @@ func reconcileRequestOf(line string) (reconcileRequest, bool) {
 
 // countEventsByReason lists cluster events and sums the aggregated
 // occurrence count of every event matching the given involvedObject
-// kind/name/namespace/apiVersion and any of the given reasons. Queries
-// across all namespaces because cluster-scoped managed resources may have
-// their events recorded outside the resource's own namespace — the
-// namespace argument then filters the decoded list down to the one
-// involvedObject the caller means (see sumEventOccurrencesByReason).
+// kind/name/namespace/apiVersion and any of the given reasons. The
+// underlying KubeClient query is narrowed server-side by a field selector
+// on involvedObject kind/name/namespace (see ListEventsForObject), but
+// still spans every namespace: cluster-scoped managed resources may have
+// their events recorded outside the resource's own namespace, so the
+// selector's namespace term matches the TARGET's namespace, never the
+// Event object's own. sumEventOccurrencesByReason re-verifies namespace and
+// apiVersion on every returned Item regardless, as a client-side backstop.
 func (r *Runner) countEventsByReason(kind, name, namespace, apiVersion string, reasons ...string) (int, error) {
-	out, err := r.kube().ListEventsAllNamespaces()
+	out, err := r.kube().ListEventsForObject(kind, name, namespace)
 	if err != nil {
 		return 0, fmt.Errorf("listing events: %w", err)
 	}

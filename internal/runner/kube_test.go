@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/discovery/cached/memory"
 	discoveryfake "k8s.io/client-go/discovery/fake"
 	"k8s.io/client-go/dynamic"
@@ -803,5 +804,303 @@ func TestResourceGVRRejectsNameWithNoTypeSegment(t *testing.T) {
 	c := &clientGoKubeClient{execKubeClient: &execKubeClient{r: &Runner{}}}
 	if _, err := c.resourceGVR(testNameExample); err == nil {
 		t.Fatal("resourceGVR() error = nil for a name with no type segment, want a non-nil error")
+	}
+}
+
+// newTestPatchRunner builds a Runner wired for the client-go patch tests
+// below: a memoized fakeRESTMapper resolving testGetObjectName to testGVR,
+// and dynClient as the dynamic client the client-go backend patches
+// against. No execFunc is set, so kube() defaults to the client-go backend
+// for every test in this section unless a case explicitly forces exec.
+func newTestPatchRunner(dynClient dynamic.Interface) *Runner {
+	return &Runner{
+		restMapperFunc:  func() (meta.RESTMapper, error) { return &fakeRESTMapper{gvr: testGVR}, nil },
+		kubeDynamicFunc: func() (dynamic.Interface, error) { return dynClient, nil },
+	}
+}
+
+// lastPatchAction returns the last PatchAction recorded against a fake
+// dynamic client's Actions(), failing the test if none was recorded. "Last"
+// rather than "only" mirrors how the rest of this file inspects fake
+// clientset actions (see TestGetObjectJSONResolvesGVRAndReadsViaDynamicClient).
+func lastPatchAction(t *testing.T, actions []ktesting.Action) ktesting.PatchAction {
+	t.Helper()
+	var found ktesting.PatchAction
+	for _, action := range actions {
+		if a, ok := action.(ktesting.PatchAction); ok {
+			found = a
+		}
+	}
+	if found == nil {
+		t.Fatal("no Patch action recorded against the fake dynamic client")
+	}
+	return found
+}
+
+// TestClientGoKubeClientPatchOperationsUseMergePatchType is the AC's
+// patch-type proof: both PatchMerge and PatchMergeStatus must issue a JSON
+// MERGE patch (RFC 7386) and nothing else. StrategicMergePatchType is not
+// supported by custom resources at all; JSONPatchType would interpret the
+// patch body as an operation array rather than a merge document. Either
+// would silently change what every clear: and per-key-null entry in the
+// fleet MEANS while still exiting zero on the easy cases, so this is
+// checked directly against the recorded action's patch type rather than
+// inferred from a successful call.
+func TestClientGoKubeClientPatchOperationsUseMergePatchType(t *testing.T) {
+	const patchJSON = `{"spec":{"forProvider":{"field":"value"}}}`
+
+	cases := map[string]struct {
+		reason string
+		call   func(c KubeClient) (string, error)
+	}{
+		"PatchMerge": {
+			reason: "the main-body patch must be a JSON merge patch",
+			call: func(c KubeClient) (string, error) {
+				return c.PatchMerge(testNamespaceExample, testGetObjectName, patchJSON)
+			},
+		},
+		"PatchMergeStatus": {
+			reason: "the status-subresource patch must ALSO be a JSON merge patch, not just the body patch",
+			call: func(c KubeClient) (string, error) {
+				return c.PatchMergeStatus(testNamespaceExample, testGetObjectName, `{"status":{"conditions":[]}}`)
+			},
+		},
+	}
+
+	for tn, tc := range cases {
+		t.Run(tn, func(t *testing.T) {
+			obj := newTestUnstructuredExample(testNamespaceExample, testNameExample, "pre-patch")
+			dynClient := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), obj)
+			r := newTestPatchRunner(dynClient)
+
+			if _, err := tc.call(r.kube()); err != nil {
+				t.Fatalf("%s: unexpected error: %v", tc.reason, err)
+			}
+
+			patchAction := lastPatchAction(t, dynClient.Actions())
+			if patchAction.GetPatchType() != types.MergePatchType {
+				t.Errorf("%s: patch type = %q, want %q (application/merge-patch+json)",
+					tc.reason, patchAction.GetPatchType(), types.MergePatchType)
+			}
+		})
+	}
+}
+
+// TestClientGoKubeClientPatchMergeStatusTargetsStatusSubresource is the
+// AC's subresource proof: PatchMergeStatus's dynamic Patch call must carry
+// "status" as its trailing subresource argument. Omitting it would have
+// the API server accept the patch against the MAIN BODY, where
+// {"status":{"conditions":[]}} is silently a no-op — ClearConditions (the
+// sole caller) would then report success without ever clearing a
+// condition, and WaitReady would return immediately instead of blocking on
+// the controller re-establishing Ready.
+//
+// Manually mutation-tested in a scratch copy never pushed: dropping the
+// "status" argument from PatchMergeStatus's call to dynamicMergePatch makes
+// this test fail with subresource="" instead of "status", confirming the
+// assertion is not vacuous.
+func TestClientGoKubeClientPatchMergeStatusTargetsStatusSubresource(t *testing.T) {
+	obj := newTestUnstructuredExample(testNamespaceExample, testNameExample, "pre-patch")
+	dynClient := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), obj)
+	r := newTestPatchRunner(dynClient)
+
+	if _, err := r.kube().PatchMergeStatus(testNamespaceExample, testGetObjectName, `{"status":{"conditions":[]}}`); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	patchAction := lastPatchAction(t, dynClient.Actions())
+	if got := patchAction.GetSubresource(); got != "status" {
+		t.Errorf("PatchMergeStatus subresource = %q, want %q", got, "status")
+	}
+}
+
+// TestClientGoKubeClientPatchMergeTargetsMainBody proves PatchMerge —
+// unlike its PatchMergeStatus sibling, which shares the same
+// dynamicMergePatch helper — carries NO subresource, so the helper does not
+// leak "status" onto the main-body path.
+func TestClientGoKubeClientPatchMergeTargetsMainBody(t *testing.T) {
+	obj := newTestUnstructuredExample(testNamespaceExample, testNameExample, "pre-patch")
+	dynClient := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), obj)
+	r := newTestPatchRunner(dynClient)
+
+	if _, err := r.kube().PatchMerge(testNamespaceExample, testGetObjectName, `{"spec":{"forProvider":{"field":"value"}}}`); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	patchAction := lastPatchAction(t, dynClient.Actions())
+	if got := patchAction.GetSubresource(); got != "" {
+		t.Errorf("PatchMerge subresource = %q, want empty (main body)", got)
+	}
+}
+
+// TestClientGoKubeClientPatchBytesReachAPIServerUnmodified is the AC's
+// load-bearing byte-fidelity proof: a patch body carrying an explicit
+// null, an empty list and an empty map must reach the API server as the
+// EXACT bytes the caller built — no unmarshal into a Go map and
+// re-marshal, which is precisely where RFC-7386 removal semantics (an
+// absent key merges, an explicit null removes) collapse: a Go map cannot
+// represent "absent" and "present with an explicit null" as different
+// states, so a round trip through one silently drops every clear: this
+// tool's container-clear rule depends on.
+func TestClientGoKubeClientPatchBytesReachAPIServerUnmodified(t *testing.T) {
+	const patchJSON = `{"spec":{"forProvider":{"removedField":null,"emptyList":[],"emptyMap":{},"keptField":"kept"}}}`
+
+	cases := map[string]struct {
+		reason string
+		call   func(c KubeClient) (string, error)
+	}{
+		"PatchMerge": {
+			reason: "main-body patch bytes must pass through untouched",
+			call: func(c KubeClient) (string, error) {
+				return c.PatchMerge(testNamespaceExample, testGetObjectName, patchJSON)
+			},
+		},
+		"PatchMergeStatus": {
+			reason: "status patch bytes must ALSO pass through untouched",
+			call: func(c KubeClient) (string, error) {
+				return c.PatchMergeStatus(testNamespaceExample, testGetObjectName, patchJSON)
+			},
+		},
+	}
+
+	for tn, tc := range cases {
+		t.Run(tn, func(t *testing.T) {
+			obj := newTestUnstructuredExample(testNamespaceExample, testNameExample, "pre-patch")
+			dynClient := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), obj)
+			r := newTestPatchRunner(dynClient)
+
+			if _, err := tc.call(r.kube()); err != nil {
+				t.Fatalf("%s: unexpected error: %v", tc.reason, err)
+			}
+
+			patchAction := lastPatchAction(t, dynClient.Actions())
+			if got := string(patchAction.GetPatch()); got != patchJSON {
+				t.Errorf("%s:\n got  %s\n want %s (byte-for-byte)", tc.reason, got, patchJSON)
+			}
+		})
+	}
+}
+
+// TestRunnerKubeBackendEnvVarForcesExecForPatchOperations proves
+// UPDATE_TESTER_KUBE_BACKEND=exec forces BOTH PatchMerge and
+// PatchMergeStatus back onto the exec backend, mirroring
+// TestRunnerKubeBackendEnvVarForcesExecForGetObjectJSONSpecifically for the
+// two operations this ticket migrates.
+func TestRunnerKubeBackendEnvVarForcesExecForPatchOperations(t *testing.T) {
+	t.Setenv(kubeBackendEnvVar, "exec")
+
+	cases := map[string]struct {
+		reason string
+		call   func(c KubeClient) (string, error)
+	}{
+		"PatchMerge": {
+			reason: "the main-body patch must honour the escape hatch",
+			call:   func(c KubeClient) (string, error) { return c.PatchMerge(testNamespaceExample, testGetObjectName, `{}`) },
+		},
+		"PatchMergeStatus": {
+			reason: "the status patch must ALSO honour the escape hatch",
+			call: func(c KubeClient) (string, error) {
+				return c.PatchMergeStatus(testNamespaceExample, testGetObjectName, `{}`)
+			},
+		},
+	}
+
+	for tn, tc := range cases {
+		t.Run(tn, func(t *testing.T) {
+			execCalled := false
+			mapperCalled := false
+			dynamicCalled := false
+			r := &Runner{
+				execFunc: func(args []string) (string, error) {
+					execCalled = true
+					return "{}", nil
+				},
+				restMapperFunc: func() (meta.RESTMapper, error) {
+					mapperCalled = true
+					return &fakeRESTMapper{gvr: testGVR}, nil
+				},
+				kubeDynamicFunc: func() (dynamic.Interface, error) {
+					dynamicCalled = true
+					return dynamicfake.NewSimpleDynamicClient(runtime.NewScheme()), nil
+				},
+			}
+
+			if _, err := tc.call(r.kube()); err != nil {
+				t.Fatalf("%s: unexpected error: %v", tc.reason, err)
+			}
+			if !execCalled {
+				t.Errorf("%s: execFunc was not invoked; UPDATE_TESTER_KUBE_BACKEND=exec did not force the exec backend", tc.reason)
+			}
+			if mapperCalled || dynamicCalled {
+				t.Errorf("%s: restMapperFunc/kubeDynamicFunc were invoked; UPDATE_TESTER_KUBE_BACKEND=exec must bypass the client-go backend entirely", tc.reason)
+			}
+		})
+	}
+}
+
+// newRejectingPatchRunner builds a Runner whose client-go patch path always
+// fails with an HTTP 400 — the measured rejected-patch failure mode
+// (3800e8a7's union-arm-swap mode) — wired with the resourceName/namespace
+// every Runner method under test here reads directly rather than taking as
+// an argument.
+func newRejectingPatchRunner() *Runner {
+	dc := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme())
+	dc.PrependReactor("patch", testGVRResource, func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewBadRequest("rejected merge patch")
+	})
+	return &Runner{
+		resourceName:    testGetObjectName,
+		namespace:       testNamespaceExample,
+		restMapperFunc:  func() (meta.RESTMapper, error) { return &fakeRESTMapper{gvr: testGVR}, nil },
+		kubeDynamicFunc: func() (dynamic.Interface, error) { return dc, nil },
+	}
+}
+
+// TestClientGoBackendPatchErrorsReachEveryPatchCaller is the AC's
+// caller-behaviour proof: a rejected client-go patch (an HTTP 400) must
+// reach Runner.Patch, Runner.NudgeReconcile, Runner.ClearConditions and
+// resolve.go's three PatchMerge call sites (pause, stripExternalName,
+// unpause) as a non-nil error — exactly how a rejected kubectl patch's
+// non-zero exit reaches every one of these callers today. None of them
+// inspects the error's text or type, so "non-nil" is the entire preserved
+// contract, verified independently for each of the six callers rather than
+// asserted once and assumed to generalise.
+func TestClientGoBackendPatchErrorsReachEveryPatchCaller(t *testing.T) {
+	cases := map[string]struct {
+		reason string
+		call   func(r *Runner) error
+	}{
+		"Runner.Patch": {
+			reason: "the primary per-field update patch",
+			call:   func(r *Runner) error { return r.Patch("field", "value", nil, nil) },
+		},
+		"Runner.NudgeReconcile": {
+			reason: "the metadata-annotation nudge patch",
+			call:   func(r *Runner) error { return r.NudgeReconcile() },
+		},
+		"Runner.ClearConditions": {
+			reason: "the status-subresource condition-clear patch",
+			call:   func(r *Runner) error { return r.ClearConditions() },
+		},
+		"resolve.pause": {
+			reason: "the paused-annotation patch",
+			call:   func(r *Runner) error { return r.pause() },
+		},
+		"resolve.stripExternalName": {
+			reason: "the external-name-removal patch",
+			call:   func(r *Runner) error { return r.stripExternalName() },
+		},
+		"resolve.unpause": {
+			reason: "the paused-annotation-removal patch",
+			call:   func(r *Runner) error { return r.unpause() },
+		},
+	}
+
+	for tn, tc := range cases {
+		t.Run(tn, func(t *testing.T) {
+			if err := tc.call(newRejectingPatchRunner()); err == nil {
+				t.Fatalf("%s (%s): error = nil for a rejected client-go patch, want non-nil", tn, tc.reason)
+			}
+		})
 	}
 }

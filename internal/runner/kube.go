@@ -11,6 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/dynamic"
@@ -177,17 +178,20 @@ func eventFieldSelector(kind, name, namespace string) string {
 // on the next slice of the migration and has already done so once.
 const kubeBackendEnvVar = "UPDATE_TESTER_KUBE_BACKEND"
 
-// clientGoKubeClient overrides event listing and resource reads with direct
-// client-go calls. Every other KubeClient operation is promoted from the
-// embedded exec backend unchanged — this type exists to migrate one
-// operation at a time, not to grow into a second full backend. A shared
-// informer or watch cache is deliberately NOT used for either override: the
-// evidence check event listing feeds is a before/after delta on the same
-// object, and a lagging cache would return a stale second read and
-// manufacture a false negative — the same hazard applies to a resource read
-// used for the same before/after comparison. clientset is a func rather
-// than a stored value so it can be resolved lazily (a Runner is often built
-// before a kubeconfig is needed) and overridden by tests.
+// clientGoKubeClient overrides event listing, resource reads and the two
+// merge-patch operations with direct client-go calls. Every other KubeClient
+// operation is promoted from the embedded exec backend unchanged — this
+// type exists to migrate one operation at a time, not to grow into a second
+// full backend. A shared informer or watch cache is deliberately NOT used
+// for any override: the evidence check event listing and resource reads
+// feed is a before/after delta on the same object, and a lagging cache
+// would return a stale second read and manufacture a false negative: the
+// two patch overrides write rather than read, so a cache cannot go stale
+// under them, but they are still direct dynamic calls for the same reason
+// — no informer or watch cache is reached for anywhere in this type.
+// clientset is a func rather than a stored value so it can be resolved
+// lazily (a Runner is often built before a kubeconfig is needed) and
+// overridden by tests.
 type clientGoKubeClient struct {
 	*execKubeClient
 	clientset func() (kubernetes.Interface, error)
@@ -375,6 +379,64 @@ func (c *clientGoKubeClient) GetObjectJSON(namespace, name string) (string, erro
 	return string(data), nil
 }
 
+// PatchMerge applies a JSON merge patch to a resource's main body via a
+// direct dynamic Patch — RFC 7386 semantics and nothing else.
+// types.MergePatchType is used explicitly: StrategicMergePatchType is not
+// supported by custom resources at all, and JSONPatchType would interpret
+// patchJSON as an operation array rather than a merge document, silently
+// misreading every caller's patch. patchJSON reaches the API server exactly
+// as the caller built it — no unmarshal into a Go map and re-marshal — which
+// is the one thing this method must get right: a map round trip is where an
+// explicit `null` (a removal) and an absent key (a no-op) collapse into the
+// same Go zero value, and every clear/withValues patch this tool builds
+// depends on that distinction surviving. A rejected patch (e.g. an HTTP 400)
+// is returned as a non-nil error, unwrapped into no special case — exactly
+// how a rejected kubectl patch's non-zero exit reaches every caller today.
+func (c *clientGoKubeClient) PatchMerge(namespace, name, patchJSON string) (string, error) {
+	return c.dynamicMergePatch(namespace, name, patchJSON)
+}
+
+// PatchMergeStatus is PatchMerge's status-subresource counterpart: the same
+// RFC 7386 merge-patch semantics, with "status" passed as the dynamic
+// client's trailing subresource argument so the patch lands on the STATUS
+// subresource rather than the main body. Omitting that argument is the one
+// mistake this method exists to prevent: the API server would accept
+// {"status":{"conditions":[]}} against the main body and silently do
+// nothing there, so ClearConditions — the sole caller — would return
+// success while never actually clearing a condition, and WaitReady would
+// then return immediately instead of blocking on the controller
+// re-establishing Ready.
+func (c *clientGoKubeClient) PatchMergeStatus(namespace, name, patchJSON string) (string, error) {
+	return c.dynamicMergePatch(namespace, name, patchJSON, "status")
+}
+
+// dynamicMergePatch is PatchMerge and PatchMergeStatus's shared
+// implementation: resolve name's GVR via the memoized RESTMapper, then issue
+// a direct dynamic Patch with patchJSON's bytes passed through untouched.
+// subresources is empty for the main body and "status" for the status
+// subresource — the same dynamic.ResourceInterface.Patch signature both
+// callers share, differing only in that one trailing argument.
+func (c *clientGoKubeClient) dynamicMergePatch(namespace, name, patchJSON string, subresources ...string) (string, error) {
+	gvr, err := c.resourceGVR(name)
+	if err != nil {
+		return "", err
+	}
+	dyn, err := c.r.goDynamicClient()
+	if err != nil {
+		return "", fmt.Errorf("resolving dynamic client: %w", err)
+	}
+	obj, err := dyn.Resource(gvr).Namespace(namespace).Patch(context.Background(), objectNameOf(name),
+		types.MergePatchType, []byte(patchJSON), metav1.PatchOptions{}, subresources...)
+	if err != nil {
+		return "", fmt.Errorf("patching %s via client-go: %w", name, err)
+	}
+	data, err := json.Marshal(obj)
+	if err != nil {
+		return "", fmt.Errorf("marshalling client-go patch result: %w", err)
+	}
+	return string(data), nil
+}
+
 // kube returns the KubeClient backend for this Runner. It is a method
 // rather than a field populated at construction so a Runner built as a bare
 // struct literal — every existing test constructs one this way, setting
@@ -389,11 +451,11 @@ func (c *clientGoKubeClient) GetObjectJSON(namespace, name string) (string, erro
 //     would silently bypass that fake — no kubeconfig exists under test —
 //     rather than exercising it, so it stays on the exec backend it was
 //     already wired for.
-//  3. Otherwise: the client-go backend for event listing and resource
-//     reads (the default, production behaviour), built from
-//     kubeClientsetFunc/kubeDynamicFunc/restMapperFunc when a test has set
-//     them, or from the ambient kubeconfig otherwise. Every other
-//     operation still delegates to the embedded exec backend.
+//  3. Otherwise: the client-go backend for event listing, resource reads
+//     and the two merge-patch operations (the default, production
+//     behaviour), built from kubeClientsetFunc/kubeDynamicFunc/restMapperFunc
+//     when a test has set them, or from the ambient kubeconfig otherwise.
+//     Every other operation still delegates to the embedded exec backend.
 //
 // Whichever branch is taken, the choice is recorded to stderr exactly once
 // per Runner (see kubeBackendLogOnce) — a parity run comparing the exec and
@@ -425,6 +487,6 @@ func kubeBackendSelectionLine(forcedExec, execFallback bool) string {
 	case execFallback:
 		return "kube backend: exec (all operations — test harness has no client-go override)"
 	default:
-		return "kube backend: client-go (event list, resource read), exec (all other operations)"
+		return "kube backend: client-go (event list, resource read, patch), exec (all other operations)"
 	}
 }

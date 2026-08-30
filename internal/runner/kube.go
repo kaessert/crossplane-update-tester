@@ -27,6 +27,7 @@ import (
 	"k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
@@ -261,6 +262,53 @@ func (c *clientGoKubeClient) ListEventsForObject(kind, name, namespace string) (
 	return string(data), nil
 }
 
+// kubeClientQPS and kubeClientBurst raise client-go's client-side rate
+// limit above its defaults (rest.DefaultQPS = 5, rest.DefaultBurst = 10).
+//
+// Those defaults are sized for a controller sharing a production API server
+// with many other clients. This tool is a test harness driving a dedicated,
+// throwaway E2E control plane on which it is the only significant client,
+// and it issues roughly a dozen requests per field test. At 5 QPS a single
+// field test spends ~2.4s waiting on tokens: a measured DNSView run (156
+// field tests) took 377s at the default against 120s with the limit raised,
+// and 256s for the kubectl-per-call exec path this backend replaced. The
+// in-process migration made the tool SLOWER until this was set, because
+// every `kubectl` fork got a brand-new token bucket and one long-lived
+// client does not.
+//
+// Do NOT express this as "no limit" (a negative QPS, which makes client-go
+// skip the limiter entirely). The ceiling is what stops a defect in this
+// tool from saturating the API server of the cluster under test and
+// surfacing as an unrelated-looking E2E failure somewhere else.
+//
+// The limiter is per-PROCESS and the post-assert hook runs one process per
+// resource, so a parallel drain at -P N raises the aggregate ceiling to
+// N*kubeClientQPS. That is the intended behaviour — the value bounds one
+// worker, not the run — but it is why the value is deliberately nowhere
+// near an API server's own capacity.
+const (
+	kubeClientQPS   = 50
+	kubeClientBurst = 100
+)
+
+// kubeRESTConfig resolves the ambient kubeconfig and applies this tool's
+// rate limit. Every client-go client in this file is built from it, so the
+// limit cannot be set on one client and silently forgotten on another —
+// which is exactly how the default slipped through: three separate
+// construction sites each resolved their own config and none touched QPS.
+func kubeRESTConfig() (*rest.Config, error) {
+	cfg, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		clientcmd.NewDefaultClientConfigLoadingRules(),
+		&clientcmd.ConfigOverrides{},
+	).ClientConfig()
+	if err != nil {
+		return nil, err
+	}
+	cfg.QPS = kubeClientQPS
+	cfg.Burst = kubeClientBurst
+	return cfg, nil
+}
+
 // goClientset returns the client-go Clientset the client-go KubeClient
 // backend uses, built once from the ambient kubeconfig (the KUBECONFIG env
 // var, falling back to ~/.kube/config — the same resolution kubectl itself
@@ -272,10 +320,7 @@ func (r *Runner) goClientset() (kubernetes.Interface, error) {
 		return r.kubeClientsetFunc()
 	}
 	r.kubeClientsetOnce.Do(func() {
-		cfg, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-			clientcmd.NewDefaultClientConfigLoadingRules(),
-			&clientcmd.ConfigOverrides{},
-		).ClientConfig()
+		cfg, err := kubeRESTConfig()
 		if err != nil {
 			r.kubeClientsetErr = fmt.Errorf("resolving kubeconfig: %w", err)
 			return
@@ -304,10 +349,7 @@ func (r *Runner) goDynamicClient() (dynamic.Interface, error) {
 		return r.kubeDynamicFunc()
 	}
 	r.kubeDynamicOnce.Do(func() {
-		cfg, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-			clientcmd.NewDefaultClientConfigLoadingRules(),
-			&clientcmd.ConfigOverrides{},
-		).ClientConfig()
+		cfg, err := kubeRESTConfig()
 		if err != nil {
 			r.kubeDynamicErr = fmt.Errorf("resolving kubeconfig: %w", err)
 			return
@@ -339,10 +381,7 @@ func (r *Runner) restMapper() (meta.RESTMapper, error) {
 			r.kubeRESTMapper, r.kubeRESTMapperErr = r.restMapperFunc()
 			return
 		}
-		cfg, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-			clientcmd.NewDefaultClientConfigLoadingRules(),
-			&clientcmd.ConfigOverrides{},
-		).ClientConfig()
+		cfg, err := kubeRESTConfig()
 		if err != nil {
 			r.kubeRESTMapperErr = fmt.Errorf("resolving kubeconfig for discovery: %w", err)
 			return

@@ -43,6 +43,7 @@
 //	update-tester run <manifest.yaml> [--timeout 120] [--poll-interval 60s]
 //	update-tester converge <manifest.yaml> [--poll-interval 60s] [--ignore-fields a,b] [--timeout 120s] [--readiness-timeout 120s]
 //	update-tester converge-all <m1.yaml,m2.yaml,...> [--poll-interval 60s] [--concurrency 8] [--timeout 120s] [--readiness-timeout 120s]
+//	update-tester batch <m1.yaml,m2.yaml,...> [--parallel 1] [--timeout 120] [--poll-interval 60s]
 //	update-tester validate <manifest.yaml> [--types-file <types.go>] [--controller-dir <dir>] [--root <dir>]
 //	update-tester expect-skeleton <types.go> --kind <Kind> --field <field>
 //	update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
@@ -55,6 +56,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -125,6 +127,8 @@ func runCommand(name string, args []string) error {
 		return cmdConverge(args)
 	case "converge-all":
 		return cmdConvergeAll(args)
+	case "batch":
+		return cmdBatch(args)
 	case "check-external-name-prefix":
 		return cmdCheckExternalNamePrefix(args)
 	case "resolve-recover":
@@ -154,6 +158,7 @@ func runCommand(name string, args []string) error {
 const usageSynopsis = `update-tester run <manifest.yaml> [--timeout 120] [--poll-interval 60s]
 update-tester converge <manifest.yaml> [--poll-interval 60s] [--ignore-fields a,b] [--timeout 120s] [--readiness-timeout 120s]
 update-tester converge-all <m1.yaml,m2.yaml,...> [--poll-interval 60s] [--concurrency 8] [--timeout 120s] [--readiness-timeout 120s]
+update-tester batch <m1.yaml,m2.yaml,...> [--parallel 1] [--timeout 120] [--poll-interval 60s]
 update-tester validate <manifest.yaml> [--types-file <types.go>] [--controller-dir <dir>] [--root <dir>]
 update-tester expect-skeleton <types.go> --kind <Kind> --field <field>
 update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
@@ -198,6 +203,17 @@ Commands:
              performs reads only, so the windows can be shared; the
              result is both faster and strictly stronger, since every
              resource is observed over the same stretch of wall clock.
+  batch      Run per-field update tests (the same check the run command
+             performs) for many manifests CONCURRENTLY in this one
+             process, sharing one client set and one backend rate-limit
+             signal across every worker. --parallel unset or 1 (the
+             default) is strictly serial and behaves identically to
+             invoking run once per manifest — concurrency is opt-in per
+             invocation. Field tests within one manifest always run one
+             at a time regardless of --parallel; only different manifests
+             ever run at once. On sustained rate-limiting from the
+             backend, the active worker ceiling is reduced automatically
+             and the reduction is reported, never silent.
   check-external-name-prefix
              Assert the live resource's crossplane.io/external-name
              annotation has the prefix declared by the manifest's
@@ -986,6 +1002,155 @@ func cmdConvergeAll(args []string) error {
 // variable rather than a flag so converge-all's own --help output never
 // changes based on whether a caller sets it.
 const envRoundtripRoot = "UPDATE_TESTER_ROOT"
+
+// ─── batch ────────────────────────────────────────────────────────────────
+
+// batchOptions holds the parsed command line of the `batch` subcommand.
+type batchOptions struct {
+	manifestPaths []string
+	timeout       int
+	pollInterval  time.Duration
+	// parallel is the initial worker ceiling. defaultBatchCLIParallel (1)
+	// when the flag is never set — see that constant's doc comment for
+	// why 1, not converge-all's 8, is batch's own default.
+	parallel int
+}
+
+// defaultBatchCLIParallel is --parallel's default. It is 1, not
+// converge-all's default concurrency of 8: batch mode ships dormant, so an
+// invocation that never sets --parallel must run every fixture strictly one
+// at a time, identically to running `run` once per manifest today. A
+// provider opts into concurrency by passing --parallel explicitly, one
+// provider at a time, each with its own measurement.
+const defaultBatchCLIParallel = 1
+
+func parseBatchArgs(args []string) (batchOptions, error) {
+	fs := flag.NewFlagSet("batch", flag.ContinueOnError)
+	timeout := fs.Int("timeout", 120, "Timeout in seconds for kubectl wait, applied to every fixture")
+	pollInterval := fs.Duration("poll-interval", 60*time.Second,
+		"Provider poll interval; calibrates the slow-observe annotation for every fixture")
+	parallel := fs.Int("parallel", defaultBatchCLIParallel,
+		"Max fixtures run concurrently in this one process. 1 (the default) is strictly serial")
+	if err := fs.Parse(cli.ReorderArgs(fs, args)); err != nil {
+		return batchOptions{}, err
+	}
+	if fs.NArg() < 1 {
+		return batchOptions{}, errors.New(
+			"usage: update-tester batch <m1.yaml,m2.yaml,...> [--parallel 1] [--timeout 120] [--poll-interval 60s]")
+	}
+	if *parallel < 1 {
+		return batchOptions{}, fmt.Errorf("--parallel must be >= 1, got %d", *parallel)
+	}
+
+	// Accept both a comma-separated list and repeated positional
+	// arguments, exactly like converge-all's own manifest-list parsing.
+	var paths []string
+	for _, arg := range fs.Args() {
+		for _, p := range strings.Split(arg, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				paths = append(paths, p)
+			}
+		}
+	}
+	if len(paths) == 0 {
+		return batchOptions{}, errors.New("batch: no manifest paths given")
+	}
+
+	return batchOptions{manifestPaths: paths, timeout: *timeout, pollInterval: *pollInterval, parallel: *parallel}, nil
+}
+
+// buildBatchTargets parses every manifest path into a runner.BatchTarget,
+// failing fast — before any client is built or any fixture runs — on a
+// manifest with no update-test annotation, exactly like cmdRun's own
+// single-manifest check.
+func buildBatchTargets(opts batchOptions) ([]runner.BatchTarget, error) {
+	targets := make([]runner.BatchTarget, 0, len(opts.manifestPaths))
+	for _, p := range opts.manifestPaths {
+		m, err := manifest.Parse(p)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", p, err)
+		}
+		if len(m.Tests) == 0 {
+			return nil, fmt.Errorf("%s: no %s annotation found in manifest", p, manifest.AnnotationKey)
+		}
+		targets = append(targets, runner.BatchTarget{
+			Label:    fmt.Sprintf("%s/%s", m.Kind, m.Name),
+			Runner:   runner.NewRunner(p, opts.timeout).WithPollInterval(opts.pollInterval),
+			Manifest: m,
+		})
+	}
+	return targets, nil
+}
+
+// cmdBatch runs `run`'s own per-field update-test check for every named
+// manifest, CONCURRENTLY in this one process, bounded by --parallel and a
+// single shared client-go client set (runner.NewSharedClients) — see
+// runner.RunBatch's own doc comment for the full design: cross-fixture
+// parallel, intra-fixture serial, one shared client set and rate-limit
+// signal regardless of --parallel, and index-attributed (never
+// completion-ordered) output.
+func cmdBatch(args []string) error {
+	opts, err := parseBatchArgs(args)
+	if err != nil {
+		return err
+	}
+
+	targets, err := buildBatchTargets(opts)
+	if err != nil {
+		return err
+	}
+
+	clients, err := runner.NewSharedClients()
+	if err != nil {
+		return fmt.Errorf("building shared client set: %w", err)
+	}
+	for _, t := range targets {
+		clients.Apply(t.Runner)
+	}
+
+	fmt.Printf("Batch: %d fixture(s), parallel=%d\n", len(targets), opts.parallel)
+	summary := runner.RunBatch(targets, clients, runner.BatchOptions{Parallel: opts.parallel})
+
+	var failedFixtures int
+	for _, res := range summary.Results {
+		fmt.Printf("\n=== %s ===\n", res.Label)
+		if res.Err != nil {
+			fmt.Printf("  \u2717 ERROR: %v\n", res.Err)
+			failedFixtures++
+			continue
+		}
+
+		var buf bytes.Buffer
+		passed, failed, noop, notEvidenced, untrusted := printResults(&buf, res.Results)
+		var assertUnchangedFields []string
+		if res.Manifest != nil {
+			assertUnchangedFields = res.Manifest.AssertUnchanged
+		}
+		assertUnchangedFailed := printUnchangedAssertions(&buf, assertUnchangedFields, res.UnchangedViolations)
+		printfTo(os.Stdout, "%s", buf.String())
+
+		total := passed + failed
+		fmt.Printf("%s: %d/%d tested, %d no-op, %d not-evidenced, %d untrusted\n",
+			verdict(failed == 0 && !assertUnchangedFailed), passed, total, noop, notEvidenced, untrusted)
+		if failed > 0 || assertUnchangedFailed {
+			failedFixtures++
+		}
+	}
+
+	if len(summary.Throttle) > 0 {
+		fmt.Println("\nBackend throttling detected:")
+		for _, ev := range summary.Throttle {
+			fmt.Printf("  \u26a0 reduced parallelism %d \u2192 %d (%s) at %s\n",
+				ev.From, ev.To, ev.Reason, ev.At.Format(time.RFC3339))
+		}
+	}
+
+	fmt.Printf("\nBatch: %d/%d fixture(s) passed\n", len(targets)-failedFixtures, len(targets))
+	if failedFixtures > 0 {
+		return fmt.Errorf("%d of %d fixtures failed", failedFixtures, len(targets))
+	}
+	return nil
+}
 
 // ─── check-external-name-prefix ───────────────────────────────────────────
 

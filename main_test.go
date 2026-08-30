@@ -979,6 +979,71 @@ func TestParseConvergeAllArgsRejectsDottedIgnoreField(t *testing.T) {
 	}
 }
 
+// TestParseBatchArgsDefaultParallelIsOne pins --parallel's default: batch
+// mode ships dormant, so an invocation that never sets the flag must resolve
+// to defaultBatchCLIParallel (1), never converge-all's own default of 8.
+func TestParseBatchArgsDefaultParallelIsOne(t *testing.T) {
+	got, err := parseBatchArgs([]string{"a.yaml"})
+	if err != nil {
+		t.Fatalf("parseBatchArgs: %v", err)
+	}
+	if got.parallel != 1 {
+		t.Errorf("parallel = %d, want 1 (the default)", got.parallel)
+	}
+}
+
+// TestParseBatchArgsManifestListForms proves both accepted manifest-list
+// shapes — one comma-separated argument, and repeated positional arguments —
+// parse to the identical path list, mirroring converge-all's own accepted
+// forms.
+func TestParseBatchArgsManifestListForms(t *testing.T) {
+	want := []string{"a.yaml", "b.yaml", "c.yaml"}
+
+	commaForm, err := parseBatchArgs([]string{"a.yaml,b.yaml,c.yaml"})
+	if err != nil {
+		t.Fatalf("comma-separated form: %v", err)
+	}
+	if !reflect.DeepEqual(commaForm.manifestPaths, want) {
+		t.Errorf("comma-separated form paths = %#v, want %#v", commaForm.manifestPaths, want)
+	}
+
+	positionalForm, err := parseBatchArgs([]string{"a.yaml", "b.yaml", "c.yaml"})
+	if err != nil {
+		t.Fatalf("repeated-positional form: %v", err)
+	}
+	if !reflect.DeepEqual(positionalForm.manifestPaths, want) {
+		t.Errorf("repeated-positional form paths = %#v, want %#v", positionalForm.manifestPaths, want)
+	}
+}
+
+// TestParseBatchArgsRejectsNonPositiveParallel proves --parallel 0 and a
+// negative value are both rejected at parse time rather than silently
+// clamped — a caller passing a typo'd flag value should see an error, not a
+// value quietly reinterpreted.
+func TestParseBatchArgsRejectsNonPositiveParallel(t *testing.T) {
+	for _, v := range []string{"0", "-1"} {
+		t.Run(v, func(t *testing.T) {
+			_, err := parseBatchArgs([]string{"--parallel", v, "a.yaml"})
+			if err == nil {
+				t.Fatalf("--parallel %s accepted, want a rejection", v)
+			}
+		})
+	}
+}
+
+// TestParseBatchArgsAcceptsExplicitParallel proves a caller-supplied
+// --parallel above 1 is honoured, not silently overridden back to the
+// serial default.
+func TestParseBatchArgsAcceptsExplicitParallel(t *testing.T) {
+	got, err := parseBatchArgs([]string{"--parallel", "8", "a.yaml"})
+	if err != nil {
+		t.Fatalf("parseBatchArgs: %v", err)
+	}
+	if got.parallel != 8 {
+		t.Errorf("parallel = %d, want 8", got.parallel)
+	}
+}
+
 // TestHookConvergeIgnoreFieldsRejectsDottedEntry proves the third entry
 // point named in the fix's acceptance criteria: UPDATE_TESTER_IGNORE_FIELDS
 // reaches validation too, because the hook never parses the env var itself —
@@ -1005,6 +1070,73 @@ func TestHookConvergeIgnoreFieldsRejectsDottedEntry(t *testing.T) {
 	}
 }
 
+// writeBatchFixture writes a manifest carrying one update-test field entry
+// under name.yaml in dir, returning its path. Every batch fixture in this
+// file shares this shape — buildBatchTargets only needs Kind/Name/Tests to
+// be present, not a realistic resource body.
+func writeBatchFixture(t *testing.T, dir, name string) string {
+	t.Helper()
+	path := filepath.Join(dir, name+".yaml")
+	yamlDoc := `apiVersion: widget.example.crossplane.io/v1alpha1
+kind: Widget
+metadata:
+  name: ` + name + `
+  annotations:
+    crossplane.io/update-test: |
+      - field: comment
+        value: "updated"
+`
+	if err := os.WriteFile(path, []byte(yamlDoc), 0o600); err != nil {
+		t.Fatalf("writing batch fixture %s: %v", name, err)
+	}
+	return path
+}
+
+// TestBuildBatchTargetsLabelsAndOrdersByManifest proves buildBatchTargets
+// parses every manifest, in the order given, into a correctly-labelled
+// BatchTarget — entirely offline, since parsing never touches a cluster.
+func TestBuildBatchTargetsLabelsAndOrdersByManifest(t *testing.T) {
+	dir := t.TempDir()
+	a := writeBatchFixture(t, dir, "widget-a")
+	b := writeBatchFixture(t, dir, "widget-b")
+
+	opts := batchOptions{manifestPaths: []string{a, b}, timeout: 30, pollInterval: time.Second, parallel: 1}
+	targets, err := buildBatchTargets(opts)
+	if err != nil {
+		t.Fatalf("buildBatchTargets: %v", err)
+	}
+	if len(targets) != 2 {
+		t.Fatalf("got %d targets, want 2", len(targets))
+	}
+	wantLabels := []string{"Widget/widget-a", "Widget/widget-b"}
+	for i, want := range wantLabels {
+		if targets[i].Label != want {
+			t.Errorf("targets[%d].Label = %q, want %q", i, targets[i].Label, want)
+		}
+		if targets[i].Manifest == nil || len(targets[i].Manifest.Tests) != 1 {
+			t.Errorf("targets[%d]: expected exactly one parsed test entry", i)
+		}
+	}
+}
+
+// TestBuildBatchTargetsRejectsManifestWithNoAnnotation proves a manifest
+// carrying no crossplane.io/update-test annotation fails fast, at parse
+// time, before any client is built or any fixture executes — matching
+// cmdRun's own single-manifest check.
+func TestBuildBatchTargetsRejectsManifestWithNoAnnotation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bare.yaml")
+	yamlDoc := "apiVersion: widget.example.crossplane.io/v1alpha1\nkind: Widget\nmetadata:\n  name: bare\n"
+	if err := os.WriteFile(path, []byte(yamlDoc), 0o600); err != nil {
+		t.Fatalf("writing fixture: %v", err)
+	}
+
+	_, err := buildBatchTargets(batchOptions{manifestPaths: []string{path}, timeout: 30})
+	if err == nil {
+		t.Fatal("buildBatchTargets accepted a manifest with no update-test annotation, want an error")
+	}
+}
+
 func TestParseArgsRequiresItsPositional(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -1017,6 +1149,7 @@ func TestParseArgsRequiresItsPositional(t *testing.T) {
 		{name: "Hook", parse: func(a []string) error { _, err := parseHookArgs(a); return err }},
 		{name: "RoundtripDiff", parse: func(a []string) error { _, err := parseRoundtripDiffArgs(a); return err }},
 		{name: "RoundtripVerify", parse: func(a []string) error { _, err := parseRoundtripVerifyArgs(a); return err }},
+		{name: "Batch", parse: func(a []string) error { _, err := parseBatchArgs(a); return err }},
 	}
 
 	for _, tc := range tests {

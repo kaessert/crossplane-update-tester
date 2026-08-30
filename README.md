@@ -35,6 +35,7 @@ Everything it asserts is derived from two sources:
 update-tester run <manifest.yaml> [--timeout 120] [--poll-interval 60s]
 update-tester converge <manifest.yaml> [--poll-interval 60s] [--ignore-fields a,b] [--timeout 120s] [--readiness-timeout 120s]
 update-tester converge-all <m1.yaml,m2.yaml,...> [--poll-interval 60s] [--concurrency 8] [--timeout 120s] [--readiness-timeout 120s]
+update-tester batch <m1.yaml,m2.yaml,...> [--parallel 1] [--timeout 120] [--poll-interval 60s]
 update-tester validate <manifest.yaml> [--types-file <types.go>] [--controller-dir <dir>] [--root <dir>]
 update-tester expect-skeleton <types.go> --kind <Kind> --field <field>
 update-tester check-external-name-prefix <manifest.yaml> [--timeout 30]
@@ -266,6 +267,49 @@ update-tester converge-all a.yaml b.yaml c.yaml
 drops both only when passed `--skip-converge`. It exists for a provider that
 wants one shared window across many resources instead of `hook`'s per-resource
 ones.
+
+### `batch` — in-process concurrent fleet update tests
+
+`batch` runs `run`'s own per-field update-test check for many manifests at
+once, in ONE process, instead of the shell driving one `update-tester run`
+process per manifest (optionally in parallel via a process-fanout tool). That
+per-process shape means N manifests really mean N kubeconfig loads, N
+client-go client sets, N discovery caches and — most importantly — N
+independent client-side rate limits with no shared view of how the backend is
+responding. `batch` replaces all of that with exactly one of each, shared by
+every fixture.
+
+```
+update-tester batch a.yaml,b.yaml,c.yaml --parallel 8
+update-tester batch a.yaml b.yaml c.yaml --parallel 8
+```
+
+**`--parallel` defaults to `1`, which is strictly serial and behaves
+identically to invoking `run` once per manifest.** Concurrency is opt-in: a
+caller that never passes `--parallel` observes exactly today's one-fixture-
+at-a-time behaviour, so adding this command changes nothing for an existing
+invocation until it explicitly asks for more.
+
+Two things are true regardless of `--parallel`:
+
+- **Cross-fixture parallel, intra-fixture serial.** Only DIFFERENT manifests
+  ever run at the same time. Within one manifest, field tests still run one
+  at a time, in annotation order, exactly as `run` always has — two concurrent
+  patches on the SAME object would collide on `resourceVersion`, and that
+  object's aggregated update-event count could no longer be attributed to
+  whichever field test just moved it.
+- **One shared client set, one shared rate-limit signal.** Every worker's
+  Kubernetes client is built once, up front, and shared — not one per worker.
+  When the backend responds with a sustained run of HTTP 429s, `batch`
+  automatically reduces the number of fixtures running at once and PRINTS
+  that it did so, along with the reason. A rate-limited backend and a merely
+  slow one must be distinguishable in the output, because the right response
+  to each is the opposite of the other — and a silent slowdown would make
+  both look identical.
+
+Output is grouped per fixture, in the SAME order the manifests were given —
+never completion order — so a result is always traceable back to the fixture
+that produced it even when several finished out of order underneath.
 
 ### `validate` — offline coverage check
 

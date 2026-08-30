@@ -2681,3 +2681,45 @@ func TestValidateStatusesDocumented(t *testing.T) {
 		}
 	}
 }
+
+// TestToClearCellCreditJSONExcludesIneligibleFromCredited is the JSON-side
+// half of the mixed-cell pin (see
+// TestClearCellReportMixedCellCreditsOnlyEligibleMembers in
+// internal/roundtrip): Credited is documented as "every OTHER eligible
+// member of a covered cell", so an ineligible member sharing the cell must
+// never appear in it, even though the same member is legitimately present
+// in Members (ClearCellReport.Members' own contract is unchanged — it
+// holds eligible and ineligible together by design).
+func TestToClearCellCreditJSONExcludesIneligibleFromCredited(t *testing.T) {
+	reports := []roundtrip.ClearCellReport{
+		{
+			Key: roundtrip.CellKey{
+				Classification: roundtrip.ClassNA,
+				Shape:          roundtrip.ShapeList,
+				Direction:      roundtrip.DirectionClear,
+				Depth:          roundtrip.DepthTop,
+			},
+			Members:           []string{"aliases", "immutableC", "tags"},
+			IneligibleMembers: []string{"immutableC"},
+			Covered:           true,
+			Representative:    "tags",
+			Route:             roundtrip.RouteSelfTombstone,
+		},
+	}
+
+	out := toClearCellCreditJSON(reports)
+	if len(out) != 1 {
+		t.Fatalf("toClearCellCreditJSON returned %d lines, want 1", len(out))
+	}
+	line := out[0]
+
+	if !reflect.DeepEqual(line.Members, []string{"aliases", "immutableC", "tags"}) {
+		t.Errorf("Members = %v, want the field's own unfiltered contract [aliases immutableC tags]", line.Members)
+	}
+	if !reflect.DeepEqual(line.Representatives, []string{"tags"}) {
+		t.Errorf("Representatives = %v, want [tags]", line.Representatives)
+	}
+	if !reflect.DeepEqual(line.Credited, []string{"aliases"}) {
+		t.Errorf("Credited = %v, want [aliases] — immutableC is INELIGIBLE and must never be credited by cell membership", line.Credited)
+	}
+}

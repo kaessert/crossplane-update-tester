@@ -1447,3 +1447,124 @@ func TestPrintClearCellReportRendersAllThreeRequiredThings(t *testing.T) {
 		t.Errorf("verdict line does not state both a cell count and a leaf count:\n%s", full)
 	}
 }
+
+// mixedClearCellFixtureCRD declares THREE top-level List leaves that all
+// land in the SAME (list, top) cell: aliases (eligible, left uncovered and
+// undispositioned), immutableC (CEL-immutable, ineligible) and tags
+// (eligible, covered by a self-tombstone test entry). This is the one
+// shape no fixture before it constructed — every prior ineligible fixture
+// was fully vacuous (every member ineligible) — and it is the shape a
+// covered cell's member listing must render correctly: crediting tags,
+// never immutableC, while still keeping immutableC visible as excluded.
+const mixedClearCellFixtureCRD = `apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+spec:
+  group: widgets.crossplane.io
+  names:
+    kind: Widget
+    plural: widgets
+  versions:
+  - name: v1alpha1
+    served: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            properties:
+              forProvider:
+                type: object
+                properties:
+                  name:
+                    type: string
+                  tags:
+                    type: array
+                    items:
+                      type: string
+                  aliases:
+                    type: array
+                    items:
+                      type: string
+                  immutableC:
+                    type: array
+                    items:
+                      type: string
+                    x-kubernetes-validations:
+                    - message: immutableC is immutable
+                      rule: "self == oldSelf"
+          status:
+            type: object
+            properties:
+              atProvider:
+                type: object
+                properties:
+                  name:
+                    type: string
+`
+
+// TestClearCellReportMixedCellCreditsOnlyEligibleMembers is the ticket's
+// own required pin: a single cell carrying one covered eligible member
+// (tags), one uncovered eligible member (aliases) and one INELIGIBLE
+// member (immutableC) together — the shape every prior ineligible fixture
+// skipped by being fully vacuous. It must fail if any render site reverts
+// to iterating Members unfiltered.
+func TestClearCellReportMixedCellCreditsOnlyEligibleMembers(t *testing.T) {
+	crd := decodeCRD(t, mixedClearCellFixtureCRD)
+	m := &manifest.Manifest{
+		Tests: []manifest.UpdateTest{
+			{Field: "tags", Value: []interface{}{}},
+		},
+	}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+	cell := clearCellReportsByKey(BuildClearCellReport(findings))["list/top"]
+
+	if !reflect.DeepEqual(cell.Members, []string{"aliases", "immutableC", "tags"}) {
+		t.Fatalf("Members = %v, want [aliases immutableC tags] — the field's own contract holds eligible and ineligible together", cell.Members)
+	}
+	if !reflect.DeepEqual(cell.IneligibleMembers, []string{"immutableC"}) {
+		t.Fatalf("IneligibleMembers = %v, want [immutableC]", cell.IneligibleMembers)
+	}
+	if !cell.Covered {
+		t.Fatalf("cell not Covered despite tags carrying a self-tombstone: %+v", cell)
+	}
+	if cell.Representative != "tags" {
+		t.Errorf("Representative = %q, want %q", cell.Representative, "tags")
+	}
+	if !reflect.DeepEqual(cell.EligibleMembers(), []string{"aliases", "tags"}) {
+		t.Errorf("EligibleMembers() = %v, want [aliases tags] — immutableC subtracted", cell.EligibleMembers())
+	}
+
+	var out []string
+	PrintClearCellReport(func(format string, args ...interface{}) {
+		out = append(out, fmt.Sprintf(format, args...))
+	}, []ClearCellReport{cell})
+	full := strings.Join(out, "")
+
+	creditLine := ""
+	excludedLine := ""
+	for _, line := range out {
+		if strings.Contains(line, "credits") {
+			creditLine = line
+		}
+		if strings.Contains(line, "excluded (ineligible)") {
+			excludedLine = line
+		}
+	}
+	if creditLine == "" {
+		t.Fatalf("no credited-member line rendered:\n%s", full)
+	}
+	if strings.Contains(creditLine, "immutableC") {
+		t.Errorf("credited-member line names the INELIGIBLE member as credited: %q", creditLine)
+	}
+	if !strings.Contains(creditLine, "credits 2 member(s): aliases, tags") {
+		t.Errorf("credited-member line = %q, want count 2 and list [aliases tags] — count and list must agree", creditLine)
+	}
+	if excludedLine == "" || !strings.Contains(excludedLine, "immutableC") {
+		t.Errorf("ineligible member immutableC must remain VISIBLE as excluded, not silently dropped from output entirely:\n%s", full)
+	}
+}

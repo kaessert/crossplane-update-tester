@@ -1469,7 +1469,7 @@ func toClearCellCreditJSON(reports []roundtrip.ClearCellReport) []cellCreditJSON
 		}
 		if r.Covered {
 			line.Representatives = []string{r.Representative}
-			for _, m := range r.Members {
+			for _, m := range r.EligibleMembers() {
 				if m != r.Representative {
 					line.Credited = append(line.Credited, m)
 				}

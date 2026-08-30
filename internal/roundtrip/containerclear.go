@@ -546,6 +546,32 @@ type ClearCellReport struct {
 	UndispositionedMembers []string
 }
 
+// EligibleMembers returns Members filtered to exclude everything in
+// IneligibleMembers, preserving Members' own sorted order. Members is
+// documented to hold eligible and ineligible members together (see this
+// type's own Members field comment) precisely so a Vacuous cell still
+// names its membership — but that means every consumer presenting a
+// member as CREDITED or DISPOSITIONED must subtract IneligibleMembers
+// first, rather than rendering Members verbatim. This is that one
+// subtraction, so it happens once instead of being re-derived — and
+// potentially re-missed — at each render site.
+func (r ClearCellReport) EligibleMembers() []string {
+	if len(r.IneligibleMembers) == 0 {
+		return r.Members
+	}
+	ineligible := make(map[string]bool, len(r.IneligibleMembers))
+	for _, m := range r.IneligibleMembers {
+		ineligible[m] = true
+	}
+	out := make([]string, 0, len(r.Members)-len(r.IneligibleMembers))
+	for _, m := range r.Members {
+		if !ineligible[m] {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
 // BuildClearCellReport groups findings into cells (GroupClearCells) and
 // renders each as a ClearCellReport, sorted by CellKey.String() so output
 // order is stable across calls and across Go's own randomized map
@@ -644,11 +670,17 @@ func PrintClearCellReport(printFn func(format string, args ...interface{}), repo
 			coveredLeaves += eligible
 			totalLeaves += eligible
 			printFn("  ✓ %s/%s: covered via %s, representative %s; credits %d member(s): %s\n",
-				r.Key.Shape, r.Key.Depth, r.Route, r.Representative, eligible, strings.Join(r.Members, ", "))
+				r.Key.Shape, r.Key.Depth, r.Route, r.Representative, eligible, strings.Join(r.EligibleMembers(), ", "))
+			if len(r.IneligibleMembers) > 0 {
+				printFn("      excluded (ineligible): %s\n", strings.Join(r.IneligibleMembers, ", "))
+			}
 		case len(r.UndispositionedMembers) == 0:
 			totalLeaves += eligible
 			printFn("  ⊘ %s/%s: uncovered, every eligible member dispositioned: %s\n",
-				r.Key.Shape, r.Key.Depth, strings.Join(r.Members, ", "))
+				r.Key.Shape, r.Key.Depth, strings.Join(r.EligibleMembers(), ", "))
+			if len(r.IneligibleMembers) > 0 {
+				printFn("      excluded (ineligible): %s\n", strings.Join(r.IneligibleMembers, ", "))
+			}
 		default:
 			totalLeaves += eligible
 			printFn("  ✗ %s/%s: uncovered, undispositioned member(s): %s\n",

@@ -37,8 +37,12 @@ import (
 // resolveControllerPodIdentityLive; converge.go's countUpdateLogCalls and
 // countEventsByReason; resolve.go's pause, stripExternalName and unpause).
 // This is the mechanical proof that the seam is behaviour-identical, not an
-// assertion in prose.
+// assertion in prose. kubeBackendEnvVar is forced to "exec" for the whole
+// table: kube() no longer has a separate branch for "a test harness with no
+// client-go override", so this is the one deliberate, explicit route to the
+// exec backend every operation in this proof needs.
 func TestKubeClientArgvEquivalence(t *testing.T) {
+	t.Setenv(kubeBackendEnvVar, "exec")
 	const (
 		ns        = "test-namespace"
 		name      = "exampleresource.example.crossplane.io/example-resource"
@@ -160,30 +164,14 @@ func TestKubeClientArgvEquivalence(t *testing.T) {
 	}
 }
 
-// TestRunnerKubeUsesExecFunc proves the existing execFunc test seam still
-// governs KubeClient's exec backend for a test Runner that has not opted
-// into the client-go path: a Runner built as a bare struct literal with
-// execFunc set and no kubeClientsetFunc (exactly how every pre-existing
-// test in this package constructs one) never shells out to a real kubectl
-// binary, and never attempts to build a real client-go client either.
-func TestRunnerKubeUsesExecFunc(t *testing.T) {
-	called := false
-	r := &Runner{execFunc: func(args []string) (string, error) {
-		called = true
-		return "ok", nil
-	}}
-
-	out, err := r.kube().ListEventsForObject(testKindExample, testNameExample, "")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !called {
-		t.Fatal("execFunc was not invoked; the exec backend bypassed the test seam")
-	}
-	if out != "ok" {
-		t.Fatalf("got %q, want %q", out, "ok")
-	}
-}
+// TestRunnerKubeUsesExecFunc was removed when the exec-fallback branch it
+// existed to pin ("execFunc set with no kubeClientsetFunc override stays on
+// the exec backend") was deleted from kube() — see kube()'s own doc
+// comment. Its coverage is superseded by
+// TestRunnerKubeBackendEnvVarForcesExec (the deliberate, explicit route to
+// the exec backend that replaced it) and
+// TestRunnerKubeDefaultsToClientGoForEvents (the default routing a bare
+// struct literal now takes).
 
 // TestRunnerKubeBackendEnvVarForcesExec proves UPDATE_TESTER_KUBE_BACKEND=exec
 // overrides EVEN a Runner that HAS a working client-go override — the escape
@@ -407,18 +395,11 @@ func TestCountEventsByReasonClientGoDoesNotCrossMatchNamespacedSibling(t *testin
 // answer the question it exists for — which backend actually served a
 // given run.
 func TestKubeBackendSelectionLineDiffersBetweenForcedAndDefault(t *testing.T) {
-	forced := kubeBackendSelectionLine(true, false)
-	fallback := kubeBackendSelectionLine(false, true)
-	deflt := kubeBackendSelectionLine(false, false)
+	forced := kubeBackendSelectionLine(true)
+	deflt := kubeBackendSelectionLine(false)
 
 	if forced == deflt {
 		t.Fatalf("forced-exec and default lines are identical: %q", forced)
-	}
-	if forced == fallback {
-		t.Fatalf("forced-exec and test-harness-fallback lines are identical: %q", forced)
-	}
-	if fallback == deflt {
-		t.Fatalf("test-harness-fallback and default lines are identical: %q", fallback)
 	}
 	if !strings.Contains(forced, kubeBackendEnvVar) {
 		t.Errorf("forced-exec line = %q, want it to name %s", forced, kubeBackendEnvVar)

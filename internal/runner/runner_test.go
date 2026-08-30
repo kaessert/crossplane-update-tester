@@ -9,8 +9,21 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 
 	"github.com/kaessert/crossplane-update-tester/internal/manifest"
 )
@@ -109,12 +122,6 @@ type fakeCluster struct {
 	// siblingEventCallCount counts handleGetEvents calls, so
 	// siblingEventGrowthPerCall can be applied per call.
 	siblingEventCallCount int
-
-	// resourceLines, when non-empty, overrides what
-	// `kubectl get -f <manifest> -o name` prints — one line per manifest
-	// document. Left empty, a single line naming the resource under test is
-	// returned.
-	resourceLines string
 
 	// logLines, when non-empty, is what `kubectl logs -l <selector>` returns
 	// for the convergence window — the controller-log loop instrument's raw
@@ -400,9 +407,6 @@ func (f *fakeCluster) handleGet(args []string) (string, error) {
 	if len(args) > 1 && args[1] == "pods" {
 		return f.handleGetPods(args)
 	}
-	if containsArg(args, "-f") {
-		return f.handleGetResourceName()
-	}
 	if spec := outputSpecOf(args); spec != "json" {
 		return "", fmt.Errorf("fakeCluster: the resource under test is only ever read with -o json, got -o %q: %v", spec, args)
 	}
@@ -441,15 +445,6 @@ func (f *fakeCluster) handleGet(args []string) (string, error) {
 		return "", err
 	}
 	return string(b), nil
-}
-
-// handleGetResourceName backs `kubectl get -f <manifest> -o name`, which
-// prints one line per document in the manifest.
-func (f *fakeCluster) handleGetResourceName() (string, error) {
-	if f.resourceLines != "" {
-		return f.resourceLines, nil
-	}
-	return testResourceIdentifier + "\n", nil
 }
 
 // handleLogs backs `kubectl logs -n crossplane-system -l <selector>
@@ -675,9 +670,311 @@ func mergeInto(dst, patch map[string]interface{}) {
 // TestEvidenceOutcomeReportsNotEvidencedWhenNeverGrows.
 const testEvidenceWindow = 5 * time.Millisecond
 
+// runnerTestExampleGVR is the GroupVersionResource newFakeRunner's
+// client-go backend resolves testResourceIdentifier's type segment
+// ("exampleresource.example.crossplane.io") to. It is deliberately a
+// different resource spelling from kube_test.go's own testGVR/
+// testGVRResource fixture ("exampleresources") — testResourceIdentifier
+// predates that fixture and every literal in this file already depends on
+// its exact text, so the two fixtures are kept independent rather than
+// unified.
+var runnerTestExampleGVR = schema.GroupVersionResource{
+	Group:    testGVRGroup,
+	Version:  testGVRVersion,
+	Resource: "exampleresource",
+}
+
+// runnerTestListKind is runnerTestExampleGVR's list Kind, registered
+// explicitly with the fake dynamic client below: NewSimpleDynamicClient's
+// own pluralization heuristic cannot infer a ListKind for a resource name
+// that is not already plural ("exampleresource", not "exampleresources" —
+// see runnerTestExampleGVR's own doc comment for why the two fixtures stay
+// independent), so an unregistered ListKind panics on the first List/Watch
+// this package's WaitForCondition tests take.
+const runnerTestListKind = testKindExample + "List"
+
+// runnerTestResolveMarkerGVR and runnerTestResolveMarkerKind back a
+// dedicated, always-present fixture object ResolveManifestName's internal
+// per-document dynamic Get resolves against — see runnerTestManifestPath's
+// doc comment for why this is a SEPARATE resource from runnerTestExampleGVR
+// rather than the object-under-test itself.
+var runnerTestResolveMarkerGVR = schema.GroupVersionResource{
+	Group: "resolve-marker.example.io", Version: "v1", Resource: "resolvemarkers",
+}
+
+const runnerTestResolveMarkerKind = "ResolveMarker"
+
+// runnerTestRESTMapper implements meta.RESTMapper for newFakeRunner,
+// answering BOTH resolution paths every other migrated operation's tests
+// (kube_test.go's fakeRESTMapper, fakeManifestRESTMapper) split across two
+// separate fixtures: ResourceFor, for the kubectl `-o name` identifier
+// GetObjectJSON/PatchMerge/PatchMergeStatus/WaitForCondition resolve, and
+// RESTMapping, for the decoded-document GroupKind ResolveManifestName
+// resolves. A single newFakeRunner-built Runner exercises both — most
+// tests only ever reach ResourceFor, but every convergeArm-based test (via
+// its own internal ResolveResource call) and
+// TestRunResolveRecoverRequiresExistingExternalName reach RESTMapping too,
+// and a Runner whose RESTMapper panics on one of its two callers is not a
+// fixture every newFakeRunner caller can share.
+type runnerTestRESTMapper struct{}
+
+func (runnerTestRESTMapper) ResourceFor(schema.GroupVersionResource) (schema.GroupVersionResource, error) {
+	return runnerTestExampleGVR, nil
+}
+
+func (runnerTestRESTMapper) RESTMapping(gk schema.GroupKind, _ ...string) (*meta.RESTMapping, error) {
+	if gk.Kind != runnerTestResolveMarkerKind {
+		return nil, fmt.Errorf("runnerTestRESTMapper: no mapping registered for %s", gk)
+	}
+	return &meta.RESTMapping{
+		Resource: runnerTestResolveMarkerGVR,
+		GroupVersionKind: schema.GroupVersionKind{
+			Group: runnerTestResolveMarkerGVR.Group, Version: runnerTestResolveMarkerGVR.Version, Kind: runnerTestResolveMarkerKind,
+		},
+		Scope: meta.RESTScopeRoot,
+	}, nil
+}
+
+func (runnerTestRESTMapper) KindFor(schema.GroupVersionResource) (schema.GroupVersionKind, error) {
+	panic("KindFor: not used by newFakeRunner's fixtures")
+}
+
+func (runnerTestRESTMapper) KindsFor(schema.GroupVersionResource) ([]schema.GroupVersionKind, error) {
+	panic("KindsFor: not used by newFakeRunner's fixtures")
+}
+
+func (runnerTestRESTMapper) ResourcesFor(schema.GroupVersionResource) ([]schema.GroupVersionResource, error) {
+	panic("ResourcesFor: not used by newFakeRunner's fixtures")
+}
+
+func (runnerTestRESTMapper) RESTMappings(schema.GroupKind, ...string) ([]*meta.RESTMapping, error) {
+	panic("RESTMappings: not used by newFakeRunner's fixtures")
+}
+
+func (runnerTestRESTMapper) ResourceSingularizer(string) (string, error) {
+	panic("ResourceSingularizer: not used by newFakeRunner's fixtures")
+}
+
+var (
+	runnerTestManifestPathOnce sync.Once
+	runnerTestManifestPathVal  string
+	runnerTestManifestPathErr  error
+)
+
+// runnerTestManifestPath returns the path to a real, on-disk manifest file
+// declaring a dedicated ResolveMarker fixture object named testNameExample,
+// with no namespace — the fixture ResolveManifestName's client-go backend
+// (a real os.ReadFile plus a real per-document dynamic Get, never a canned
+// string) needs r.manifestPath to point at.
+//
+// It deliberately does NOT declare testKindExample, the object-under-test's
+// own Kind: convergeArm (RunConverge/RunConvergeAll's shared entry point)
+// calls ResolveResource FIRST, before waitGenerationSettled/waitSynced/
+// waitReady/the baseline Snapshot() — every one of which polls the SAME
+// simulated object and is counted by fakeCluster's getObjectCalls (see
+// readyAfterCalls, syncedConflictReads, driftAfterGetCalls). Had the
+// manifest resolved against the object-under-test's own GVR, this internal
+// resolution Get would ALSO increment that counter, silently shifting every
+// call-count-driven fixture in converge_test.go/convergeall_test.go by one
+// and decoupling their documented "call N is where X happens" comments from
+// reality. selectResourceName only matches on the bare object NAME when a
+// manifest holds a single document (see its own doc comment) — the
+// resolved line's TYPE segment is never inspected by any caller here, so a
+// same-named object of a wholly different, unrelated Kind resolves
+// ResolveResource correctly with zero interaction with the object-under-
+// test's own simulated state. Built once per test binary run and reused,
+// since its content never varies across newFakeRunner's callers.
+func runnerTestManifestPath() string {
+	runnerTestManifestPathOnce.Do(func() {
+		f, err := os.CreateTemp("", "runner-test-manifest-*.yaml")
+		if err != nil {
+			runnerTestManifestPathErr = err
+			return
+		}
+		defer f.Close() //nolint:errcheck // best-effort close on a fixture written once per binary run; a leaked fd here does not affect any test's outcome
+		doc := fmt.Sprintf("apiVersion: %s/%s\nkind: %s\nmetadata:\n  name: %s\n",
+			runnerTestResolveMarkerGVR.Group, runnerTestResolveMarkerGVR.Version, runnerTestResolveMarkerKind, testNameExample)
+		if _, err := f.WriteString(doc); err != nil {
+			runnerTestManifestPathErr = err
+			return
+		}
+		runnerTestManifestPathVal = f.Name()
+	})
+	if runnerTestManifestPathErr != nil {
+		panic(runnerTestManifestPathErr)
+	}
+	return runnerTestManifestPathVal
+}
+
+// newFakeClientGoDynamicClient builds the dynamic.Interface newFakeRunner
+// wires as kubeDynamicFunc. Get and Patch are reactored straight into
+// r.execFunc, reconstructing the SAME argv execKubeClient used to build
+// for each operation, so GetObjectJSON/PatchMerge/PatchMergeStatus
+// exercise the real client-go KubeClient methods (RESTMapper resolution,
+// RFC 7386 merge-patch semantics, JSON marshalling) while fakeCluster
+// itself remains the one place every test's simulated cluster state
+// (call counts, drift, silent wipes, event generations...) lives —
+// unchanged by which KubeClient backend kube() routes a Runner through.
+// Routing through r.execFunc rather than closing over fakeCluster.exec
+// directly matters: several tests (e.g. TestSnapshotReadsTheWholeObject)
+// REPLACE r.execFunc after construction to capture the argv a call issues,
+// while still delegating to the same fakeCluster underneath — a reactor
+// bound to the ORIGINAL fakeCluster.exec value would silently never see
+// that override.
+//
+// List is left on the fake dynamic client's own tracker, seeded with one
+// object that is already Ready — WaitForCondition was a total no-op
+// success under the old exec fallback (`kubectl wait` was never issued a
+// real query in these tests), and no test in this package ever needed
+// WaitReady itself to fail, so an always-satisfied wait preserves that
+// exactly. The reactor still round-trips through the exec backend's own
+// "wait" case, purely so f.waitCalls keeps counting invocations the same
+// way every other migrated operation's fake does.
+func newFakeClientGoDynamicClient(r *Runner) dynamic.Interface {
+	seed := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": testGVRGroup + "/" + testGVRVersion,
+		"kind":       testKindExample,
+		"metadata":   map[string]interface{}{"name": testNameExample},
+		"status": map[string]interface{}{
+			"conditions": []interface{}{
+				map[string]interface{}{"type": "Ready", "status": "True"},
+			},
+		},
+	}}
+	dc := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{runnerTestExampleGVR: runnerTestListKind})
+	// Seeded via Tracker().Create with an EXPLICIT GVR, rather than through
+	// the constructor's own objects varargs: the tracker's default Add
+	// derives a GVR from the object's Kind via
+	// meta.UnsafeGuessKindToResource, which pluralizes "ExampleResource" to
+	// "exampleresources" — silently filing the seed under a DIFFERENT
+	// resource than runnerTestExampleGVR ("exampleresource", singular) and
+	// leaving every List/Watch against the real GVR seeing an empty
+	// tracker. Create's own gvr parameter is exactly the escape hatch for a
+	// resource name the guesser cannot reconstruct.
+	if err := dc.Tracker().Create(runnerTestExampleGVR, seed, seed.GetNamespace()); err != nil {
+		panic(fmt.Errorf("newFakeClientGoDynamicClient: seeding tracker: %w", err))
+	}
+
+	// The ResolveManifestName marker fixture (see runnerTestManifestPath's
+	// doc comment): a second, unrelated object served entirely by the
+	// tracker's own default Get — no reactor below touches this resource,
+	// so resolving it never reaches r.execFunc/fakeCluster at all.
+	marker := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": runnerTestResolveMarkerGVR.Group + "/" + runnerTestResolveMarkerGVR.Version,
+		"kind":       runnerTestResolveMarkerKind,
+		"metadata":   map[string]interface{}{"name": testNameExample},
+	}}
+	if err := dc.Tracker().Create(runnerTestResolveMarkerGVR, marker, marker.GetNamespace()); err != nil {
+		panic(fmt.Errorf("newFakeClientGoDynamicClient: seeding resolve-marker tracker: %w", err))
+	}
+
+	dc.PrependReactor("get", runnerTestExampleGVR.Resource, func(action ktesting.Action) (bool, runtime.Object, error) {
+		ga, ok := action.(ktesting.GetAction)
+		if !ok {
+			return false, nil, nil
+		}
+		args := []string{kubectlGetSubcommand, manifestResourceIdentifier(runnerTestExampleGVR, ga.GetName()), "-o", "json"}
+		if ns := ga.GetNamespace(); ns != "" {
+			args = append(args, "-n", ns)
+		}
+		raw, err := r.execFunc(args)
+		if err != nil {
+			return true, nil, err
+		}
+		var obj map[string]interface{}
+		if err := json.Unmarshal([]byte(raw), &obj); err != nil {
+			return true, nil, fmt.Errorf("newFakeClientGoDynamicClient: decoding fakeCluster get response: %w", err)
+		}
+		return true, &unstructured.Unstructured{Object: obj}, nil
+	})
+
+	dc.PrependReactor("patch", runnerTestExampleGVR.Resource, func(action ktesting.Action) (bool, runtime.Object, error) {
+		pa, ok := action.(ktesting.PatchAction)
+		if !ok {
+			return false, nil, nil
+		}
+		args := []string{"patch", manifestResourceIdentifier(runnerTestExampleGVR, pa.GetName())}
+		if pa.GetSubresource() == "status" {
+			args = append(args, "--subresource=status")
+		}
+		args = append(args, "--type=merge", "-p", string(pa.GetPatch()))
+		if ns := pa.GetNamespace(); ns != "" {
+			args = append(args, "-n", ns)
+		}
+		if _, err := r.execFunc(args); err != nil {
+			return true, nil, err
+		}
+		return true, &unstructured.Unstructured{Object: map[string]interface{}{}}, nil
+	})
+
+	dc.PrependReactor("list", runnerTestExampleGVR.Resource, func(ktesting.Action) (bool, runtime.Object, error) {
+		identifier := manifestResourceIdentifier(runnerTestExampleGVR, testNameExample)
+		_, _ = r.execFunc([]string{"wait", identifier, "--for=condition=Ready"})
+		return false, nil, nil
+	})
+
+	return dc
+}
+
+// newFakeClientGoClientset builds the kubernetes.Interface newFakeRunner
+// wires as kubeClientsetFunc: a static single provider Pod, so
+// ProviderLogs' client-go pod listing finds exactly the one pod `kubectl
+// logs -l <selector>` always found in these tests (none of which vary pod
+// COUNT for the log-reading path — that knob, f.providerPods, exists for
+// the separate get-pods-by-jsonpath lookups restartControllerDeployment
+// and resolveControllerPodIdentityLive make, which stay exec-backed and
+// untouched by this migration). Events are reactored into r.execFunc
+// exactly like the dynamic client's get/patch reactors above (see that
+// constructor's doc comment for why r.execFunc, not fakeCluster.exec
+// directly), so event-count simulation (generations, siblings, budgets,
+// restarts) is untouched by the flip.
+func newFakeClientGoClientset(r *Runner) kubernetes.Interface {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "provider-example-pod",
+			Namespace: providerDeploymentNamespace,
+			Labels:    map[string]string{providerDeploymentSelector: testProviderDeployment},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "package-runtime"}}},
+	}
+	cs := fake.NewSimpleClientset(pod)
+
+	cs.PrependReactor("list", "events", func(ktesting.Action) (bool, runtime.Object, error) {
+		raw, err := r.execFunc([]string{kubectlGetSubcommand, "events", "--all-namespaces", "-o", "json"})
+		if err != nil {
+			return true, nil, err
+		}
+		var list corev1.EventList
+		if err := json.Unmarshal([]byte(raw), &list); err != nil {
+			return true, nil, fmt.Errorf("newFakeClientGoClientset: decoding fakeCluster events response: %w", err)
+		}
+		return true, &list, nil
+	})
+
+	return cs
+}
+
+// newFakePodLogStreamFunc builds the podLogStreamFunc newFakeRunner wires:
+// r.execFunc's own "logs" case (exactly like every other migrated
+// operation's fake — see newFakeClientGoDynamicClient's doc comment for
+// why r.execFunc rather than fakeCluster.exec directly), wrapped as a
+// stream rather than a (string, error) return, so ProviderLogs' client-go
+// backend reads exactly the content — or error — `kubectl logs` used to.
+func newFakePodLogStreamFunc(r *Runner) func(namespace, podName, container string, sinceSeconds int64) (io.ReadCloser, error) {
+	return func(string, string, string, int64) (io.ReadCloser, error) {
+		out, err := r.execFunc([]string{"logs", "-n", providerDeploymentNamespace, "-l", providerDeploymentSelector, "--tail=-1"})
+		if err != nil {
+			return nil, err
+		}
+		return io.NopCloser(strings.NewReader(out)), nil
+	}
+}
+
 func newFakeRunner(f *fakeCluster) *Runner {
-	return &Runner{
+	r := &Runner{
 		resourceName: testResourceIdentifier,
+		manifestPath: runnerTestManifestPath(),
 		timeout:      "5s",
 		execFunc:     f.exec,
 		restartFunc:  f.restart,
@@ -688,6 +985,25 @@ func newFakeRunner(f *fakeCluster) *Runner {
 		sleepFunc:      func(time.Duration) {},
 		evidenceWindow: testEvidenceWindow,
 	}
+
+	// restMapperFunc/kubeDynamicFunc/kubeClientsetFunc/podLogStreamFunc:
+	// route the migrated KubeClient operations (GetObjectJSON, PatchMerge,
+	// PatchMergeStatus, WaitForCondition, ListEventsForObject,
+	// ProviderLogs, and — via RunResolveRecover's internal ResolveResource
+	// call — ResolveManifestName) through fake client-go clients whose
+	// Get/Patch/List/Events/Logs handling all delegate back into r.execFunc
+	// (and so, by default, into fakeCluster's own simulation) — see the
+	// constructors above. Assigned after r exists, rather than as struct
+	// literal fields, because each closure reads r.execFunc at CALL time —
+	// see newFakeClientGoDynamicClient's doc comment for why that matters.
+	// RolloutRestart, RolloutStatus and GetPodsJSONPath remain on execFunc
+	// unconditionally: they are promoted from the embedded exec backend
+	// unchanged by kube(), migration or no.
+	r.restMapperFunc = func() (meta.RESTMapper, error) { return runnerTestRESTMapper{}, nil }
+	r.kubeDynamicFunc = func() (dynamic.Interface, error) { return newFakeClientGoDynamicClient(r), nil }
+	r.kubeClientsetFunc = func() (kubernetes.Interface, error) { return newFakeClientGoClientset(r), nil }
+	r.podLogStreamFunc = newFakePodLogStreamFunc(r)
+	return r
 }
 
 // TestSnapshotReadsTheWholeObject pins the kubectl contract Snapshot
@@ -800,6 +1116,8 @@ func TestSnapshotAtProviderShapes(t *testing.T) {
 					return tc.object, nil
 				},
 			}
+			r.restMapperFunc = func() (meta.RESTMapper, error) { return runnerTestRESTMapper{}, nil }
+			r.kubeDynamicFunc = func() (dynamic.Interface, error) { return newFakeClientGoDynamicClient(r), nil }
 
 			got, err := r.Snapshot()
 			if tc.wantErrHas != "" {
@@ -1441,6 +1759,7 @@ func TestEvidenceOutcomeRetriesUntilEventVisible(t *testing.T) {
 		sleepFunc:      func(time.Duration) {},
 		evidenceWindow: time.Second,
 	}
+	r.kubeClientsetFunc = func() (kubernetes.Interface, error) { return newFakeClientGoClientset(r), nil }
 
 	checked, evidenced, err := r.evidenceOutcome("", "", "", "", 0, nil)
 	if err != nil {
@@ -1469,6 +1788,7 @@ func TestEvidenceOutcomeReportsNotEvidencedWhenNeverGrows(t *testing.T) {
 		sleepFunc:      func(time.Duration) {},
 		evidenceWindow: testEvidenceWindow,
 	}
+	r.kubeClientsetFunc = func() (kubernetes.Interface, error) { return newFakeClientGoClientset(r), nil }
 
 	checked, evidenced, err := r.evidenceOutcome("", "", "", "", 0, nil)
 	if err != nil {
@@ -3035,31 +3355,47 @@ func TestSelectResourceName(t *testing.T) {
 }
 
 // TestResolveResourceMultiDocumentSelectsMatchingName drives the fix
-// through the Runner: when `kubectl get -f <manifest> -o name` prints
-// several lines (a companion object plus the CR under test), the cached
-// resourceName must be the CR's line alone — never the whole multi-line
-// output, which every subsequent kubectl call would then be issued against.
+// through the Runner, against a real manifest file and a fake dynamic
+// client (ResolveResource's client-go backend reads both directly — see
+// ResolveManifestName): when resolution prints several lines (a companion
+// object plus the CR under test), the cached resourceName must be the CR's
+// line alone — never the whole multi-line output, which every subsequent
+// client-go call would then be issued against.
 func TestResolveResourceMultiDocumentSelectsMatchingName(t *testing.T) {
-	f := &fakeCluster{
-		resourceLines: "secret/" + testNameExample + "-credentials\n" + testResourceIdentifier + "\n",
-	}
-	r := newFakeRunner(f)
+	const secretName = testNameExample + "-credentials"
+	path := writeManifestFile(t,
+		manifestDocSecret(secretName, testNamespaceExample),
+		manifestDocExampleResource(testNameExample, testNamespaceExample),
+	)
+	secret := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       testCompanionKind,
+		"metadata":   map[string]interface{}{"name": secretName, "namespace": testNamespaceExample},
+	}}
+	resource := newTestUnstructuredExample(testNamespaceExample, testNameExample, "irrelevant")
+	r := newManifestRunner(secret, resource)
+	r.manifestPath = path
 
 	m := &manifest.Manifest{Kind: testKindExample, Name: testNameExample}
 	if err := r.ResolveResource(m); err != nil {
 		t.Fatalf("ResolveResource: unexpected error: %v", err)
 	}
-	if r.resourceName != testResourceIdentifier {
-		t.Errorf("resourceName = %q, want the CR's own identifier %q", r.resourceName, testResourceIdentifier)
+	want := testGVRResource + "." + testGVRGroup + "/" + testNameExample
+	if r.resourceName != want {
+		t.Errorf("resourceName = %q, want the CR's own identifier %q", r.resourceName, want)
 	}
 }
 
 // TestResolveResourceNoMatchingDocumentErrors confirms an unresolvable
 // output fails loudly instead of being cached and carried into every later
-// kubectl call.
+// client-go call: the manifest resolves cleanly, but to a DIFFERENT name
+// than the one the manifest parser is looking for.
 func TestResolveResourceNoMatchingDocumentErrors(t *testing.T) {
-	f := &fakeCluster{resourceLines: "secret/unrelated-object\n"}
-	r := newFakeRunner(f)
+	const unrelatedName = "unrelated-object"
+	path := writeManifestFile(t, manifestDocExampleResource(unrelatedName, testNamespaceExample))
+	obj := newTestUnstructuredExample(testNamespaceExample, unrelatedName, "irrelevant")
+	r := newManifestRunner(obj)
+	r.manifestPath = path
 
 	m := &manifest.Manifest{Kind: testKindExample, Name: testNameExample}
 	err := r.ResolveResource(m)
@@ -3072,17 +3408,21 @@ func TestResolveResourceNoMatchingDocumentErrors(t *testing.T) {
 }
 
 // TestResolveResourceRecordsNamespace confirms the resolved namespace is
-// carried onto the Runner, so every later kubectl call is namespace-scoped.
+// carried onto the Runner, so every later client-go call is
+// namespace-scoped.
 func TestResolveResourceRecordsNamespace(t *testing.T) {
-	f := &fakeCluster{}
-	r := newFakeRunner(f)
+	const ns = "team-a"
+	path := writeManifestFile(t, manifestDocExampleResource(testNameExample, ns))
+	obj := newTestUnstructuredExample(ns, testNameExample, "irrelevant")
+	r := newManifestRunner(obj)
+	r.manifestPath = path
 
-	m := &manifest.Manifest{Kind: testKindExample, Name: testNameExample, Namespace: "team-a"}
+	m := &manifest.Manifest{Kind: testKindExample, Name: testNameExample, Namespace: ns}
 	if err := r.ResolveResource(m); err != nil {
 		t.Fatalf("ResolveResource: unexpected error: %v", err)
 	}
-	if r.namespace != "team-a" {
-		t.Errorf("namespace = %q, want %q", r.namespace, "team-a")
+	if r.namespace != ns {
+		t.Errorf("namespace = %q, want %q", r.namespace, ns)
 	}
 }
 

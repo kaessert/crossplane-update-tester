@@ -874,24 +874,26 @@ func (r *Runner) podLogStream(cs kubernetes.Interface, namespace, podName, conta
 
 // kube returns the KubeClient backend for this Runner. It is a method
 // rather than a field populated at construction so a Runner built as a bare
-// struct literal — every existing test constructs one this way, setting
-// execFunc directly with no knowledge of KubeClient — still resolves to a
-// working backend. Selection order:
+// struct literal resolves to a working backend with no separate wiring
+// step. Selection order:
 //
 //  1. kubeBackendEnvVar set to "exec" forces the exec backend for every
-//     operation.
-//  2. execFunc set with no kubeClientsetFunc override: this is a test
-//     Runner exercising behaviour through an injected exec fake that
-//     predates this migration. Routing it through a real client-go client
-//     would silently bypass that fake — no kubeconfig exists under test —
-//     rather than exercising it, so it stays on the exec backend it was
-//     already wired for.
-//  3. Otherwise: the client-go backend for event listing, resource reads,
+//     operation — the rollback path and differential diagnostic if the
+//     client-go path ever misbehaves on a provider this migration's own
+//     runs did not cover.
+//  2. Otherwise: the client-go backend for event listing, resource reads,
 //     manifest-name resolution, the two merge-patch operations, the Ready
 //     wait, and the controller-log read (the default, production
 //     behaviour), built from kubeClientsetFunc/kubeDynamicFunc/restMapperFunc
 //     when a test has set them, or from the ambient kubeconfig otherwise.
 //     Every other operation still delegates to the embedded exec backend.
+//
+// A test Runner built as a bare struct literal takes exactly this same
+// path: there is no longer a separate branch for "a test harness with no
+// client-go override", so every test either wires kubeClientsetFunc/
+// kubeDynamicFunc/restMapperFunc/podLogStreamFunc — even if only to a fake
+// client-go client that itself delegates to a hand-rolled simulation — or
+// forces kubeBackendEnvVar to exercise the exec backend deliberately.
 //
 // Whichever branch is taken, the choice is recorded to stderr exactly once
 // per Runner (see kubeBackendLogOnce) — a parity run comparing the exec and
@@ -901,11 +903,10 @@ func (r *Runner) podLogStream(cs kubernetes.Interface, namespace, podName, conta
 func (r *Runner) kube() KubeClient {
 	exec := &execKubeClient{r: r}
 	forcedExec := os.Getenv(kubeBackendEnvVar) == "exec"
-	execFallback := !forcedExec && r.execFunc != nil && r.kubeClientsetFunc == nil
 	r.kubeBackendLogOnce.Do(func() {
-		fmt.Fprintln(os.Stderr, "    "+kubeBackendSelectionLine(forcedExec, execFallback))
+		fmt.Fprintln(os.Stderr, "    "+kubeBackendSelectionLine(forcedExec))
 	})
-	if forcedExec || execFallback {
+	if forcedExec {
 		return exec
 	}
 	return &clientGoKubeClient{execKubeClient: exec, clientset: r.goClientset}
@@ -916,13 +917,9 @@ func (r *Runner) kube() KubeClient {
 // forced the choice. It is a standalone function, rather than inlined into
 // kube(), so a unit test can assert on its output directly instead of
 // parsing captured stderr text out of a live Runner.
-func kubeBackendSelectionLine(forcedExec, execFallback bool) string {
-	switch {
-	case forcedExec:
+func kubeBackendSelectionLine(forcedExec bool) string {
+	if forcedExec {
 		return fmt.Sprintf("kube backend: exec (all operations — forced by %s=exec)", kubeBackendEnvVar)
-	case execFallback:
-		return "kube backend: exec (all operations — test harness has no client-go override)"
-	default:
-		return "kube backend: client-go (event list, resource read, manifest resolve, patch, wait, log), exec (all other operations)"
 	}
+	return "kube backend: client-go (event list, resource read, manifest resolve, patch, wait, log), exec (all other operations)"
 }

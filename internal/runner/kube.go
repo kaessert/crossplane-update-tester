@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -20,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
+	k8syaml "k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/discovery/cached/memory"
@@ -206,26 +208,30 @@ func eventFieldSelector(kind, name, namespace string) string {
 // on the next slice of the migration and has already done so once.
 const kubeBackendEnvVar = "UPDATE_TESTER_KUBE_BACKEND"
 
-// clientGoKubeClient overrides event listing, resource reads, the two
-// merge-patch operations, the Ready wait, and the controller-log read with
-// direct client-go calls. Every other KubeClient operation is promoted from
-// the embedded exec backend unchanged — this type exists to migrate one
-// operation at a time, not to grow into a second full backend. A shared
-// informer or watch cache is deliberately NOT used for the event listing or
-// resource read overrides: the evidence check those feed is a before/after
-// delta on the same object, and a lagging cache would return a stale second
-// read and manufacture a false negative. The two patch overrides write
-// rather than read, so a cache cannot go stale under them, but they are
-// still direct dynamic calls for the same reason. WaitForCondition is the
-// one exception to "no watch cache reached for anywhere in this type": a
-// wait for a future transition is exactly what a watch is for, and its own
-// doc comment states the boundary that keeps that watch from ever becoming
-// a second, cached source for the two direct-read overrides above.
-// ProviderLogs opens a fresh log stream per pod on every call, exactly like
-// the event/resource-read overrides — nothing here is cached either.
-// clientset is a func rather than a stored value so it can be resolved
-// lazily (a Runner is often built before a kubeconfig is needed) and
-// overridden by tests.
+// clientGoKubeClient overrides event listing, resource reads, manifest-name
+// resolution, the two merge-patch operations, the Ready wait, and the
+// controller-log read with direct client-go calls. Every other KubeClient
+// operation is promoted from the embedded exec backend unchanged — this
+// type exists to migrate one operation at a time, not to grow into a
+// second full backend. A shared informer or watch cache is deliberately
+// NOT used for the event listing, resource read or manifest-name
+// resolution overrides: the evidence check those feed is a before/after
+// delta on the same object, and a lagging cache would return a stale
+// second read and manufacture a false negative — and a manifest resolution
+// that consulted a cache could resolve an object as present after its
+// deletion had already reached the API server, which is exactly the
+// distinction ResolveManifestName exists to get right. The two patch
+// overrides write rather than read, so a cache cannot go stale under them,
+// but they are still direct dynamic calls for the same reason.
+// WaitForCondition is the one exception to "no watch cache reached for
+// anywhere in this type": a wait for a future transition is exactly what a
+// watch is for, and its own doc comment states the boundary that keeps
+// that watch from ever becoming a second, cached source for the direct-read
+// overrides above. ProviderLogs opens a fresh log stream per pod on every
+// call, exactly like the event/resource-read overrides — nothing here is
+// cached either. clientset is a func rather than a stored value so it can
+// be resolved lazily (a Runner is often built before a kubeconfig is
+// needed) and overridden by tests.
 type clientGoKubeClient struct {
 	*execKubeClient
 	clientset func() (kubernetes.Interface, error)
@@ -380,6 +386,136 @@ func (c *clientGoKubeClient) resourceGVR(resourceName string) (schema.GroupVersi
 		return schema.GroupVersionResource{}, fmt.Errorf("mapping %q to a GroupVersionResource: %w", resourceType, err)
 	}
 	return gvr, nil
+}
+
+// resolveManifestGVR resolves gvk — a decoded manifest document's own
+// apiVersion/kind, never a kubectl `-o name` string — to a
+// GroupVersionResource and reports whether the mapped resource is
+// namespace-scoped, via the SAME memoized RESTMapper resourceGVR uses.
+// RESTMapping is used here rather than ResourceFor: ResolveManifestName
+// starts from a GroupVersionKind, and only RESTMapping's Scope tells a
+// namespaced object apart from a cluster-scoped one that happens to share
+// a Kind — a distinction manifestDocumentNamespace needs to decide whether
+// a document's own (possibly absent) metadata.namespace applies at all.
+func (c *clientGoKubeClient) resolveManifestGVR(gvk schema.GroupVersionKind) (gvr schema.GroupVersionResource, namespaced bool, err error) {
+	mapper, err := c.r.restMapper()
+	if err != nil {
+		return schema.GroupVersionResource{}, false, fmt.Errorf("resolving RESTMapper: %w", err)
+	}
+	mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+	if err != nil {
+		return schema.GroupVersionResource{}, false, fmt.Errorf("mapping %s to a GroupVersionResource: %w", gvk, err)
+	}
+	return mapping.Resource, mapping.Scope.Name() == meta.RESTScopeNameNamespace, nil
+}
+
+// manifestDocumentNamespace decides which namespace to read a decoded
+// manifest document's live object under, mirroring `kubectl get -f
+// <manifest>` with no `-n` flag: an explicit caller namespace (kubectl's
+// `-n` override) wins when set, then the document's own declared
+// metadata.namespace, then "default" — kubectl's own context-default
+// fallback for a namespaced object that declares neither. ResolveManifestName's
+// sole caller (Runner.ResolveResource) always passes "" here, because it
+// runs before the manifest has been resolved at all, so in practice this
+// falls through to the document's own namespace (every namespaced example
+// this project tests declares one) or, failing that, "default". A
+// cluster-scoped object always resolves to "" regardless of what either
+// argument carries: the dynamic client's URL builder omits the namespace
+// path segment only when this is empty, and a non-empty value for a
+// cluster-scoped resource would build a namespaced-shaped request that
+// 404s permanently.
+func manifestDocumentNamespace(callerNamespace, docNamespace string, namespaced bool) string {
+	if !namespaced {
+		return ""
+	}
+	if callerNamespace != "" {
+		return callerNamespace
+	}
+	if docNamespace != "" {
+		return docNamespace
+	}
+	return "default"
+}
+
+// manifestResourceIdentifier formats a kubectl `-o name` identifier —
+// "<plural-resource>.<group>/<name>" for a non-core resource, bare
+// "<plural-resource>/<name>" for the core group — from a resolved GVR and
+// object name. This is the exact shape selectResourceName, resourceTypeOf
+// and objectNameOf already parse; building it here keeps that contract
+// defined in the one place that produces it, rather than left to whichever
+// caller assembles it next.
+func manifestResourceIdentifier(gvr schema.GroupVersionResource, name string) string {
+	if gvr.Group == "" {
+		return gvr.Resource + "/" + name
+	}
+	return gvr.Resource + "." + gvr.Group + "/" + name
+}
+
+// ResolveManifestName resolves manifestPath's document(s) to their live
+// resource name(s), one line per document in document order, via a direct
+// dynamic Get per document — never a YAML decode alone.
+//
+// `kubectl get -f <manifest>` is a LIVE lookup of every document, not a
+// parse of the file. Measured against a real cluster ahead of this
+// implementation (a two-document manifest, second object deleted):
+// kubectl printed NOTHING on stdout for the whole invocation and exited
+// non-zero the moment the second document failed to resolve, even though
+// the FIRST document's object still existed — a manifest containing both
+// present objects printed both lines, in document order, on a clean exit.
+// A decode-and-map implementation that never touches the cluster cannot
+// reproduce the failing case: it would print a line for every document
+// regardless of whether the object was ever created, changing exactly the
+// lines selectResourceName sees, and only on a manifest where some
+// document does not exist. This implementation reproduces the measured
+// behaviour by construction, not by special-casing it: it Gets each
+// document in order and returns the first error immediately, with no
+// partial output — there is no separate "accumulate then decide" step for
+// a special case to hide in.
+func (c *clientGoKubeClient) ResolveManifestName(namespace, manifestPath string) (string, error) {
+	// #nosec G304 -- manifestPath is an operator-supplied example manifest
+	// path, not attacker-controlled input; the exec backend reads the same
+	// path via kubectl.
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return "", fmt.Errorf("reading manifest %s: %w", manifestPath, err)
+	}
+	dyn, err := c.r.goDynamicClient()
+	if err != nil {
+		return "", fmt.Errorf("resolving dynamic client: %w", err)
+	}
+
+	dec := k8syaml.NewYAMLOrJSONDecoder(bytes.NewReader(data), 4096)
+	var lines []string
+	for {
+		var doc unstructured.Unstructured
+		if err := dec.Decode(&doc); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return "", fmt.Errorf("parsing manifest %s: %w", manifestPath, err)
+		}
+		gvk := doc.GroupVersionKind()
+		if gvk.Kind == "" {
+			// A blank document — a trailing "---" separator, or one with
+			// neither apiVersion nor kind — carries nothing to resolve.
+			// internal/manifest's own decodeManifestDocs skips exactly
+			// this case for the same reason.
+			continue
+		}
+		gvr, namespaced, err := c.resolveManifestGVR(gvk)
+		if err != nil {
+			return "", fmt.Errorf("resolving document %d (%s) from manifest %s: %w", len(lines)+1, gvk.Kind, manifestPath, err)
+		}
+		ns := manifestDocumentNamespace(namespace, doc.GetNamespace(), namespaced)
+		if _, err := dyn.Resource(gvr).Namespace(ns).Get(context.Background(), doc.GetName(), metav1.GetOptions{}); err != nil {
+			return "", fmt.Errorf("resolving %s %q from manifest %s via client-go: %w", gvk.Kind, doc.GetName(), manifestPath, err)
+		}
+		lines = append(lines, manifestResourceIdentifier(gvr, doc.GetName()))
+	}
+	if len(lines) == 0 {
+		return "", fmt.Errorf("manifest %s contains no Kubernetes documents", manifestPath)
+	}
+	return strings.Join(lines, "\n") + "\n", nil
 }
 
 // GetObjectJSON reads name (a kubectl `-o name` identifier) with a direct
@@ -751,11 +887,11 @@ func (r *Runner) podLogStream(cs kubernetes.Interface, namespace, podName, conta
 //     rather than exercising it, so it stays on the exec backend it was
 //     already wired for.
 //  3. Otherwise: the client-go backend for event listing, resource reads,
-//     the two merge-patch operations, the Ready wait, and the
-//     controller-log read (the default, production behaviour), built from
-//     kubeClientsetFunc/kubeDynamicFunc/restMapperFunc when a test has set
-//     them, or from the ambient kubeconfig otherwise. Every other
-//     operation still delegates to the embedded exec backend.
+//     manifest-name resolution, the two merge-patch operations, the Ready
+//     wait, and the controller-log read (the default, production
+//     behaviour), built from kubeClientsetFunc/kubeDynamicFunc/restMapperFunc
+//     when a test has set them, or from the ambient kubeconfig otherwise.
+//     Every other operation still delegates to the embedded exec backend.
 //
 // Whichever branch is taken, the choice is recorded to stderr exactly once
 // per Runner (see kubeBackendLogOnce) — a parity run comparing the exec and
@@ -787,6 +923,6 @@ func kubeBackendSelectionLine(forcedExec, execFallback bool) string {
 	case execFallback:
 		return "kube backend: exec (all operations — test harness has no client-go override)"
 	default:
-		return "kube backend: client-go (event list, resource read, patch, wait, log), exec (all other operations)"
+		return "kube backend: client-go (event list, resource read, manifest resolve, patch, wait, log), exec (all other operations)"
 	}
 }

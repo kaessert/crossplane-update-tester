@@ -2,6 +2,9 @@ package runner
 
 import (
 	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -1100,6 +1103,416 @@ func TestClientGoBackendPatchErrorsReachEveryPatchCaller(t *testing.T) {
 		t.Run(tn, func(t *testing.T) {
 			if err := tc.call(newRejectingPatchRunner()); err == nil {
 				t.Fatalf("%s (%s): error = nil for a rejected client-go patch, want non-nil", tn, tc.reason)
+			}
+		})
+	}
+}
+
+// --- ResolveManifestName (UT-KUBE-GO-MANIFEST) ---
+//
+// Live measurement recorded ahead of this implementation (see the ticket's
+// own result summary for the full transcript): applying a two-document
+// manifest and deleting one object, `kubectl get -f <manifest> -o name`
+// printed BOTH lines when both objects existed, and printed NOTHING at all
+// — not even the still-existing first document's line — once the second
+// document's object was deleted, exiting non-zero with
+// `Error from server (NotFound): ...`. The tests below hold the
+// implementation to that measured, all-or-nothing shape rather than to a
+// decode-only guess.
+
+// testCompanionGVRGroup, testCompanionGVRVersion and testCompanionGVRResource
+// describe a core-group companion object (a Secret) — distinct from
+// testGVRGroup's custom-resource fixture — so a manifest test can exercise
+// the "<resource>/<name>" (no dot-group) identifier shape alongside the
+// "<resource>.<group>/<name>" shape in the SAME multi-document manifest.
+const (
+	testCompanionGVRVersion  = "v1"
+	testCompanionGVRResource = "secrets"
+	testCompanionKind        = "Secret"
+)
+
+var testCompanionGVR = schema.GroupVersionResource{Group: "", Version: testCompanionGVRVersion, Resource: testCompanionGVRResource}
+
+// fakeManifestRESTMapper stands in for meta.RESTMapper for
+// ResolveManifestName's tests, which resolve via RESTMapping (a
+// GroupKind+version) — the opposite of fakeRESTMapper above, which exists
+// for the kubectl `-o name` string every OTHER client-go override resolves
+// through. Keyed by GroupKind so one fake instance answers for every Kind a
+// multi-document manifest test needs (a managed resource plus its
+// companion Secret). Every other meta.RESTMapper method panics: a test
+// that reaches one has exercised a resolution path this migration does not
+// use.
+type fakeManifestRESTMapper struct {
+	mappings map[schema.GroupKind]*meta.RESTMapping
+}
+
+func (m *fakeManifestRESTMapper) RESTMapping(gk schema.GroupKind, _ ...string) (*meta.RESTMapping, error) {
+	mapping, ok := m.mappings[gk]
+	if !ok {
+		return nil, fmt.Errorf("fakeManifestRESTMapper: no mapping registered for %s", gk)
+	}
+	return mapping, nil
+}
+
+func (m *fakeManifestRESTMapper) ResourceFor(schema.GroupVersionResource) (schema.GroupVersionResource, error) {
+	panic("ResourceFor: not used by the ResolveManifestName migration")
+}
+
+func (m *fakeManifestRESTMapper) KindFor(schema.GroupVersionResource) (schema.GroupVersionKind, error) {
+	panic("KindFor: not used by the ResolveManifestName migration")
+}
+
+func (m *fakeManifestRESTMapper) KindsFor(schema.GroupVersionResource) ([]schema.GroupVersionKind, error) {
+	panic("KindsFor: not used by the ResolveManifestName migration")
+}
+
+func (m *fakeManifestRESTMapper) ResourcesFor(schema.GroupVersionResource) ([]schema.GroupVersionResource, error) {
+	panic("ResourcesFor: not used by the ResolveManifestName migration")
+}
+
+func (m *fakeManifestRESTMapper) RESTMappings(schema.GroupKind, ...string) ([]*meta.RESTMapping, error) {
+	panic("RESTMappings: not used by the ResolveManifestName migration")
+}
+
+func (m *fakeManifestRESTMapper) ResourceSingularizer(string) (string, error) {
+	panic("ResourceSingularizer: not used by the ResolveManifestName migration")
+}
+
+// exampleResourceMapping and secretMapping are the two GroupKind->RESTMapping
+// entries every ResolveManifestName test below needs: the custom resource
+// under test (namespaced) and its core-group companion Secret (also
+// namespaced, exactly like a real connection-secret companion object).
+var (
+	exampleResourceMapping = &meta.RESTMapping{
+		Resource:         testGVR,
+		GroupVersionKind: schema.GroupVersionKind{Group: testGVRGroup, Version: testGVRVersion, Kind: testKindExample},
+		Scope:            meta.RESTScopeNamespace,
+	}
+	secretMapping = &meta.RESTMapping{
+		Resource:         testCompanionGVR,
+		GroupVersionKind: schema.GroupVersionKind{Group: "", Version: testCompanionGVRVersion, Kind: testCompanionKind},
+		Scope:            meta.RESTScopeNamespace,
+	}
+)
+
+// writeManifestFile joins docs with a YAML document separator and writes
+// them to a temp file, returning its path — ResolveManifestName reads a
+// real path via os.ReadFile, exactly like the exec backend reads one via
+// kubectl, so a test proving its behaviour needs a real file rather than an
+// in-memory reader.
+func writeManifestFile(t *testing.T, docs ...string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "manifest.yaml")
+	content := strings.Join(docs, "\n---\n")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing manifest fixture: %v", err)
+	}
+	return path
+}
+
+// manifestDocExampleResource and manifestDocSecret build the YAML text for
+// the two document shapes every test below composes into a manifest: the
+// custom resource under test, and a core-group companion object sharing
+// its own name/namespace parameters.
+func manifestDocExampleResource(name, namespace string) string {
+	return fmt.Sprintf("apiVersion: %s/%s\nkind: %s\nmetadata:\n  name: %s\n  namespace: %s\n",
+		testGVRGroup, testGVRVersion, testKindExample, name, namespace)
+}
+
+func manifestDocSecret(name, namespace string) string {
+	return fmt.Sprintf("apiVersion: %s\nkind: %s\nmetadata:\n  name: %s\n  namespace: %s\n",
+		testCompanionGVRVersion, testCompanionKind, name, namespace)
+}
+
+// newManifestRunner builds a Runner wired for ResolveManifestName's
+// client-go path: a fakeManifestRESTMapper carrying both GroupKind
+// mappings, and a fake dynamic client seeded with objs.
+func newManifestRunner(objs ...runtime.Object) *Runner {
+	return &Runner{
+		restMapperFunc: func() (meta.RESTMapper, error) {
+			return &fakeManifestRESTMapper{mappings: map[schema.GroupKind]*meta.RESTMapping{
+				{Group: testGVRGroup, Kind: testKindExample}: exampleResourceMapping,
+				{Group: "", Kind: testCompanionKind}:         secretMapping,
+			}}, nil
+		},
+		kubeDynamicFunc: func() (dynamic.Interface, error) {
+			return dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), objs...), nil
+		},
+	}
+}
+
+// TestResolveManifestNameSingleDocument covers the first of
+// selectResourceName's own three cases: a manifest holding exactly one
+// document. The full output must be exactly the one resolved identifier
+// line, newline-terminated exactly like kubectl's own `-o name` output.
+func TestResolveManifestNameSingleDocument(t *testing.T) {
+	path := writeManifestFile(t, manifestDocExampleResource(testNameExample, testNamespaceExample))
+	obj := newTestUnstructuredExample(testNamespaceExample, testNameExample, "irrelevant")
+	r := newManifestRunner(obj)
+
+	out, err := r.kube().ResolveManifestName("", path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := testGVRResource + "." + testGVRGroup + "/" + testNameExample + "\n"
+	if out != want {
+		t.Errorf("ResolveManifestName() = %q, want %q", out, want)
+	}
+}
+
+// TestResolveManifestNameManagedResourcePlusCompanion covers
+// selectResourceName's second case: a managed resource plus a companion
+// Secret in the SAME manifest, at DISTINCT names. Both lines must appear,
+// in document order, and the full multi-line string is asserted — not just
+// whichever line a caller might pick out.
+func TestResolveManifestNameManagedResourcePlusCompanion(t *testing.T) {
+	const secretName = "example-resource-connection"
+	path := writeManifestFile(t,
+		manifestDocExampleResource(testNameExample, testNamespaceExample),
+		manifestDocSecret(secretName, testNamespaceExample),
+	)
+	resource := newTestUnstructuredExample(testNamespaceExample, testNameExample, "irrelevant")
+	secret := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       testCompanionKind,
+		"metadata":   map[string]interface{}{"name": secretName, "namespace": testNamespaceExample},
+	}}
+	r := newManifestRunner(resource, secret)
+
+	out, err := r.kube().ResolveManifestName("", path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := testGVRResource + "." + testGVRGroup + "/" + testNameExample + "\n" +
+		testCompanionGVRResource + "/" + secretName + "\n"
+	if out != want {
+		t.Errorf("ResolveManifestName() = %q, want %q (document order preserved)", out, want)
+	}
+}
+
+// TestResolveManifestNameSharedNameDisambiguatedByType covers
+// selectResourceName's third case: two documents that share a bare object
+// NAME, disambiguated only by type. ResolveManifestName itself does no
+// disambiguation — selectResourceName does, downstream — but it must
+// independently resolve each document to its OWN correctly-typed
+// identifier so that downstream disambiguation has two genuinely different
+// lines to choose between rather than an accidental duplicate.
+func TestResolveManifestNameSharedNameDisambiguatedByType(t *testing.T) {
+	const sharedName = "shared-name"
+	path := writeManifestFile(t,
+		manifestDocExampleResource(sharedName, testNamespaceExample),
+		manifestDocSecret(sharedName, testNamespaceExample),
+	)
+	resource := newTestUnstructuredExample(testNamespaceExample, sharedName, "irrelevant")
+	secret := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       testCompanionKind,
+		"metadata":   map[string]interface{}{"name": sharedName, "namespace": testNamespaceExample},
+	}}
+	r := newManifestRunner(resource, secret)
+
+	out, err := r.kube().ResolveManifestName("", path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := testGVRResource + "." + testGVRGroup + "/" + sharedName + "\n" +
+		testCompanionGVRResource + "/" + sharedName + "\n"
+	if out != want {
+		t.Errorf("ResolveManifestName() = %q, want %q — the two lines must differ by TYPE even though the name is identical", out, want)
+	}
+}
+
+// TestResolveManifestNameFailsWholeCallWhenAnyDocumentMissing is the AC's
+// load-bearing proof: it reproduces, against a fake dynamic client, the
+// EXACT shape measured live — a manifest whose first document still exists
+// and whose second does not. The call must fail outright, with NO partial
+// output for the still-existing first document, exactly like the measured
+// kubectl run. A decode-and-map implementation that never Gets anything
+// would instead return two lines here and pass every OTHER test in this
+// file; this is the one test that catches it.
+func TestResolveManifestNameFailsWholeCallWhenAnyDocumentMissing(t *testing.T) {
+	const missingName = "example-resource-b"
+	path := writeManifestFile(t,
+		manifestDocExampleResource(testNameExample, testNamespaceExample),
+		manifestDocExampleResource(missingName, testNamespaceExample),
+	)
+	present := newTestUnstructuredExample(testNamespaceExample, testNameExample, "irrelevant")
+	// missingName is deliberately never seeded into the fake dynamic
+	// client, so a Get against it 404s exactly like the live measurement's
+	// deleted second object did.
+	r := newManifestRunner(present)
+
+	out, err := r.kube().ResolveManifestName("", path)
+	if err == nil {
+		t.Fatalf("ResolveManifestName() error = nil for a manifest whose second document does not exist, want non-nil")
+	}
+	if out != "" {
+		t.Errorf("ResolveManifestName() output = %q, want empty — the measured live run printed NOTHING when any document failed, not even the still-existing first document's line", out)
+	}
+}
+
+// TestResolveManifestNameReusesSharedRESTMapper is the AC's memoization
+// proof for THIS operation, mirroring TestRESTMapperResolvedAtMostOncePerRunner
+// but across two DIFFERENT operations on the same Runner — ResolveManifestName
+// then GetObjectJSON — to prove the RESTMapper introduced for GetObjectJSON
+// is reused rather than rebuilt, not merely that ResolveManifestName's own
+// two documents share one build.
+func TestResolveManifestNameReusesSharedRESTMapper(t *testing.T) {
+	fakeClientset := fake.NewSimpleClientset()
+	fakeDisc, ok := fakeClientset.Discovery().(*discoveryfake.FakeDiscovery)
+	if !ok {
+		t.Fatalf("fake clientset Discovery() is %T, want *discoveryfake.FakeDiscovery", fakeClientset.Discovery())
+	}
+	fakeDisc.Resources = []*metav1.APIResourceList{
+		{
+			GroupVersion: testGVRGroup + "/" + testGVRVersion,
+			APIResources: []metav1.APIResource{
+				{Name: testGVRResource, Namespaced: true, Kind: testKindExample, SingularName: "exampleresource"},
+			},
+		},
+	}
+
+	var restMapperBuilds int32
+	path := writeManifestFile(t, manifestDocExampleResource(testNameExample, testNamespaceExample))
+	obj := newTestUnstructuredExample(testNamespaceExample, testNameExample, "memoized")
+	r := &Runner{
+		restMapperFunc: func() (meta.RESTMapper, error) {
+			atomic.AddInt32(&restMapperBuilds, 1)
+			return restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(fakeDisc)), nil
+		},
+		kubeDynamicFunc: func() (dynamic.Interface, error) {
+			return dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), obj), nil
+		},
+	}
+
+	if _, err := r.kube().ResolveManifestName("", path); err != nil {
+		t.Fatalf("ResolveManifestName: unexpected error: %v", err)
+	}
+	if _, err := r.kube().GetObjectJSON(testNamespaceExample, testGetObjectName); err != nil {
+		t.Fatalf("GetObjectJSON: unexpected error: %v", err)
+	}
+
+	if got := atomic.LoadInt32(&restMapperBuilds); got != 1 {
+		t.Errorf("restMapperFunc invoked %d time(s) across a ResolveManifestName call and a GetObjectJSON call on the same Runner, want exactly 1 — a higher count means ResolveManifestName built its own RESTMapper instead of reusing the shared one", got)
+	}
+}
+
+// TestRunnerKubeBackendEnvVarForcesExecForResolveManifestNameSpecifically
+// mirrors TestRunnerKubeBackendEnvVarForcesExecForGetObjectJSONSpecifically:
+// UPDATE_TESTER_KUBE_BACKEND=exec must force ResolveManifestName
+// specifically back onto the exec backend, this operation included.
+func TestRunnerKubeBackendEnvVarForcesExecForResolveManifestNameSpecifically(t *testing.T) {
+	t.Setenv(kubeBackendEnvVar, "exec")
+
+	execCalled := false
+	mapperCalled := false
+	dynamicCalled := false
+	r := &Runner{
+		execFunc: func(args []string) (string, error) {
+			execCalled = true
+			return testGVRResource + "." + testGVRGroup + "/" + testNameExample + "\n", nil
+		},
+		restMapperFunc: func() (meta.RESTMapper, error) {
+			mapperCalled = true
+			return &fakeManifestRESTMapper{}, nil
+		},
+		kubeDynamicFunc: func() (dynamic.Interface, error) {
+			dynamicCalled = true
+			return dynamicfake.NewSimpleDynamicClient(runtime.NewScheme()), nil
+		},
+	}
+
+	if _, err := r.kube().ResolveManifestName("", "/tmp/does-not-matter.yaml"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !execCalled {
+		t.Error("execFunc was not invoked; UPDATE_TESTER_KUBE_BACKEND=exec did not force the exec backend for ResolveManifestName")
+	}
+	if mapperCalled || dynamicCalled {
+		t.Error("restMapperFunc/kubeDynamicFunc were invoked; UPDATE_TESTER_KUBE_BACKEND=exec must bypass the client-go backend entirely")
+	}
+}
+
+// TestManifestDocumentNamespace is a pure-function table test over the
+// precedence manifestDocumentNamespace implements: an explicit caller
+// namespace, then the document's own, then "default" — but only ever for a
+// namespaced resource; a cluster-scoped one always resolves to "".
+func TestManifestDocumentNamespace(t *testing.T) {
+	cases := map[string]struct {
+		reason          string
+		callerNamespace string
+		docNamespace    string
+		namespaced      bool
+		want            string
+	}{
+		"cluster-scoped ignores both": {
+			reason:          "a cluster-scoped resource never takes a namespace, however either argument is set",
+			callerNamespace: "caller-ns",
+			docNamespace:    "doc-ns",
+			namespaced:      false,
+			want:            "",
+		},
+		"caller namespace wins": {
+			reason:          "an explicit caller namespace is kubectl's -n override and takes precedence",
+			callerNamespace: "caller-ns",
+			docNamespace:    "doc-ns",
+			namespaced:      true,
+			want:            "caller-ns",
+		},
+		"falls back to the document's own namespace": {
+			reason:          "no caller override: the document's own declared namespace applies",
+			callerNamespace: "",
+			docNamespace:    "doc-ns",
+			namespaced:      true,
+			want:            "doc-ns",
+		},
+		"falls back to default when neither is set": {
+			reason:          "neither caller nor document declares a namespace: kubectl's own context-default fallback",
+			callerNamespace: "",
+			docNamespace:    "",
+			namespaced:      true,
+			want:            "default",
+		},
+	}
+
+	for tn, tc := range cases {
+		t.Run(tn, func(t *testing.T) {
+			if got := manifestDocumentNamespace(tc.callerNamespace, tc.docNamespace, tc.namespaced); got != tc.want {
+				t.Errorf("%s: manifestDocumentNamespace() = %q, want %q", tc.reason, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestManifestResourceIdentifier is a pure-function table test over the
+// output shape ResolveManifestName's callers (resourceTypeOf, objectNameOf,
+// selectResourceName) parse: a dotted group segment for a non-core
+// resource, none for the core group.
+func TestManifestResourceIdentifier(t *testing.T) {
+	cases := map[string]struct {
+		reason string
+		gvr    schema.GroupVersionResource
+		name   string
+		want   string
+	}{
+		"non-core resource carries a dotted group": {
+			reason: "a custom resource's kubectl `-o name` identifier always names its group",
+			gvr:    testGVR,
+			name:   testNameExample,
+			want:   testGVRResource + "." + testGVRGroup + "/" + testNameExample,
+		},
+		"core-group resource carries no group segment": {
+			reason: "kubectl never appends a bare dot for the core group",
+			gvr:    testCompanionGVR,
+			name:   "example-secret",
+			want:   testCompanionGVRResource + "/example-secret",
+		},
+	}
+
+	for tn, tc := range cases {
+		t.Run(tn, func(t *testing.T) {
+			if got := manifestResourceIdentifier(tc.gvr, tc.name); got != tc.want {
+				t.Errorf("%s: manifestResourceIdentifier() = %q, want %q", tc.reason, got, tc.want)
 			}
 		})
 	}

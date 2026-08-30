@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1806,6 +1807,114 @@ func decodeCRDForMain(t *testing.T, y string) map[string]interface{} {
 	return crd
 }
 
+// captureOSStdout redirects os.Stdout to an in-memory pipe for the
+// duration of fn, restores it afterward, and returns everything written
+// during fn — the shape internal/runner's own captureOSStderr uses, ported
+// here because printContainerClearCells' report writes straight to
+// os.Stdout and has no injectable writer of its own.
+func captureOSStdout(t *testing.T, fn func()) string {
+	t.Helper()
+
+	orig := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stdout = w
+
+	fn()
+
+	w.Close()
+	os.Stdout = orig
+
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read captured stdout: %v", err)
+	}
+	return string(out)
+}
+
+// writeCRDFixture writes CRD yaml under root/package/crds/<name>.yaml —
+// the layout roundtrip.FindCRD scans.
+func writeCRDFixture(t *testing.T, root, name, crdYAML string) {
+	t.Helper()
+	dir := filepath.Join(root, "package", "crds")
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatalf("creating package/crds: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(crdYAML), 0o600); err != nil {
+		t.Fatalf("writing CRD fixture: %v", err)
+	}
+}
+
+// TestInferProviderRootFromManifestWalksUpToPackageCrds is
+// inferProviderRootFromManifest's own table test: it must find a
+// package/crds directory an arbitrary number of levels above the
+// manifest, and report false rather than panicking when none exists
+// anywhere up to the filesystem root.
+func TestInferProviderRootFromManifestWalksUpToPackageCrds(t *testing.T) {
+	root := t.TempDir()
+	writeCRDFixture(t, root, "widget.yaml", containerClearFixtureCRDForMain)
+
+	nested := filepath.Join(root, "examples", "widget")
+	if err := os.MkdirAll(nested, 0o750); err != nil {
+		t.Fatalf("creating nested examples dir: %v", err)
+	}
+	manifestPath := filepath.Join(nested, "widget.yaml")
+	if err := os.WriteFile(manifestPath, []byte("kind: Widget\n"), 0o600); err != nil {
+		t.Fatalf("writing manifest fixture: %v", err)
+	}
+
+	got, ok := inferProviderRootFromManifest(manifestPath)
+	if !ok {
+		t.Fatal("inferProviderRootFromManifest returned false, want the root found by walking up")
+	}
+	// Resolve both sides through filepath.EvalSymlinks-free Abs/Clean so a
+	// platform that returns t.TempDir() through a symlinked path (macOS
+	// /tmp -> /private/tmp) does not produce a false mismatch.
+	wantAbs, _ := filepath.Abs(root)
+	if got != wantAbs {
+		t.Errorf("inferProviderRootFromManifest = %q, want %q", got, wantAbs)
+	}
+
+	// No package/crds anywhere above an isolated temp dir.
+	isolated := t.TempDir()
+	if _, ok := inferProviderRootFromManifest(filepath.Join(isolated, "widget.yaml")); ok {
+		t.Error("inferProviderRootFromManifest found a root under a tree with no package/crds anywhere")
+	}
+}
+
+// TestPrintContainerClearCellsFallsBackWhenRootIsWrong is the fix's own
+// end-to-end pin: this is exactly the shape six of the fleet's seven
+// update-test.validate Makefile recipes produce — os.Getwd()'s default
+// resolves to the WRONG directory (simulated here by an unrelated temp
+// dir standing in for `go -C tools/update-tester`'s own changed cwd), and
+// only the manifest's own absolute path still knows where the provider
+// root actually is.
+func TestPrintContainerClearCellsFallsBackWhenRootIsWrong(t *testing.T) {
+	providerRoot := t.TempDir()
+	writeCRDFixture(t, providerRoot, "widget.yaml", containerClearFixtureCRDForMain)
+
+	manifestDir := filepath.Join(providerRoot, "examples", "widget")
+	if err := os.MkdirAll(manifestDir, 0o750); err != nil {
+		t.Fatalf("creating manifest dir: %v", err)
+	}
+	manifestPath := filepath.Join(manifestDir, "widget.yaml")
+	if err := os.WriteFile(manifestPath, []byte("kind: Widget\n"), 0o600); err != nil {
+		t.Fatalf("writing manifest fixture: %v", err)
+	}
+
+	m := &manifest.Manifest{APIVersion: "widgets.crossplane.io/v1alpha1", Kind: "Widget", Name: "example"}
+	wrongRoot := t.TempDir() // stands in for tools/update-tester's own cwd
+
+	out := captureOSStdout(t, func() {
+		printContainerClearCells(wrongRoot, manifestPath, m)
+	})
+	if !strings.Contains(out, "container-clear cell") {
+		t.Errorf("printContainerClearCells with a wrong --root default produced no output at all, want it to fall back via the manifest path:\n%s", out)
+	}
+}
+
 // TestBuildRoundtripVerifyReportContainerClearNeverAffectsExitCode is the
 // ticket's own required pin: a manifest with ZERO clear-direction
 // coverage anywhere — the measured state of most of the fleet — still
@@ -1864,7 +1973,11 @@ func TestBuildRoundtripVerifyReportMustTestFindingStillFailsRegardlessOfCells(t 
 
 // TestBuildRoundtripVerifyReportBackendProvenanceNeverInferred confirms an
 // undeclared backend renders as empty (never guessed) and, when declared
-// simulator, marks every cell's SimulatorSatisfied bit.
+// simulator, marks every DirectionSet (equal) cell's SimulatorSatisfied
+// bit. A DirectionClear cell never carries it, declared backend or not:
+// container-clear coverage is derived entirely offline from the CRD schema
+// and the manifest's own test entries, never from a live backend — see
+// cellCreditJSON's own doc comment.
 func TestBuildRoundtripVerifyReportBackendProvenanceNeverInferred(t *testing.T) {
 	crd := decodeCRDForMain(t, containerClearFixtureCRDForMain)
 	m := &manifest.Manifest{Kind: "Widget", Name: "example"}
@@ -1891,10 +2004,25 @@ func TestBuildRoundtripVerifyReportBackendProvenanceNeverInferred(t *testing.T) 
 	if len(sim.Cells) == 0 {
 		t.Fatal("no cells reported for a simulator-backed run with an equal row present")
 	}
+	var sawSetCell, sawClearCell bool
 	for _, c := range sim.Cells {
+		if c.Direction == "clear" {
+			sawClearCell = true
+			if c.SimulatorSatisfied {
+				t.Errorf("clear-direction cell %+v reports SimulatorSatisfied — container-clear coverage is offline and never backend-derived", c)
+			}
+			continue
+		}
+		sawSetCell = true
 		if !c.SimulatorSatisfied {
 			t.Errorf("cell %+v does not report SimulatorSatisfied with a declared simulator backend", c)
 		}
+	}
+	if !sawSetCell {
+		t.Fatal("no DirectionSet (equal) cell reported for a simulator-backed run with an equal row present")
+	}
+	if !sawClearCell {
+		t.Fatal("no DirectionClear cell reported even though containerClearFixtureCRDForMain declares container-typed leaves")
 	}
 }
 

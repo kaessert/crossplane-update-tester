@@ -124,13 +124,20 @@ func TestGroupCellsEveryDerivedCellIsSetDirection(t *testing.T) {
 // TestCellKeyStringIsStableAndDistinguishesEveryAxis confirms String()
 // (RotationState's own map key) differs whenever any one axis differs —
 // two cells that collide on their string key would silently share
-// rotation cursors and sticky registries.
+// rotation cursors and sticky registries. Depth is included as a fourth
+// axis (RULING 1, container-clear's own regrain) even though a
+// DirectionSet key never populates it: a DirectionClear key with the same
+// Classification/Shape/Direction but a different Depth must still produce
+// a distinct string, or a top-level and a nested container-clear cell
+// would collide.
 func TestCellKeyStringIsStableAndDistinguishesEveryAxis(t *testing.T) {
 	base := CellKey{Classification: ClassEqual, Shape: ShapeScalar, Direction: DirectionSet}
 	variants := []CellKey{
 		{Classification: ClassValueChanged, Shape: ShapeScalar, Direction: DirectionSet},
 		{Classification: ClassEqual, Shape: ShapeList, Direction: DirectionSet},
 		{Classification: ClassEqual, Shape: ShapeScalar, Direction: DirectionClear},
+		{Classification: ClassNA, Shape: ShapeList, Direction: DirectionClear, Depth: DepthTop},
+		{Classification: ClassNA, Shape: ShapeList, Direction: DirectionClear, Depth: DepthNested},
 	}
 	seen := map[string]bool{base.String(): true}
 	for _, v := range variants {
@@ -146,5 +153,28 @@ func TestCellKeyStringIsStableAndDistinguishesEveryAxis(t *testing.T) {
 	independentCopy := CellKey{Classification: base.Classification, Shape: base.Shape, Direction: base.Direction}
 	if base.String() != independentCopy.String() {
 		t.Errorf("CellKey.String() is not stable: %q != %q", base.String(), independentCopy.String())
+	}
+}
+
+// TestCellKeyDepthDistinguishesClearCellsOnly confirms Depth is meaningful
+// (and load-bearing for String()'s distinctness) ONLY on a DirectionClear
+// key — every DirectionSet key GroupCells ever produces leaves Depth at
+// its zero value, so two equal-cell keys differing in nothing but a
+// hypothetical Depth value would never actually arise from GroupCells'
+// own output.
+func TestCellKeyDepthDistinguishesClearCellsOnly(t *testing.T) {
+	top := CellKey{Classification: ClassNA, Shape: ShapeMap, Direction: DirectionClear, Depth: DepthTop}
+	nested := CellKey{Classification: ClassNA, Shape: ShapeMap, Direction: DirectionClear, Depth: DepthNested}
+	if top.String() == nested.String() {
+		t.Errorf("CellKey.String() collapses DepthTop and DepthNested: %q", top.String())
+	}
+
+	rows := []Row{
+		{Path: "a", Classification: ClassEqual, SpecFound: true, SpecValue: "x", MirrorFound: true, MirrorValue: "x"},
+	}
+	for key := range GroupCells(rows) {
+		if key.Depth != "" {
+			t.Errorf("GroupCells produced a DirectionSet key with non-empty Depth: %+v", key)
+		}
 	}
 }

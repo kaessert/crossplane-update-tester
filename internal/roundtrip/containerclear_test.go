@@ -1,8 +1,10 @@
 package roundtrip
 
 import (
+	"fmt"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -919,5 +921,529 @@ func TestDeclaredContainerLeavesPathsAreSorted(t *testing.T) {
 	sort.Strings(sorted)
 	if !reflect.DeepEqual(paths, sorted) {
 		t.Errorf("DeclaredContainerLeaves paths = %v, not sorted", paths)
+	}
+}
+
+// ─── cell regrain (2026-08-29 "GRANULARITY RULED" — Rulings 1, 2, 3) ───────
+
+// clearCellFixtureCRD declares TWO leaves at each (shape, depth)
+// combination the regrain must split by, so a test can prove a cell's
+// membership is exactly (shape, depth) and nothing coarser:
+//
+//   - tags, aliases   — both List, top-level (share one cell)
+//   - labels          — Map, top-level (its own cell; no second top-level
+//     map leaf, so grouping tests that need a lone top-level map member
+//     use this one)
+//   - network.subnets, network.routes — both Map, nested (share one cell)
+//   - network.itemsList               — List, nested (its own cell; proves
+//     depth splits List leaves too, not only Map ones)
+const clearCellFixtureCRD = `apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+spec:
+  group: widgets.crossplane.io
+  names:
+    kind: Widget
+    plural: widgets
+  versions:
+  - name: v1alpha1
+    served: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            properties:
+              forProvider:
+                type: object
+                properties:
+                  name:
+                    type: string
+                  tags:
+                    type: array
+                    items:
+                      type: string
+                  aliases:
+                    type: array
+                    items:
+                      type: string
+                  labels:
+                    type: object
+                    additionalProperties:
+                      type: string
+                  network:
+                    type: object
+                    properties:
+                      subnets:
+                        type: object
+                        additionalProperties:
+                          type: string
+                      routes:
+                        type: object
+                        additionalProperties:
+                          type: string
+                      itemsList:
+                        type: array
+                        items:
+                          type: string
+          status:
+            type: object
+            properties:
+              atProvider:
+                type: object
+                properties:
+                  name:
+                    type: string
+`
+
+// vacuousClearCellFixtureCRD declares TWO CEL-immutable top-level List
+// leaves and nothing else List-shaped, so the (list, top) cell they form
+// has zero eligible members — the VACUOUS state AC 10(b) requires be
+// rendered rather than omitted.
+const vacuousClearCellFixtureCRD = `apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+spec:
+  group: widgets.crossplane.io
+  names:
+    kind: Widget
+    plural: widgets
+  versions:
+  - name: v1alpha1
+    served: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            properties:
+              forProvider:
+                type: object
+                properties:
+                  name:
+                    type: string
+                  immutableA:
+                    type: array
+                    items:
+                      type: string
+                    x-kubernetes-validations:
+                    - message: immutableA is immutable
+                      rule: "self == oldSelf"
+                  immutableB:
+                    type: array
+                    items:
+                      type: string
+                    x-kubernetes-validations:
+                    - message: immutableB is immutable
+                      rule: "self == oldSelf"
+          status:
+            type: object
+            properties:
+              atProvider:
+                type: object
+                properties:
+                  name:
+                    type: string
+`
+
+// clearCellReportsByKey indexes BuildClearCellReport's own output by
+// "<shape>/<depth>" so a test can look up the cell it cares about without
+// depending on the slice's own sorted order.
+func clearCellReportsByKey(reports []ClearCellReport) map[string]ClearCellReport {
+	out := make(map[string]ClearCellReport, len(reports))
+	for _, r := range reports {
+		out[string(r.Key.Shape)+"/"+string(r.Key.Depth)] = r
+	}
+	return out
+}
+
+// TestGroupClearCellsKeyIsShapeAndDepth confirms RULING 1's cell key
+// exactly: two leaves sharing (shape, depth) land in ONE cell regardless of
+// name, and two leaves sharing shape but differing in depth land in
+// DIFFERENT cells — the depth split applies to List leaves as much as Map
+// leaves.
+func TestGroupClearCellsKeyIsShapeAndDepth(t *testing.T) {
+	crd := decodeCRD(t, clearCellFixtureCRD)
+	m := &manifest.Manifest{Tests: nil}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+
+	cells := GroupClearCells(findings)
+	if len(cells) != 4 {
+		t.Fatalf("GroupClearCells produced %d cells, want 4 (list/top, map/top, map/nested, list/nested): %+v", len(cells), cells)
+	}
+
+	listTop := CellKey{Classification: ClassNA, Shape: ShapeList, Direction: DirectionClear, Depth: DepthTop}
+	if got := sortedClearPaths(cells[listTop]); !reflect.DeepEqual(got, []string{"aliases", "tags"}) {
+		t.Errorf("list/top cell members = %v, want [aliases tags]", got)
+	}
+
+	mapTop := CellKey{Classification: ClassNA, Shape: ShapeMap, Direction: DirectionClear, Depth: DepthTop}
+	if got := sortedClearPaths(cells[mapTop]); !reflect.DeepEqual(got, []string{"labels"}) {
+		t.Errorf("map/top cell members = %v, want [labels]", got)
+	}
+
+	mapNested := CellKey{Classification: ClassNA, Shape: ShapeMap, Direction: DirectionClear, Depth: DepthNested}
+	if got := sortedClearPaths(cells[mapNested]); !reflect.DeepEqual(got, []string{"network.routes", "network.subnets"}) {
+		t.Errorf("map/nested cell members = %v, want [network.routes network.subnets]", got)
+	}
+
+	listNested := CellKey{Classification: ClassNA, Shape: ShapeList, Direction: DirectionClear, Depth: DepthNested}
+	if got := sortedClearPaths(cells[listNested]); !reflect.DeepEqual(got, []string{"network.itemsList"}) {
+		t.Errorf("list/nested cell members = %v, want [network.itemsList] — depth must split List leaves too, not only Map leaves", got)
+	}
+}
+
+func sortedClearPaths(findings []ContainerClearFinding) []string {
+	out := make([]string, len(findings))
+	for i, f := range findings {
+		out[i] = f.Path
+	}
+	sort.Strings(out)
+	return out
+}
+
+// TestDepthOfDerivesFromDottedPath is depthOf's own table test: no dotted
+// ancestor is DepthTop, at least one is DepthNested — including a
+// multi-level path, so the check is "any dot", not "exactly one".
+func TestDepthOfDerivesFromDottedPath(t *testing.T) {
+	cases := map[string]struct {
+		path string
+		want Depth
+	}{
+		"top-level, no dot":       {path: "tags", want: DepthTop},
+		"one level nested":        {path: "network.subnets", want: DepthNested},
+		"two levels nested":       {path: "a.b.c", want: DepthNested},
+		"empty path defaults top": {path: "", want: DepthTop},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := depthOf(tc.path); got != tc.want {
+				t.Errorf("depthOf(%q) = %q, want %q", tc.path, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestClearCellReportCoverageIsExistential confirms RULING 2's existential
+// half: a cell with ONE covered eligible member (tags) and one uncovered,
+// undisposed sibling (aliases) is nonetheless Covered — coverage does not
+// require every member to be tested, only one.
+func TestClearCellReportCoverageIsExistential(t *testing.T) {
+	crd := decodeCRD(t, clearCellFixtureCRD)
+	m := &manifest.Manifest{
+		Tests: []manifest.UpdateTest{
+			// tags self-tombstoned: value: [] on its own entry.
+			{Field: "tags", Value: []interface{}{}},
+			// aliases carries no entry at all — uncovered, undisposed.
+		},
+	}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+	cell := clearCellReportsByKey(BuildClearCellReport(findings))["list/top"]
+
+	if !cell.Covered {
+		t.Fatalf("list/top cell not Covered despite tags carrying self-tombstone coverage: %+v", cell)
+	}
+	if cell.Representative != "tags" {
+		t.Errorf("Representative = %q, want %q (the one covered member)", cell.Representative, "tags")
+	}
+	if cell.Route != RouteSelfTombstone {
+		t.Errorf("Route = %q, want %q", cell.Route, RouteSelfTombstone)
+	}
+	if !reflect.DeepEqual(cell.Members, []string{"aliases", "tags"}) {
+		t.Errorf("Members = %v, want [aliases tags] — both siblings still occupy the cell", cell.Members)
+	}
+	if len(cell.UndispositionedMembers) != 0 {
+		t.Errorf("UndispositionedMembers = %v, want empty — a covered cell reports no disposition gap", cell.UndispositionedMembers)
+	}
+}
+
+// TestClearCellReportImpossibilityIsUniversalAsymmetric is the AC's own
+// named case: RULING 2's universal half. tags carries a valid disposition;
+// aliases carries none. Neither is covered. The cell must NOT read as
+// settled — a single disposed member never speaks for its undisposed
+// sibling, which is exactly the incentive-gradient failure ("author one
+// reason and move on") the ruling exists to close off.
+func TestClearCellReportImpossibilityIsUniversalAsymmetric(t *testing.T) {
+	crd := decodeCRD(t, clearCellFixtureCRD)
+	m := &manifest.Manifest{
+		Tests: []manifest.UpdateTest{
+			{
+				Field: "tags",
+				Skip: manifest.SkipInfo{
+					Reason:      manifest.SkipVendorDefect,
+					Evidence:    "observed a 400 on an empty-list PATCH",
+					Ticket:      "https://example.invalid/issues/1",
+					Disposition: manifest.DispositionOneLivePatch,
+				},
+			},
+			// aliases: no entry at all — no disposition, no coverage.
+		},
+	}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+	cell := clearCellReportsByKey(BuildClearCellReport(findings))["list/top"]
+
+	if cell.Covered {
+		t.Fatalf("list/top cell reported Covered with no member ever tested: %+v", cell)
+	}
+	if cell.Vacuous {
+		t.Fatalf("list/top cell reported Vacuous — both members are eligible: %+v", cell)
+	}
+	if !reflect.DeepEqual(cell.UndispositionedMembers, []string{"aliases"}) {
+		t.Errorf("UndispositionedMembers = %v, want exactly [aliases] — tags' own disposition must never cover its sibling", cell.UndispositionedMembers)
+	}
+}
+
+// TestClearCellReportImpossibilityIsUniversalBothDisposed is the symmetric
+// control for the asymmetric test above: once EVERY eligible member of an
+// uncovered cell carries a disposition, UndispositionedMembers is empty.
+func TestClearCellReportImpossibilityIsUniversalBothDisposed(t *testing.T) {
+	crd := decodeCRD(t, clearCellFixtureCRD)
+	disposedSkip := manifest.SkipInfo{
+		Reason:      manifest.SkipVendorDefect,
+		Evidence:    "observed a 400 on an empty-list PATCH",
+		Ticket:      "https://example.invalid/issues/1",
+		Disposition: manifest.DispositionOneLivePatch,
+	}
+	m := &manifest.Manifest{
+		Tests: []manifest.UpdateTest{
+			{Field: "tags", Skip: disposedSkip},
+			{Field: "aliases", Skip: disposedSkip},
+		},
+	}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+	cell := clearCellReportsByKey(BuildClearCellReport(findings))["list/top"]
+
+	if cell.Covered {
+		t.Fatalf("list/top cell reported Covered with no member ever tested: %+v", cell)
+	}
+	if len(cell.UndispositionedMembers) != 0 {
+		t.Errorf("UndispositionedMembers = %v, want empty — every eligible member carries a disposition", cell.UndispositionedMembers)
+	}
+}
+
+// TestClearCellReportVacuousCellRendered confirms AC 10(b): a cell whose
+// every member is ineligible is rendered — Members and IneligibleMembers
+// populated, Vacuous true — rather than omitted for lack of an eligible
+// member.
+func TestClearCellReportVacuousCellRendered(t *testing.T) {
+	crd := decodeCRD(t, vacuousClearCellFixtureCRD)
+	m := &manifest.Manifest{Tests: nil}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+	reports := BuildClearCellReport(findings)
+	cell := clearCellReportsByKey(reports)["list/top"]
+
+	if !cell.Vacuous {
+		t.Fatalf("list/top cell not reported Vacuous despite both members being CEL-immutable: %+v", cell)
+	}
+	if cell.Covered {
+		t.Errorf("a Vacuous cell must never also report Covered: %+v", cell)
+	}
+	if !reflect.DeepEqual(cell.Members, []string{"immutableA", "immutableB"}) {
+		t.Errorf("Members = %v, want [immutableA immutableB] — a vacuous cell still names its membership", cell.Members)
+	}
+	if !reflect.DeepEqual(cell.IneligibleMembers, []string{"immutableA", "immutableB"}) {
+		t.Errorf("IneligibleMembers = %v, want [immutableA immutableB]", cell.IneligibleMembers)
+	}
+	if len(cell.UndispositionedMembers) != 0 {
+		t.Errorf("UndispositionedMembers = %v, want empty — a vacuous cell has no eligible member to demand a disposition from", cell.UndispositionedMembers)
+	}
+
+	// The vacuous cell must actually be present in the reported slice, not
+	// merely constructible by a caller who already knows to look for it.
+	found := false
+	for _, r := range reports {
+		if r.Key.Shape == ShapeList && r.Key.Depth == DepthTop {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("BuildClearCellReport omitted the vacuous cell from its output entirely")
+	}
+}
+
+// TestClearCellReportRepresentativeIsStickyAndDeterministic is RULING 3:
+// a clear cell's representative does not rotate. With BOTH tags and
+// aliases covered, the alphabetically-first covered member (aliases) is
+// chosen every time, across repeated calls — there is no cursor, no seed,
+// and no RotationState in this code path at all (contrast
+// roundtrip.CreditCells, which takes one), so "sticky" here means simply
+// that the same input always yields the same answer, deterministically,
+// forever.
+func TestClearCellReportRepresentativeIsStickyAndDeterministic(t *testing.T) {
+	crd := decodeCRD(t, clearCellFixtureCRD)
+	m := &manifest.Manifest{
+		Tests: []manifest.UpdateTest{
+			{Field: "tags", Value: []interface{}{}},
+			{Field: "aliases", Value: []interface{}{}},
+		},
+	}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+
+	// Simulate several successive "runs" (BuildClearCellReport regroups
+	// from scratch every call, exactly as roundtrip-verify's own
+	// per-invocation report construction does) and confirm the
+	// Representative never moves.
+	for i := 0; i < 5; i++ {
+		cell := clearCellReportsByKey(BuildClearCellReport(findings))["list/top"]
+		if !cell.Covered {
+			t.Fatalf("run %d: list/top cell not Covered: %+v", i, cell)
+		}
+		if cell.Representative != "aliases" {
+			t.Errorf("run %d: Representative = %q, want %q (alphabetically first covered member, sticky across runs)", i, cell.Representative, "aliases")
+		}
+		if !reflect.DeepEqual(cell.Members, []string{"aliases", "tags"}) {
+			t.Errorf("run %d: Members = %v, want [aliases tags]", i, cell.Members)
+		}
+	}
+}
+
+// TestBuildClearCellReportOrderIsStable confirms the reported cell order
+// is deterministic (sorted by CellKey.String()) across repeated calls,
+// independent of Go's randomized map iteration inside GroupClearCells —
+// the property BuildClearCellReport's own sort exists to guarantee.
+func TestBuildClearCellReportOrderIsStable(t *testing.T) {
+	crd := decodeCRD(t, clearCellFixtureCRD)
+	m := &manifest.Manifest{Tests: nil}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+
+	var first []string
+	for i := 0; i < 10; i++ {
+		reports := BuildClearCellReport(findings)
+		keys := make([]string, len(reports))
+		for j, r := range reports {
+			keys[j] = r.Key.String()
+		}
+		if i == 0 {
+			first = keys
+			continue
+		}
+		if !reflect.DeepEqual(keys, first) {
+			t.Fatalf("run %d: cell order = %v, want %v (stable across calls)", i, keys, first)
+		}
+	}
+}
+
+// TestClearCellReportRouteNamedForEachMechanism is AC 10(c): every one of
+// the five credit routes is both produced by ContainerClearCoverage and
+// carried through to the cell report's own Route field, using a
+// single-member cell per case so the covered member IS the representative.
+func TestClearCellReportRouteNamedForEachMechanism(t *testing.T) {
+	crd := decodeCRD(t, containerClearFixtureCRD)
+
+	cases := map[string]struct {
+		tests    []manifest.UpdateTest
+		wantPath string
+		want     ClearRoute
+	}{
+		"sibling clear:": {
+			tests:    []manifest.UpdateTest{{Field: "name", Value: "new-name", Clear: []string{"tags"}}},
+			wantPath: "tags",
+			want:     RouteSiblingClear,
+		},
+		"sibling withValues:": {
+			tests:    []manifest.UpdateTest{{Field: "name", Value: "new-name", WithValues: map[string]interface{}{"tags": []interface{}{}}}},
+			wantPath: "tags",
+			want:     RouteSiblingWithValues,
+		},
+		"ancestor-tombstone": {
+			tests:    []manifest.UpdateTest{{Field: "name", Value: "new-name", Clear: []string{"network"}}},
+			wantPath: "network.subnets",
+			want:     RouteAncestorTombstone,
+		},
+		"per-key-null": {
+			tests:    []manifest.UpdateTest{{Field: "labels", Value: map[string]interface{}{"a": "1", "b": nil}}},
+			wantPath: "labels",
+			want:     RoutePerKeyNull,
+		},
+		"self-tombstone": {
+			tests:    []manifest.UpdateTest{{Field: "tags", Value: []interface{}{}}},
+			wantPath: "tags",
+			want:     RouteSelfTombstone,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			m := &manifest.Manifest{Tests: tc.tests}
+			findings, err := ContainerClearCoverage(crd, m)
+			if err != nil {
+				t.Fatalf("ContainerClearCoverage: %v", err)
+			}
+
+			byPath := findingsByPath(findings)
+			leaf := byPath[tc.wantPath]
+			if !leaf.Covered {
+				t.Fatalf("%s not covered: %+v", tc.wantPath, leaf)
+			}
+			if leaf.Route != tc.want {
+				t.Errorf("ContainerClearFinding.Route = %q, want %q", leaf.Route, tc.want)
+			}
+
+			// And the SAME route must survive into the cell report's own
+			// Representative/Route for the cell this leaf occupies alone.
+			depth := depthOf(tc.wantPath)
+			cell := clearCellReportsByKey(BuildClearCellReport(findings))[string(leaf.Shape)+"/"+string(depth)]
+			if cell.Representative != tc.wantPath {
+				t.Errorf("cell Representative = %q, want %q", cell.Representative, tc.wantPath)
+			}
+			if cell.Route != tc.want {
+				t.Errorf("cell Route = %q, want %q", cell.Route, tc.want)
+			}
+		})
+	}
+}
+
+// TestPrintClearCellReportRendersAllThreeRequiredThings confirms the text
+// report AC 10 demands: (a) a credited leaf names its representative and
+// route, (b) a vacuous cell is printed rather than skipped, and (c) the
+// verdict line states TWO numbers — cells and leaves — never one.
+func TestPrintClearCellReportRendersAllThreeRequiredThings(t *testing.T) {
+	crd := decodeCRD(t, vacuousClearCellFixtureCRD)
+	m := &manifest.Manifest{Tests: nil}
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+	reports := BuildClearCellReport(findings)
+
+	var out []string
+	PrintClearCellReport(func(format string, args ...interface{}) {
+		out = append(out, fmt.Sprintf(format, args...))
+	}, reports)
+	full := strings.Join(out, "")
+
+	if !strings.Contains(full, "VACUOUS") {
+		t.Errorf("report does not render the vacuous cell:\n%s", full)
+	}
+	if !strings.Contains(full, "cells covered") || !strings.Contains(full, "leaves covered") {
+		t.Errorf("verdict line does not state both a cell count and a leaf count:\n%s", full)
 	}
 }

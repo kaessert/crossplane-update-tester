@@ -56,15 +56,39 @@ const (
 // observation classified the field as — so ClassNA is used there instead
 // of leaving the field's normal classification vocabulary to imply
 // something it does not mean.
+//
+// Depth is a fourth axis, meaningful only for a DirectionClear key — see
+// GroupClearCells for why a container-clear cell must split by depth and
+// Depth's own doc comment for the measured mechanism disjointness that
+// makes it load-bearing rather than cosmetic. Every DirectionSet key
+// leaves Depth at its zero value: GroupCells never produces one, and
+// nothing about the equal-cell rotation this ticket does not reopen reads
+// it.
 type CellKey struct {
 	Classification string
 	Shape          Shape
 	Direction      Direction
+	Depth          Depth
 }
 
 // ClassNA is CellKey.Classification's value for a DirectionClear cell,
 // where a set-direction classification does not apply.
 const ClassNA = "n/a"
+
+// Depth is a container-clear cell's third grouping axis: whether the leaf
+// sits directly under spec.forProvider (DepthTop) or beneath a nested
+// ancestor object (DepthNested) — see GroupClearCells. Always the zero
+// value on a DirectionSet key.
+type Depth string
+
+const (
+	// DepthTop is a leaf with no dotted-path ancestor — a direct child of
+	// spec.forProvider.
+	DepthTop Depth = "top"
+	// DepthNested is a leaf reached through at least one ancestor object
+	// (e.g. "network.subnets").
+	DepthNested Depth = "nested"
+)
 
 // ShapeOf derives a Row's container shape from whichever of SpecValue or
 // MirrorValue is actually populated, preferring the spec side since that

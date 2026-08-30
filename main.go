@@ -542,6 +542,8 @@ func cmdValidate(args []string) error {
 	skipReasonFindings := validator.CheckSkipReasons(m, fields)
 	validator.PrintSkipReasons(skipReasonFindings)
 
+	printContainerClearCells(opts.root, opts.manifestPath, m)
+
 	if !result.AllGood {
 		return errors.New("mutable-field coverage is incomplete")
 	}
@@ -564,6 +566,80 @@ func cmdValidate(args []string) error {
 		return errors.New("skip: reason does not resolve against this manifest's own declared coverage")
 	}
 	return nil
+}
+
+// printContainerClearCells is `validate`'s wiring for the container-clear
+// cell gate (roundtrip.ContainerClearCoverage, grouped into cells by
+// roundtrip.BuildClearCellReport) — the first place this check reaches any
+// provider's own Makefile target, since roundtrip-verify's copy of the
+// same computation sits behind `roundtrip-verify`, a subcommand no
+// provider invokes.
+//
+// REPORT-ONLY: the return value is deliberately discarded by cmdValidate
+// and nothing here is wired into result.AllGood or any of cmdValidate's
+// other exit-code decisions — flipping this from advisory to enforcing is
+// a distinct, later, conversation-reserved act (see roundtrip.
+// ContainerClearFinding's own doc comment for why). A CRD that cannot be
+// found is silently skipped, exactly as roundtrip-verify already treats
+// that case: `validate` has always run without a CRD present (its other
+// checks resolve against the Go types file, never the CRD), so a provider
+// mid-generation with no CRD yet must not start failing a check that was
+// never gating before.
+//
+// root ALONE is not a reliable place to find package/crds: six of the
+// fleet's seven update-test.validate Makefile recipes invoke this command
+// as `--types-file \"$$PWD/$$types\" \"$$PWD/$$f\"`, never passing --root at
+// all, and `UPDATE_TESTER := go -C tools/update-tester tool ...` changes
+// the TOOL PROCESS'S OWN working directory to tools/update-tester before it
+// ever runs — so parseValidateArgs' os.Getwd() fallback silently resolves
+// root to the wrong directory on every one of those six, and
+// roundtrip.FindCRD finds nothing. manifestPath is unaffected by that: the
+// shell builds "$$PWD/$$f" into an absolute path BEFORE go -C ever runs, so
+// inferProviderRootFromManifest walks up from ITS OWN directory instead,
+// which reaches the provider root reliably regardless of what the tool
+// process's own cwd became.
+func printContainerClearCells(root, manifestPath string, m *manifest.Manifest) {
+	crd, _ := roundtrip.FindCRD(root, m.APIVersion, m.Kind)
+	if crd == nil {
+		if inferredRoot, ok := inferProviderRootFromManifest(manifestPath); ok {
+			crd, _ = roundtrip.FindCRD(inferredRoot, m.APIVersion, m.Kind)
+		}
+	}
+	if crd == nil {
+		return
+	}
+	findings, err := roundtrip.ContainerClearCoverage(crd, m)
+	if err != nil {
+		printfTo(os.Stdout, "container-clear: ERROR — %s\n", err)
+		return
+	}
+	roundtrip.PrintClearCellReport(func(format string, args ...interface{}) {
+		printfTo(os.Stdout, format, args...)
+	}, roundtrip.BuildClearCellReport(findings))
+}
+
+// inferProviderRootFromManifest walks upward from manifestPath's own
+// absolute directory looking for a "package/crds" directory, returning the
+// first one found. See printContainerClearCells' own doc comment for why
+// this fallback exists — root's os.Getwd() default cannot be trusted under
+// `go -C tools/update-tester tool ...`, but manifestPath's own absolute
+// path was already resolved by the invoking shell before that happened.
+func inferProviderRootFromManifest(manifestPath string) (string, bool) {
+	abs, err := filepath.Abs(manifestPath)
+	if err != nil {
+		return "", false
+	}
+	dir := filepath.Dir(abs)
+	for {
+		if info, err := os.Stat(filepath.Join(dir, "package", "crds")); err == nil && info.IsDir() {
+			return dir, true
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", false
+		}
+		dir = parent
+	}
 }
 
 // ─── expect-skeleton ────────────────────────────────────────────────────────
@@ -1270,13 +1346,25 @@ type roundtripVerifyReportJSON struct {
 	Waivers             []waiverFindingJSON `json:"waivers,omitempty"`
 }
 
-// cellCreditJSON is the machine-readable shape one roundtrip.CellCredit
-// renders as — an `equal` cell's representative crediting outcome for one
-// run. SimulatorSatisfied restates the report's own Backend declaration on
-// every cell line, per the provenance requirement: a reader filtering or
-// grepping cell lines never has to cross-reference a separate top-level
-// field to see whether a cell was satisfied by a simulator-derived
-// classification.
+// cellCreditJSON is the machine-readable shape one roundtrip.CellCredit (an
+// `equal` cell) OR one roundtrip.ClearCellReport (a container-clear cell)
+// renders as — the SAME array both directions join (RULING 1's own
+// requirement: "clear cells join the existing cells[] array", no parallel
+// DTO), distinguished by Direction. SimulatorSatisfied restates the
+// report's own Backend declaration on every equal-cell line, per the
+// provenance requirement: a reader filtering or grepping cell lines never
+// has to cross-reference a separate top-level field to see whether a cell
+// was satisfied by a simulator-derived classification; it is always false
+// on a clear-direction line, which this offline check never derives from a
+// live backend at all.
+//
+// Depth, Vacuous, UndispositionedMembers and Route are populated ONLY on a
+// clear-direction line (Direction == "clear") — RULING 1's depth axis,
+// RULING 2's existential/universal split, and the named credit route AC 10
+// requires. All four are the zero value, and omitted, on every equal-cell
+// line, so an existing reader parsing only
+// Classification/Shape/Direction/Members/Representatives/Credited/Sticky/
+// SimulatorSatisfied sees no change to those fields' own shape.
 type cellCreditJSON struct {
 	Classification     string   `json:"classification"`
 	Shape              string   `json:"shape"`
@@ -1286,6 +1374,12 @@ type cellCreditJSON struct {
 	Credited           []string `json:"credited"`
 	Sticky             []string `json:"sticky,omitempty"`
 	SimulatorSatisfied bool     `json:"simulatorSatisfied,omitempty"`
+	// The four fields below are clear-direction-only — see this type's own
+	// doc comment.
+	Depth                  string   `json:"depth,omitempty"`
+	Vacuous                bool     `json:"vacuous,omitempty"`
+	UndispositionedMembers []string `json:"undispositionedMembers,omitempty"`
+	Route                  string   `json:"route,omitempty"`
 }
 
 // containerClearJSON is the machine-readable shape one
@@ -1298,7 +1392,9 @@ type cellCreditJSON struct {
 // Ineligible is true, or no disposition: was authored on the leaf's own
 // skip: entry — omitempty means a report from a manifest with zero
 // authored dispositions (every manifest in the fleet today) renders
-// byte-identical to before this field existed.
+// byte-identical to before this field existed. Route names Covered's own
+// credit mechanism (one of the five ClearRoute constants) and is empty
+// whenever Covered is false.
 type containerClearJSON struct {
 	Path        string `json:"path"`
 	Shape       string `json:"shape"`
@@ -1307,6 +1403,7 @@ type containerClearJSON struct {
 	Reason      string `json:"reason,omitempty"`
 	Detail      string `json:"detail"`
 	Disposition string `json:"disposition,omitempty"`
+	Route       string `json:"route,omitempty"`
 }
 
 // waiverFindingJSON is the machine-readable shape one
@@ -1341,8 +1438,44 @@ func toContainerClearJSON(findings []roundtrip.ContainerClearFinding) []containe
 		out[i] = containerClearJSON{
 			Path: f.Path, Shape: string(f.Shape), Covered: f.Covered,
 			Ineligible: f.Ineligible, Reason: string(f.Reason), Detail: f.Detail,
-			Disposition: string(f.Disposition),
+			Disposition: string(f.Disposition), Route: string(f.Route),
 		}
+	}
+	return out
+}
+
+// toClearCellCreditJSON renders BuildClearCellReport's own
+// roundtrip.ClearCellReport slice into cellCreditJSON lines — the SAME
+// array shape toCellCreditJSON renders an equal cell's roundtrip.CellCredit
+// as (RULING 1's "clear cells join the existing cells[] array", no
+// parallel DTO). Representatives/Credited follow CellCredit's own
+// vocabulary: Representatives is the single sticky credited member
+// (RULING 3 — never a rotated subset), Credited is every OTHER eligible
+// member of a covered cell, mechanically credited by cell membership. Both
+// are empty on an uncovered or vacuous cell, since there is no
+// representative to credit siblings from.
+func toClearCellCreditJSON(reports []roundtrip.ClearCellReport) []cellCreditJSON {
+	out := make([]cellCreditJSON, len(reports))
+	for i, r := range reports {
+		line := cellCreditJSON{
+			Classification:         r.Key.Classification,
+			Shape:                  string(r.Key.Shape),
+			Direction:              string(r.Key.Direction),
+			Members:                r.Members,
+			Depth:                  string(r.Key.Depth),
+			Vacuous:                r.Vacuous,
+			UndispositionedMembers: r.UndispositionedMembers,
+			Route:                  string(r.Route),
+		}
+		if r.Covered {
+			line.Representatives = []string{r.Representative}
+			for _, m := range r.Members {
+				if m != r.Representative {
+					line.Credited = append(line.Credited, m)
+				}
+			}
+		}
+		out[i] = line
 	}
 	return out
 }
@@ -1515,6 +1648,16 @@ func buildRoundtripVerifyReport(
 	}
 	waivers := roundtrip.ClassifyWaivers(m, rows)
 
+	// RULING 1's own requirement: clear cells join the SAME cells[] array
+	// the equal-cell credits above populate, never a parallel array — see
+	// toClearCellCreditJSON and cellCreditJSON's own doc comment. Grouped
+	// only when ContainerClearCoverage produced no error, matching
+	// ContainerClear's own empty-on-error behaviour above.
+	cellsJSON := toCellCreditJSON(credits, backend)
+	if clearFindings != nil {
+		cellsJSON = append(cellsJSON, toClearCellCreditJSON(roundtrip.BuildClearCellReport(clearFindings))...)
+	}
+
 	report = roundtripVerifyReportJSON{
 		Kind:                m.Kind,
 		Name:                m.Name,
@@ -1524,7 +1667,7 @@ func buildRoundtripVerifyReport(
 		Excluded:            toRoundtripVerifyExcludedJSON(excluded),
 		Backend:             string(backend),
 		Seed:                rotation.Seed,
-		Cells:               toCellCreditJSON(credits, backend),
+		Cells:               cellsJSON,
 		ContainerClear:      toContainerClearJSON(clearFindings),
 		ContainerClearError: containerClearErr,
 		Waivers:             toWaiverFindingJSON(waivers),

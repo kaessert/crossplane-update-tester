@@ -93,8 +93,16 @@ type RotationState struct {
 // String renders a CellKey as the stable identity every report keyed by
 // cell uses. It carries no manifest identity — see stateKey for the
 // persisted rotation state's own lookup key, which adds one.
+//
+// Adding the Depth segment changes every key's string versus before Depth
+// existed (a trailing "|" now follows every DirectionSet key, since Depth
+// is always empty there). Any already-persisted rotation-state file goes
+// unmatched on the next run and each cursor restarts from zero — the same,
+// already-accepted reconvergence manifestScope's own introduction produced
+// (see stateKey), bounded by RepresentativesPerRun and needing no
+// migration.
 func (k CellKey) String() string {
-	return fmt.Sprintf("%s|%s|%s", k.Classification, k.Shape, k.Direction)
+	return fmt.Sprintf("%s|%s|%s|%s", k.Classification, k.Shape, k.Direction, k.Depth)
 }
 
 // stateKey combines a manifest scope with a CellKey into the string

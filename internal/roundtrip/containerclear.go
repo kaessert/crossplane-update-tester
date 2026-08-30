@@ -130,7 +130,38 @@ type ContainerClearFinding struct {
 	// from Reason or Evidence prose: absent is reported as absent, not
 	// defaulted to a tier.
 	Disposition manifest.Disposition
+	// Route names the mechanism that produced Covered — one of the five
+	// ClearRoute constants. Empty whenever Covered is false.
+	Route ClearRoute
 }
+
+// ClearRoute names the mechanism that credited one covered container leaf's
+// clear-direction coverage — a stable, machine-readable restatement of
+// coverageFor's own prose Detail, so a report can name a credit route
+// without sniffing that free-form string. These are the five routes
+// ContainerClearCoverage's own doc comment documents, in the same order.
+type ClearRoute string
+
+const (
+	// RouteSiblingClear is the whole-field tombstone shape: a sibling
+	// entry's clear: list names this leaf's own exact path.
+	RouteSiblingClear ClearRoute = "sibling clear:"
+	// RouteSiblingWithValues is the List-shaped equivalent: a sibling
+	// entry's withValues: map names this leaf with an empty list literal.
+	RouteSiblingWithValues ClearRoute = "sibling withValues:"
+	// RouteAncestorTombstone is the whole-subtree tombstone shape: a
+	// sibling entry's clear: list names an OBJECT ancestor of this leaf,
+	// which RFC-7386 merge-patch semantics remove wholesale, this leaf
+	// included.
+	RouteAncestorTombstone ClearRoute = "ancestor-tombstone"
+	// RoutePerKeyNull is the per-key removal shape: the entry testing this
+	// leaf's own field nulls one of its member keys.
+	RoutePerKeyNull ClearRoute = "per-key-null"
+	// RouteSelfTombstone is the entry testing this leaf's own field
+	// patching the leaf's OWN value to a tombstone — an explicit
+	// `value: null` or an empty List value.
+	RouteSelfTombstone ClearRoute = "self-tombstone"
+)
 
 // ContainerClearCoverage checks every declared container-typed leaf under
 // crd's spec.forProvider schema against m's own Tests. A leaf is covered
@@ -225,11 +256,11 @@ func ContainerClearCoverage(crd map[string]interface{}, m *manifest.Manifest) ([
 
 	findings := make([]ContainerClearFinding, 0, len(leaves))
 	for _, leaf := range leaves {
-		covered, detail := coverageFor(leaf, clearedSiblings, withValuesEmptyList, perKeyNulled, selfByField)
+		covered, route, detail := coverageFor(leaf, clearedSiblings, withValuesEmptyList, perKeyNulled, selfByField)
 
 		reason, isIneligible := ineligible[leaf.Path]
 		if !isIneligible {
-			finding := ContainerClearFinding{Path: leaf.Path, Shape: leaf.Shape, Covered: covered, Detail: detail}
+			finding := ContainerClearFinding{Path: leaf.Path, Shape: leaf.Shape, Covered: covered, Route: route, Detail: detail}
 			if !covered {
 				finding.Disposition = dispositionFor(leaf, selfByField)
 			}
@@ -288,23 +319,24 @@ func ContainerClearCoverage(crd map[string]interface{}, m *manifest.Manifest) ([
 // coverageFor applies the covered/uncovered decision ContainerClearCoverage
 // documents to one leaf, independent of whether that leaf turns out to be
 // ineligible — kept separate so the ineligible/covered contradiction check
-// above can compute both without duplicating this logic.
-func coverageFor(leaf ContainerLeaf, clearedSiblings, withValuesEmptyList, perKeyNulled map[string]bool, selfByField map[string]manifest.UpdateTest) (covered bool, detail string) {
+// above can compute both without duplicating this logic. route is the zero
+// value (empty ClearRoute) whenever covered is false.
+func coverageFor(leaf ContainerLeaf, clearedSiblings, withValuesEmptyList, perKeyNulled map[string]bool, selfByField map[string]manifest.UpdateTest) (covered bool, route ClearRoute, detail string) {
 	ancestor, ancestorCleared := clearedAncestor(leaf.Path, clearedSiblings)
 	self, hasSelf := selfByField[leaf.Path]
 	switch {
 	case clearedSiblings[leaf.Path]:
-		return true, "whole-field tombstone: named in a sibling entry's clear: list"
+		return true, RouteSiblingClear, "whole-field tombstone: named in a sibling entry's clear: list"
 	case leaf.Shape == ShapeList && withValuesEmptyList[leaf.Path]:
-		return true, "whole-field tombstone: named in a sibling entry's withValues: map with an empty list literal (RFC-7386 wholesale replacement, equivalent to a null tombstone)"
+		return true, RouteSiblingWithValues, "whole-field tombstone: named in a sibling entry's withValues: map with an empty list literal (RFC-7386 wholesale replacement, equivalent to a null tombstone)"
 	case ancestorCleared:
-		return true, fmt.Sprintf("whole-subtree tombstone: ancestor %q named in a sibling entry's clear: list removes this leaf too", ancestor)
+		return true, RouteAncestorTombstone, fmt.Sprintf("whole-subtree tombstone: ancestor %q named in a sibling entry's clear: list removes this leaf too", ancestor)
 	case perKeyNulled[leaf.Path]:
-		return true, "per-key removal: this field's own tested value nulls a member key"
+		return true, RoutePerKeyNull, "per-key removal: this field's own tested value nulls a member key"
 	case hasSelf && selfTombstoned(self, leaf.Shape):
-		return true, "whole-field tombstone: this field's own tested value is an explicit `value: null` or an empty container, with no sibling field needed to host it"
+		return true, RouteSelfTombstone, "whole-field tombstone: this field's own tested value is an explicit `value: null` or an empty container, with no sibling field needed to host it"
 	default:
-		return false, "no clear:, whole-field tombstone, whole-subtree tombstone, per-key removal, or self-tombstone exercises this container leaf's removal direction"
+		return false, "", "no clear:, whole-field tombstone, whole-subtree tombstone, per-key removal, or self-tombstone exercises this container leaf's removal direction"
 	}
 }
 
@@ -420,4 +452,210 @@ func containerLeafSummary(findings []ContainerClearFinding) string {
 		return fmt.Sprintf("%d/%d container leaves carry clear-direction coverage", covered, eligible)
 	}
 	return fmt.Sprintf("%d/%d container leaves carry clear-direction coverage (%d ineligible, excluded)", covered, eligible, ineligible)
+}
+
+// depthOf derives a container leaf's depth axis (see Depth) from its own
+// dotted path: no ancestor segment means DepthTop, at least one means
+// DepthNested. Agrees exactly with DeclaredContainerLeaves' own path
+// construction (dot-joined from the schema walk), so this never has to
+// re-walk the schema to answer a question the path already encodes.
+func depthOf(path string) Depth {
+	if strings.Contains(path, ".") {
+		return DepthNested
+	}
+	return DepthTop
+}
+
+// GroupClearCells partitions ContainerClearCoverage's own findings into
+// DirectionClear cells keyed by (Shape, Depth) — RULING 1 of the
+// 2026-08-29 granularity note. Classification is always ClassNA (a
+// set-direction classification does not apply to a clear obligation; see
+// CellKey's own doc comment) and manifest scope is implicit, exactly as
+// GroupCells settles it: findings passed here are always the result of ONE
+// manifest's own ContainerClearCoverage call, and this function never
+// reaches across manifests to merge two independently-observed leaf sets
+// into one cell (GroupCells' own doc comment states why that would be
+// wrong; the same reasoning applies here unchanged).
+//
+// Depth splits the key because the two depths' own coverage routes are
+// measured near-disjoint: fleet-wide, 98.3% of NESTED coverage rides an
+// ancestor tombstone — a route with no top-level analogue, since a
+// top-level leaf has no ancestor object under spec.forProvider to name —
+// while 92% of TOP-LEVEL coverage is per-key-null or a sibling
+// clear:/withValues: entry, none of which a nested leaf's own sibling set
+// (which sits inside the SAME ancestor object, not at spec.forProvider)
+// can supply in the same way. A representative from one depth is therefore
+// never evidence for a member at the other, so the two must never share a
+// cell even when their Shape agrees.
+//
+// Every finding is included regardless of Ineligible — an ineligible leaf
+// still occupies its cell; see ClearCellReport.Vacuous for why that
+// matters (a cell every one of whose members is ineligible must still be
+// rendered, not silently omitted for lack of an eligible member).
+func GroupClearCells(findings []ContainerClearFinding) map[CellKey][]ContainerClearFinding {
+	out := make(map[CellKey][]ContainerClearFinding)
+	for _, f := range findings {
+		key := CellKey{Classification: ClassNA, Shape: f.Shape, Direction: DirectionClear, Depth: depthOf(f.Path)}
+		out[key] = append(out[key], f)
+	}
+	return out
+}
+
+// ClearCellReport is the cell-denominator verdict for one DirectionClear
+// cell — RULING 1, 2 and 3 of the 2026-08-29 granularity note, rendered so
+// a caller can print or gate on it without recomputing anything from
+// Members. No parallel DTO: this is the same CellKey/ContainerClearFinding
+// vocabulary GroupCells/CellCredit already use for the equal direction,
+// carrying Direction: clear and Classification: ClassNA rather than a
+// second type family.
+type ClearCellReport struct {
+	Key CellKey
+	// Members lists every declared leaf occupying this cell, sorted —
+	// eligible and ineligible together, so a Vacuous cell (every member
+	// ineligible) is still rendered with its membership visible rather
+	// than reported as an empty cell.
+	Members []string
+	// IneligibleMembers is the subset of Members classifyIneligibility
+	// excluded from this cell's eligible set, sorted.
+	IneligibleMembers []string
+	// Covered is RULING 2's existential half: true the moment ANY eligible
+	// member carries clear-direction coverage of its own.
+	Covered bool
+	// Vacuous is true when every member is ineligible — zero eligible
+	// members at all. A vacuous cell can be neither Covered nor
+	// satisfied-by-disposition: it simply has nothing left to test, and is
+	// reported rather than folded into either state so it is never
+	// silently indistinguishable from a cell nobody has looked at.
+	Vacuous bool
+	// Representative names the ONE credited member a reader should look
+	// at — RULING 3: sticky and never rotated. Chosen deterministically as
+	// the alphabetically-first covered eligible member, since there is no
+	// per-run selection to make here (unlike an equal cell's
+	// RotationState.Select, this cell-report path never receives, reads,
+	// or advances a RotationState at all — D2's size-scaled rotation
+	// budget has no application on this axis). Empty unless Covered.
+	Representative string
+	// Route is Representative's own credit mechanism — one of the
+	// ClearRoute constants. Empty unless Covered.
+	Route ClearRoute
+	// UndispositionedMembers is RULING 2's universal half: the eligible,
+	// uncovered members carrying no authored disposition, sorted. An
+	// uncovered, non-vacuous cell is fully dispositioned only once this is
+	// empty — a single disposed member never speaks for an undisposed
+	// sibling in the same cell. Always empty when Covered or Vacuous.
+	UndispositionedMembers []string
+}
+
+// BuildClearCellReport groups findings into cells (GroupClearCells) and
+// renders each as a ClearCellReport, sorted by CellKey.String() so output
+// order is stable across calls and across Go's own randomized map
+// iteration.
+func BuildClearCellReport(findings []ContainerClearFinding) []ClearCellReport {
+	cells := GroupClearCells(findings)
+
+	keys := make([]CellKey, 0, len(cells))
+	for k := range cells {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i].String() < keys[j].String() })
+
+	out := make([]ClearCellReport, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, buildClearCellReport(key, cells[key]))
+	}
+	return out
+}
+
+// buildClearCellReport renders one cell's members into its ClearCellReport
+// — the pure per-cell step BuildClearCellReport applies to every cell it
+// finds.
+func buildClearCellReport(key CellKey, members []ContainerClearFinding) ClearCellReport {
+	sorted := append([]ContainerClearFinding(nil), members...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Path < sorted[j].Path })
+
+	report := ClearCellReport{Key: key}
+	var coveredEligible []ContainerClearFinding
+	eligibleCount := 0
+	for _, m := range sorted {
+		report.Members = append(report.Members, m.Path)
+		if m.Ineligible {
+			report.IneligibleMembers = append(report.IneligibleMembers, m.Path)
+			continue
+		}
+		eligibleCount++
+		if m.Covered {
+			coveredEligible = append(coveredEligible, m)
+		}
+	}
+	report.Vacuous = eligibleCount == 0
+
+	if len(coveredEligible) > 0 {
+		// sorted is already Path-ascending, so the first covered member
+		// found while walking it is deterministically the
+		// alphabetically-first one — no tie-break, no cursor, no state:
+		// the same input always yields the same Representative (RULING 3).
+		rep := coveredEligible[0]
+		report.Covered = true
+		report.Representative = rep.Path
+		report.Route = rep.Route
+		return report
+	}
+
+	if !report.Vacuous {
+		for _, m := range sorted {
+			if m.Ineligible || m.Covered {
+				continue
+			}
+			if m.Disposition == "" {
+				report.UndispositionedMembers = append(report.UndispositionedMembers, m.Path)
+			}
+		}
+	}
+	return report
+}
+
+// PrintClearCellReport renders reports as text, in the shape the `validate`
+// subcommand prints alongside its other offline checks — report-only, by
+// construction: nothing here returns a value a caller could fold into an
+// exit-code decision. The verdict line states TWO numbers, cells and
+// leaves, never one — the two denominators move independently once a
+// single cell credits several leaves.
+func PrintClearCellReport(printFn func(format string, args ...interface{}), reports []ClearCellReport) {
+	if len(reports) == 0 {
+		printFn("container-clear cells: no declared container-typed leaves\n")
+		return
+	}
+
+	printFn("container-clear cell coverage (report-only — RULING 1-3, cell key: shape+depth, clear direction):\n")
+
+	totalCells, coveredCells, vacuousCells := 0, 0, 0
+	totalLeaves, coveredLeaves := 0, 0
+	for _, r := range reports {
+		totalCells++
+		eligible := len(r.Members) - len(r.IneligibleMembers)
+
+		switch {
+		case r.Vacuous:
+			vacuousCells++
+			printFn("  ⊘ %s/%s: VACUOUS — every member ineligible: %s\n",
+				r.Key.Shape, r.Key.Depth, strings.Join(r.IneligibleMembers, ", "))
+		case r.Covered:
+			coveredCells++
+			coveredLeaves += eligible
+			totalLeaves += eligible
+			printFn("  ✓ %s/%s: covered via %s, representative %s; credits %d member(s): %s\n",
+				r.Key.Shape, r.Key.Depth, r.Route, r.Representative, eligible, strings.Join(r.Members, ", "))
+		case len(r.UndispositionedMembers) == 0:
+			totalLeaves += eligible
+			printFn("  ⊘ %s/%s: uncovered, every eligible member dispositioned: %s\n",
+				r.Key.Shape, r.Key.Depth, strings.Join(r.Members, ", "))
+		default:
+			totalLeaves += eligible
+			printFn("  ✗ %s/%s: uncovered, undispositioned member(s): %s\n",
+				r.Key.Shape, r.Key.Depth, strings.Join(r.UndispositionedMembers, ", "))
+		}
+	}
+
+	printFn("container-clear cell verdict: %d/%d cells covered, %d/%d leaves covered (%d vacuous cell(s), excluded from both denominators)\n",
+		coveredCells, totalCells-vacuousCells, coveredLeaves, totalLeaves, vacuousCells)
 }

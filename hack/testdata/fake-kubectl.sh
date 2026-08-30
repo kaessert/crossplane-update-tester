@@ -532,7 +532,17 @@ cmd_logs() {
   # demonstrably alive and logging, having made no Update() call. "Alive and
   # quiet" must be distinguishable from "not logging at all", which is what a
   # provider running without --debug produces.
-  local dir name namespace req
+  #
+  # now is resolved to the REAL current instant, not a fixed calendar date:
+  # the tool anchors Update() attribution on the observation window's own
+  # ArmedAt (an absolute, real time.Now() the real binary this script stands
+  # in for records when it arms), and a log line timestamped before that
+  # instant is discarded regardless of how far back the underlying query
+  # reached. A fixed past timestamp here would be silently discarded the
+  # moment the wall clock advances past it, breaking the FAIL_MODE=logloop
+  # scenario below with no signal at all.
+  local dir name namespace req now
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   for dir in "$STATE"/res/*/; do
     [ -d "$dir" ] || continue
     name=$(cat "$dir/name")
@@ -542,13 +552,13 @@ cmd_logs() {
     else
       req="{\"name\":\"$(json_escape "$name")\"}"
     fi
-    printf '2026-01-01T00:00:00Z\tDEBUG\tprovider-fake\tReconciling\t{"request": %s}\n' "$req"
+    printf '%s\tDEBUG\tprovider-fake\tReconciling\t{"request": %s}\n' "$now" "$req"
     # FAIL_MODE=logloop adds the Update() line the managed reconciler writes
     # on every call, while `get events` stays frozen — the live signature of
     # client-go's rate limiter holding an aggregated count still across a
     # resource that is updating on every poll tick.
     if [ "$FAIL_MODE" = "logloop" ]; then
-      printf '2026-01-01T00:00:00Z\tDEBUG\tprovider-fake\tSuccessfully requested update of external resource\t{"request": %s, "version": "1"}\n' "$req"
+      printf '%s\tDEBUG\tprovider-fake\tSuccessfully requested update of external resource\t{"request": %s, "version": "1"}\n' "$now" "$req"
     fi
   done
 }

@@ -6,6 +6,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -455,7 +456,7 @@ func TestClientGoKubeClientProviderLogsAndExecAgreeOnAttributedCount(t *testing.
 	if err != nil {
 		t.Fatalf("exec path: unexpected error: %v", err)
 	}
-	execCalls, execLines := countUpdateLogLinesIn(execOut, "example-resource", "")
+	execCalls, execLines := countUpdateLogLinesIn(execOut, "example-resource", "", time.Time{})
 
 	// client-go path: the same logical content, served through
 	// podLogStreamFunc — no env var, proving the DEFAULT routing serves
@@ -472,7 +473,7 @@ func TestClientGoKubeClientProviderLogsAndExecAgreeOnAttributedCount(t *testing.
 	if err != nil {
 		t.Fatalf("client-go path: unexpected error: %v", err)
 	}
-	goCalls, goLines := countUpdateLogLinesIn(goOut, "example-resource", "")
+	goCalls, goLines := countUpdateLogLinesIn(goOut, "example-resource", "", time.Time{})
 
 	if execCalls != goCalls || execLines != goLines {
 		t.Errorf("exec and client-go paths disagree for identical log content: exec=(calls=%d,lines=%d), client-go=(calls=%d,lines=%d)",

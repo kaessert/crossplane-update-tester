@@ -205,6 +205,110 @@ func TestConvergeAllReportsPerTargetVerdicts(t *testing.T) {
 	}
 }
 
+// TestConvergeAllSecondTargetUnderSharedWindow is the multi-manifest
+// regression the false RECONCILIATION LOOP was actually measured on: two
+// manifests under one shared barrier window (standing for the
+// UPTEST_MANIFESTS_<RESOURCE> comma pair one `make e2e.<resource>` run
+// bundles — the cluster-scoped and namespaced variants of a resource, each
+// resolved through its OWN Runner and OWN controller-log source) where the
+// FIRST manifest's post-assert-hook rename lands with comfortable
+// separation from its own arm, but the SECOND manifest's rename can land
+// inside kubectl's whole-second --since rounding of ITS OWN, later
+// ArmedAt. Both targets share one barrier; only the second is exposed.
+//
+// preRun is captured before RunConvergeAll runs at all, so EVERY target's
+// real ArmedAt (captured inside convergeArm, during the call) is
+// guaranteed >= preRun regardless of which target the barrier's internal
+// concurrency happens to arm first — which is what lets
+// preRun.Add(-time.Second) stand in for "before this target's own window"
+// deterministically, with no dependency on goroutine scheduling order.
+func TestConvergeAllSecondTargetUnderSharedWindow(t *testing.T) {
+	newTarget := func(label, logLines string) ConvergeTarget {
+		f := &fakeCluster{
+			generation:      1,
+			readyAfterCalls: 1,
+			atProvider:      map[string]interface{}{"path": "/DC0/vm"},
+			kind:            testKindExample,
+			name:            testNameExample,
+			generations:     []int32{0},
+			logLines:        logLines,
+		}
+		r := newFakeRunner(f)
+		r.sleepFunc = func(time.Duration) {}
+		return ConvergeTarget{
+			Label:    label,
+			Runner:   r,
+			Manifest: &manifest.Manifest{Kind: testKindExample, Name: testNameExample},
+			Opts:     ConvergeOptions{PollInterval: time.Millisecond, Timeout: time.Second, ReadinessTimeout: time.Second},
+		}
+	}
+
+	t.Run("PreArmRenameOnSecondTargetIsIgnored", func(t *testing.T) {
+		preRun := time.Now()
+		targets := []ConvergeTarget{
+			// The cluster-scoped sibling: quiet, no rename in its own log
+			// window at all — standing for the manifest whose hook runs
+			// first and gains the extra second of separation.
+			newTarget("Folder/example-folder",
+				strings.Join([]string{testReconcileLogLine}, "\n")),
+			// The namespaced sibling: its own post-assert-hook rename,
+			// timestamped before RunConvergeAll even started — so it is
+			// unambiguously before THIS target's own ArmedAt too, whatever
+			// real instant that turns out to be. Each target reads through
+			// its own separate fakeCluster/Runner, so this line can never
+			// leak into the first target's own log query either way.
+			newTarget("Folder/example-folder-ns",
+				strings.Join([]string{
+					testReconcileLogLine,
+					newTestUpdateLogLineAt(preRun.Add(-time.Second), testNameExample, ""),
+				}, "\n")),
+		}
+
+		results := RunConvergeAll(targets, 4)
+
+		for i, res := range results {
+			if res.Err != nil {
+				t.Fatalf("target %d (%s): unexpected error %v", i, targets[i].Label, res.Err)
+			}
+			if !res.Result.Passed {
+				t.Errorf("target %d (%s): expected Passed=true, got %q %v — a pre-arm rename must not be attributed to either target's own shared-barrier window",
+					i, targets[i].Label, res.Result.Message, res.Result.Diagnostics)
+			}
+		}
+	})
+
+	t.Run("InWindowUpdateOnSecondTargetStillDetected", func(t *testing.T) {
+		// A comfortable hour past "now": genuinely inside every target's
+		// real (millisecond-scale) observation window under this fast
+		// test, and unambiguously after every target's own ArmedAt.
+		inWindow := time.Now().Add(time.Hour)
+		targets := []ConvergeTarget{
+			newTarget("Folder/example-folder",
+				strings.Join([]string{testReconcileLogLine}, "\n")),
+			newTarget("Folder/example-folder-ns",
+				strings.Join([]string{
+					testReconcileLogLine,
+					newTestUpdateLogLineAt(inWindow, testNameExample, ""),
+				}, "\n")),
+		}
+
+		results := RunConvergeAll(targets, 4)
+
+		if results[0].Err != nil || !results[0].Result.Passed {
+			t.Errorf("Folder/example-folder: expected Passed=true (quiet), got err=%v result=%+v", results[0].Err, results[0].Result)
+		}
+		if results[1].Err != nil {
+			t.Fatalf("Folder/example-folder-ns: unexpected error %v", results[1].Err)
+		}
+		if results[1].Result.Passed {
+			t.Fatalf("Folder/example-folder-ns: expected Passed=false — a genuine in-window Update() call must still be detected under a shared barrier, got %+v", results[1].Result)
+		}
+		if results[1].Result.Message != "RECONCILIATION LOOP DETECTED" {
+			t.Errorf("Folder/example-folder-ns: Message = %q, want RECONCILIATION LOOP DETECTED", results[1].Result.Message)
+		}
+	})
+}
+
 // TestFormatConvergeAllSummaryPassingTargetWithDiagnosticsPrintsThem pins
 // the fix this ticket exists to make: a PASSING target whose Diagnostics
 // are non-empty (the restart note buildConvergeResult attaches on a

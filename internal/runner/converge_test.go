@@ -43,11 +43,25 @@ const (
 	testAPIVersionNamespaced    = "example.m.crossplane.io/v1alpha1"
 )
 
+// testLogLineTimestamp is the RFC3339 timestamp every DEFAULT
+// controller-log fixture in this file below carries — testReconcileLogLine
+// and every newTestUpdateLogLine call. It is computed once, at package
+// init, as an hour past whatever the real wall clock reads at that moment.
+// Package init always runs before any individual test's own convergeArm
+// captures its own ArmedAt (see countUpdateLogLinesIn's anchor), and no
+// unit test in this package runs for anywhere near an hour, so this
+// timestamp is guaranteed to land after every ArmedAt the suite ever
+// records — regardless of what calendar date the suite happens to run on.
+// A test that specifically exercises the anchor (a line that must land
+// BEFORE a given ArmedAt) builds its own timestamp instead; see
+// TestRunConvergeIgnoresOwnPreArmRenameLogLine.
+var testLogLineTimestamp = time.Now().Add(time.Hour).Format(time.RFC3339)
+
 // testReconcileLogLine is a benign structured controller log line — the
 // reconciler announcing a reconcile, not an Update() call. It is the
 // fakeCluster's default `kubectl logs` output, standing for a controller
 // that is demonstrably alive and logging while making no backend writes.
-const testReconcileLogLine = `2026-01-01T00:00:00Z	DEBUG	provider-example	Reconciling	{"controller": "exampleresource.cluster", "request": {"name":"example-resource"}}`
+var testReconcileLogLine = testLogLineTimestamp + `	DEBUG	provider-example	Reconciling	{"controller": "exampleresource.cluster", "request": {"name":"example-resource"}}`
 
 // newTestUpdateLogLine builds the controller log line the managed reconciler
 // writes on a successful Update(), for the given reconcile request. An empty
@@ -59,7 +73,20 @@ func newTestUpdateLogLine(name, namespace string) string {
 	if namespace != "" {
 		req = `{"name":"` + name + `","namespace":"` + namespace + `"}`
 	}
-	return "2026-01-01T00:00:00Z\tDEBUG\tprovider-example\t" + logMsgUpdated +
+	return testLogLineTimestamp + "\tDEBUG\tprovider-example\t" + logMsgUpdated +
+		"\t{\"controller\": \"exampleresource\", \"request\": " + req + `, "version": "1"}`
+}
+
+// newTestUpdateLogLineAt is newTestUpdateLogLine with an explicit timestamp
+// — for a test that must place the line at a precise instant relative to a
+// baseline's ArmedAt, rather than at the suite-wide default future offset
+// testLogLineTimestamp carries.
+func newTestUpdateLogLineAt(ts time.Time, name, namespace string) string {
+	req := `{"name":"` + name + `"}`
+	if namespace != "" {
+		req = `{"name":"` + name + `","namespace":"` + namespace + `"}`
+	}
+	return ts.Format(time.RFC3339) + "\tDEBUG\tprovider-example\t" + logMsgUpdated +
 		"\t{\"controller\": \"exampleresource\", \"request\": " + req + `, "version": "1"}`
 }
 
@@ -936,7 +963,7 @@ func TestCountUpdateLogLinesInAttributesByReconcileRequest(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			calls, lines := countUpdateLogLinesIn(out, tc.resource, tc.namespace)
+			calls, lines := countUpdateLogLinesIn(out, tc.resource, tc.namespace, time.Time{})
 			if calls != tc.wantCalls {
 				t.Errorf("calls = %d, want %d", calls, tc.wantCalls)
 			}
@@ -952,11 +979,11 @@ func TestCountUpdateLogLinesInAttributesByReconcileRequest(t *testing.T) {
 // nothing (a provider not running with --debug), which is a different fact
 // from a live controller that made zero Update() calls.
 func TestCountUpdateLogLinesInLivenessIsNotZeroCalls(t *testing.T) {
-	calls, lines := countUpdateLogLinesIn("", testNameExample, "")
+	calls, lines := countUpdateLogLinesIn("", testNameExample, "", time.Time{})
 	if calls != 0 || lines != 0 {
 		t.Fatalf("empty output: calls, lines = %d, %d; want 0, 0", calls, lines)
 	}
-	calls, lines = countUpdateLogLinesIn(testReconcileLogLine, testNameExample, "")
+	calls, lines = countUpdateLogLinesIn(testReconcileLogLine, testNameExample, "", time.Time{})
 	if calls != 0 || lines != 1 {
 		t.Fatalf("live but quiet: calls, lines = %d, %d; want 0, 1", calls, lines)
 	}
@@ -973,13 +1000,90 @@ func TestCountUpdateLogLinesInIgnoresUnattributableLines(t *testing.T) {
 		logMsgUpdated + `\t{"request": {"name":""}}`,        // request without a name
 		logMsgUpdated + `\t{"request": {"name": not-json}}`, // malformed payload
 	}, "\n")
-	calls, lines := countUpdateLogLinesIn(out, testNameExample, "")
+	calls, lines := countUpdateLogLinesIn(out, testNameExample, "", time.Time{})
 	if calls != 0 {
 		t.Errorf("calls = %d, want 0 — an unattributable line must not be credited to any resource", calls)
 	}
 	if lines != 4 {
 		t.Errorf("lines = %d, want 4", lines)
 	}
+}
+
+// TestCountUpdateLogLinesInAnchorsOnArmedAt pins the fix for the false
+// RECONCILIATION LOOP measured live on provider-vsphere's namespaced
+// Folder: a barrier armed at T that reads a controller log line timestamped
+// AT or BEFORE T must never attribute that line to this window, however far
+// back the underlying query reached — because that line describes something
+// that happened before the window opened, most commonly the test harness's
+// own pre-arm rename landing inside kubectl's whole-second --since
+// rounding. The SAME single Update() call, moved to a timestamp AFTER
+// armedAt, is genuine in-window evidence and must still be counted. Both
+// directions are required — either one alone would leave the other failure
+// mode unproven (a detector that discards everything is just as wrong as
+// one that discards nothing).
+func TestCountUpdateLogLinesInAnchorsOnArmedAt(t *testing.T) {
+	armedAt := time.Date(2026, 8, 30, 14, 26, 32, 0, time.UTC)
+
+	t.Run("OneUpdateOneSecondBeforeArmedAtIsNotCounted", func(t *testing.T) {
+		// The recorded shape: the harness's rename Update() landed at
+		// 14:26:31Z, one second before the barrier armed at 14:26:32Z.
+		line := newTestUpdateLogLineAt(armedAt.Add(-time.Second), testNameExample, "")
+		calls, lines := countUpdateLogLinesIn(line, testNameExample, "", armedAt)
+		if calls != 0 {
+			t.Errorf("calls = %d, want 0 — a call timestamped before the window armed must never be attributed to it", calls)
+		}
+		if lines != 0 {
+			t.Errorf("lines = %d, want 0 — the line is outside the window entirely, not merely uncounted", lines)
+		}
+	})
+
+	t.Run("SameSingleUpdateInsideTheWindowIsStillCounted", func(t *testing.T) {
+		// The identical call, moved one second AFTER the barrier armed:
+		// genuine in-window evidence, and the anchor must not suppress it.
+		line := newTestUpdateLogLineAt(armedAt.Add(time.Second), testNameExample, "")
+		calls, lines := countUpdateLogLinesIn(line, testNameExample, "", armedAt)
+		if calls != 1 {
+			t.Errorf("calls = %d, want 1 — a call timestamped after the window armed is genuine evidence and must still be counted", calls)
+		}
+		if lines != 1 {
+			t.Errorf("lines = %d, want 1", lines)
+		}
+	})
+
+	t.Run("LineTimestampedExactlyAtArmedAtIsDiscarded", func(t *testing.T) {
+		// "at or before" per the doc comment: a line stamped at the exact
+		// armed instant is not yet inside the window either.
+		line := newTestUpdateLogLineAt(armedAt, testNameExample, "")
+		calls, lines := countUpdateLogLinesIn(line, testNameExample, "", armedAt)
+		if calls != 0 || lines != 0 {
+			t.Errorf("calls, lines = %d, %d; want 0, 0 — a line stamped exactly at armedAt is not inside the window", calls, lines)
+		}
+	})
+
+	t.Run("UnparseableTimestampIsKeptNotDiscarded", func(t *testing.T) {
+		// The anchor exists to narrow an over-wide query, never to
+		// suppress a signal it cannot itself place in time: a line with no
+		// usable timestamp must survive, exactly as it did before the
+		// anchor existed.
+		line := "not-a-timestamp\tDEBUG\tprovider-example\t" + logMsgUpdated +
+			`\t{"controller": "exampleresource", "request": {"name":"` + testNameExample + `"}, "version": "1"}`
+		calls, lines := countUpdateLogLinesIn(line, testNameExample, "", armedAt)
+		if calls != 1 || lines != 1 {
+			t.Errorf("calls, lines = %d, %d; want 1, 1 — an unparseable timestamp must not be discarded", calls, lines)
+		}
+	})
+
+	t.Run("ZeroArmedAtDisablesTheAnchorEntirely", func(t *testing.T) {
+		// The zero Time is the "no window to anchor against" sentinel
+		// every pre-existing direct call site in this file uses — it must
+		// reproduce the pre-anchor behaviour exactly, whatever the line's
+		// own timestamp says.
+		line := newTestUpdateLogLineAt(armedAt.Add(-time.Hour), testNameExample, "")
+		calls, lines := countUpdateLogLinesIn(line, testNameExample, "", time.Time{})
+		if calls != 1 || lines != 1 {
+			t.Errorf("calls, lines = %d, %d; want 1, 1 — the zero Time must disable the anchor, not merely widen it", calls, lines)
+		}
+	})
 }
 
 // TestBuildConvergeResultLogInstrumentCatchesWhatEventsMiss is the measured
@@ -1123,6 +1227,114 @@ func TestRunConvergeIgnoresSiblingScopeLogLines(t *testing.T) {
 	}
 	if !result.Passed {
 		t.Fatalf("expected Passed=true: the sibling scope's Update() calls must not be attributed to this resource, got %+v", result)
+	}
+}
+
+// TestRunConvergeIgnoresOwnPreArmRenameLogLine reproduces the measured
+// false RECONCILIATION LOOP end to end through RunConverge: the post-assert
+// hook renames the resource immediately before the barrier arms, and that
+// rename's own Update() call lands in the controller log a moment BEFORE
+// convergeArm takes its baseline — inside kubectl's whole-second --since
+// rounding, but outside the observation window itself. The window anchor
+// (see countUpdateLogLinesIn) must discard it, and the resource must report
+// stable with zero updates rather than a loop it never actually made.
+//
+// preArm is captured before RunConverge runs, so the baseline's own ArmedAt
+// (captured moments later, inside convergeArm) is always >= preArm — which
+// makes preArm.Add(-time.Second) deterministically BEFORE ArmedAt with no
+// clock injection required, on any machine, on any date.
+func TestRunConvergeIgnoresOwnPreArmRenameLogLine(t *testing.T) {
+	m := &manifest.Manifest{
+		Kind:       testKindExample,
+		Name:       testNameExample,
+		Namespace:  testNamespaceExample,
+		APIVersion: testAPIVersionNamespaced,
+	}
+	preArm := time.Now()
+	f := &fakeCluster{
+		generation:      1,
+		readyAfterCalls: 1,
+		atProvider:      map[string]interface{}{"path": "/DC0/vm"},
+		kind:            testKindExample,
+		name:            testNameExample,
+		namespace:       testNamespaceExample,
+		apiVersion:      testAPIVersionNamespaced,
+		generations:     []int32{0},
+		logLines: strings.Join([]string{
+			testReconcileLogLine,
+			// The harness's own pre-assert-hook rename, timestamped a
+			// second before the barrier is about to arm — exactly the
+			// shape recorded live (rename at 14:26:31Z, barrier armed at
+			// 14:26:32Z).
+			newTestUpdateLogLineAt(preArm.Add(-time.Second), testNameExample, testNamespaceExample),
+		}, "\n"),
+	}
+	r := newFakeRunner(f)
+	r.sleepFunc = func(time.Duration) {}
+
+	result, err := r.RunConverge(m, ConvergeOptions{
+		PollInterval:     time.Millisecond,
+		ReadinessTimeout: time.Second,
+		Timeout:          time.Second,
+	})
+	if err != nil {
+		t.Fatalf("RunConverge() error = %v", err)
+	}
+	if !result.Passed {
+		t.Fatalf("expected Passed=true: a rename Update() timestamped before the barrier armed is not evidence of a loop, got %+v", result)
+	}
+	if result.Message != "resource stable (1 cycle observed, 0 updates)" {
+		t.Errorf("Message = %q, want the stable-resource message with 0 updates — the pre-arm rename must not be attributed to this window", result.Message)
+	}
+}
+
+// TestRunConvergeStillDetectsLoopInsideTheWindow is
+// TestRunConvergeIgnoresOwnPreArmRenameLogLine's counterpart: the identical
+// single Update() call, moved to a timestamp safely AFTER the barrier
+// arms, is genuine in-window evidence and must still fail. Proving only the
+// pre-arm direction would leave open the possibility that the anchor was
+// implemented by discarding every log line rather than the ones before it.
+func TestRunConvergeStillDetectsLoopInsideTheWindow(t *testing.T) {
+	m := &manifest.Manifest{
+		Kind:       testKindExample,
+		Name:       testNameExample,
+		Namespace:  testNamespaceExample,
+		APIVersion: testAPIVersionNamespaced,
+	}
+	// A comfortable margin past whatever ArmedAt convergeArm records a
+	// moment after this fixture is built — well inside the (real,
+	// millisecond-scale) observation window this fast test actually waits.
+	inWindow := time.Now().Add(time.Hour)
+	f := &fakeCluster{
+		generation:      1,
+		readyAfterCalls: 1,
+		atProvider:      map[string]interface{}{"path": "/DC0/vm"},
+		kind:            testKindExample,
+		name:            testNameExample,
+		namespace:       testNamespaceExample,
+		apiVersion:      testAPIVersionNamespaced,
+		generations:     []int32{0},
+		logLines: strings.Join([]string{
+			testReconcileLogLine,
+			newTestUpdateLogLineAt(inWindow, testNameExample, testNamespaceExample),
+		}, "\n"),
+	}
+	r := newFakeRunner(f)
+	r.sleepFunc = func(time.Duration) {}
+
+	result, err := r.RunConverge(m, ConvergeOptions{
+		PollInterval:     time.Millisecond,
+		ReadinessTimeout: time.Second,
+		Timeout:          time.Second,
+	})
+	if err != nil {
+		t.Fatalf("RunConverge() error = %v", err)
+	}
+	if result.Passed {
+		t.Fatalf("expected Passed=false: an Update() call genuinely inside the window must still fail, got %+v", result)
+	}
+	if result.Message != "RECONCILIATION LOOP DETECTED" {
+		t.Errorf("Message = %q, want RECONCILIATION LOOP DETECTED — the anchor must never mask a real in-window call", result.Message)
 	}
 }
 

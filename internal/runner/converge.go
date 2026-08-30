@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/kaessert/crossplane-update-tester/internal/differ"
 	"github.com/kaessert/crossplane-update-tester/internal/manifest"
@@ -357,7 +358,7 @@ func (r *Runner) convergeArm(m *manifest.Manifest, opts ConvergeOptions) (*conve
 		Events:      beforeEvents,
 		Gen:         gen,
 		Notes:       notes,
-		ArmedAt:     time.Now(),
+		ArmedAt:     r.now(),
 		PodIdentity: podIdentity,
 	}, nil, nil
 }
@@ -452,7 +453,11 @@ func (r *Runner) convergeAssertAttempt(m *manifest.Manifest, opts ConvergeOption
 	// here is carried into the verdict rather than returned: an unreadable log
 	// costs this check its most reliable instrument, which the operator must
 	// be told about, but it is not itself evidence about the resource.
-	logCalls, logLines, logErr := r.countUpdateLogCalls(m, waitDur)
+	//
+	// b.ArmedAt anchors attribution: a line timestamped at or before the
+	// barrier armed is not part of THIS observation window, however far
+	// back the underlying query reached (see countUpdateLogCalls).
+	logCalls, logLines, logErr := r.countUpdateLogCalls(m, waitDur, b.ArmedAt)
 	logObs := updateLogObservation{Calls: logCalls, Lines: logLines, Err: logErr, Window: waitDur}
 
 	diff, err := differ.DiffSnapshotsExcluding(b.Snapshot, after, opts.IgnoreFields)
@@ -807,19 +812,27 @@ type reconcileRequest struct {
 	Namespace string `json:"namespace"`
 }
 
-// updateLogWindowSlack widens the log query past the convergence window,
-// because kubectl's --since takes whole seconds and a line written a fraction
-// before the window opened would otherwise be lost to rounding. Over-reading
-// is safe in the direction that matters: this check fails on a non-zero count,
-// so a slightly wide window can only make a genuine loop easier to see, never
-// manufacture one on a resource that made no calls at all.
+// updateLogWindowSlack widens the log QUERY past the convergence window,
+// because kubectl's --since takes whole seconds and a line written a
+// fraction before the window opened would otherwise be lost to rounding.
+// Widening the query is safe in a way it previously was not: attribution no
+// longer trusts the query's own boundary. countUpdateLogLinesIn discards
+// every line timestamped at or before the barrier's own ArmedAt, so a wider
+// query can only hand the anchor MORE lines to filter — never change which
+// ones survive it. Before that anchor existed, this slack was itself the
+// bug: the harness's own pre-arm mutation (e.g. a post-assert rename) could
+// land inside the widened window and be misread as the resource's own
+// Update() call.
 const updateLogWindowSlack = time.Second
 
 // countUpdateLogCalls reads the provider controller's own log across the
 // convergence window and reports how many Update() calls it made for this
 // resource — the loop signal that the event delta rate-limits away (see
-// logMsgUpdated).
-func (r *Runner) countUpdateLogCalls(m *manifest.Manifest, window time.Duration) (calls, lines int, err error) {
+// logMsgUpdated). armedAt is the instant the observation window opened
+// (convergeBaseline.ArmedAt); a log line timestamped at or before it is
+// outside the window and is never counted, however far back the underlying
+// query reaches — see countUpdateLogLinesIn.
+func (r *Runner) countUpdateLogCalls(m *manifest.Manifest, window time.Duration, armedAt time.Time) (calls, lines int, err error) {
 	since := int((window + updateLogWindowSlack).Seconds())
 	if since < 1 {
 		since = 1
@@ -838,7 +851,7 @@ func (r *Runner) countUpdateLogCalls(m *manifest.Manifest, window time.Duration)
 	if err != nil {
 		return 0, 0, fmt.Errorf("reading controller log: %w", err)
 	}
-	calls, lines = countUpdateLogLinesIn(out, m.Name, m.Namespace)
+	calls, lines = countUpdateLogLinesIn(out, m.Name, m.Namespace, armedAt)
 	return calls, lines, nil
 }
 
@@ -856,13 +869,30 @@ func (r *Runner) countUpdateLogCalls(m *manifest.Manifest, window time.Duration)
 // A cluster-scoped resource's namespace is the empty string and matches only
 // a request carrying no namespace at all.
 //
-// lines counts every line the window returned, whatever it said. It is the
+// armedAt anchors the whole function to the observation window: a line
+// timestamped AT OR BEFORE armedAt is discarded before either counter sees
+// it, because it describes something that happened before this window
+// opened — most commonly the test harness's own pre-arm mutation (a
+// post-assert rename immediately preceding the barrier) landing inside
+// kubectl's whole-second --since rounding, which is exactly the false
+// RECONCILIATION LOOP this anchor exists to stop. A line whose leading
+// timestamp cannot be parsed is KEPT rather than discarded — the anchor
+// exists to narrow an over-wide query, never to suppress a signal it cannot
+// itself place in time — so an unparseable timestamp degrades to the
+// pre-anchor behaviour for that one line. Passing the zero Time disables
+// the anchor entirely (every line survives it), for callers with no window
+// to anchor against.
+//
+// lines counts every surviving line, whatever it said. It is the
 // instrument's liveness proxy: the reconciler writes these at DEBUG, so a
 // provider started without --debug returns nothing, and zero calls out of
 // zero lines means "could not see" rather than "did not happen".
-func countUpdateLogLinesIn(out, name, namespace string) (calls, lines int) {
+func countUpdateLogLinesIn(out, name, namespace string, armedAt time.Time) (calls, lines int) {
 	for _, line := range strings.Split(out, "\n") {
 		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		if ts, ok := parseLogLineTimestamp(line); ok && !armedAt.IsZero() && !ts.After(armedAt) {
 			continue
 		}
 		lines++
@@ -878,6 +908,23 @@ func countUpdateLogLinesIn(out, name, namespace string) (calls, lines int) {
 		}
 	}
 	return calls, lines
+}
+
+// parseLogLineTimestamp extracts and parses the RFC3339 timestamp every
+// structured controller log line begins with — the same leading field
+// countUpdateLogLinesIn anchors attribution against. ok is false when the
+// line carries no leading whitespace-delimited field, or that field does not
+// parse as RFC3339.
+func parseLogLineTimestamp(line string) (time.Time, bool) {
+	field := line
+	if i := strings.IndexFunc(line, unicode.IsSpace); i >= 0 {
+		field = line[:i]
+	}
+	ts, err := time.Parse(time.RFC3339, field)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return ts, true
 }
 
 // reconcileRequestOf decodes the reconcile request out of a structured log

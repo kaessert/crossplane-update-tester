@@ -116,7 +116,10 @@ cp -R "$TESTDATA/examples" "$TREE/examples"
 {
   echo "module github.com/example/provider-example/tools/update-tester"
   echo
-  echo "go 1.24.0"
+  # Derived from the repo's own go.mod — the same single source of truth the
+  # CI workflow uses via `go-version-file: go.mod`. A hard-coded literal here
+  # drifts every time the tool's own go directive is raised.
+  grep -E '^go [0-9]' "$REPO_ROOT/go.mod"
   echo
   echo "tool $MODULE_PATH"
   echo

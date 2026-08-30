@@ -1568,3 +1568,142 @@ func TestClearCellReportMixedCellCreditsOnlyEligibleMembers(t *testing.T) {
 		t.Errorf("ineligible member immutableC must remain VISIBLE as excluded, not silently dropped from output entirely:\n%s", full)
 	}
 }
+
+// uncoveredDispositionedMixedCellFixtureCRD declares THREE top-level List
+// leaves landing in the SAME (list, top) cell: aliases and labels (both
+// eligible, uncovered, each carrying an authored skip: disposition) and
+// immutableC (CEL-immutable, ineligible). Unlike
+// mixedClearCellFixtureCRD, NONE of the eligible members is covered — the
+// cell as a whole is uncovered, but every eligible member is
+// dispositioned, which is the one shape that reaches the
+// "uncovered, every eligible member dispositioned" render line rather
+// than either the covered line or the "undispositioned member(s)" line.
+const uncoveredDispositionedMixedCellFixtureCRD = `apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+spec:
+  group: widgets.crossplane.io
+  names:
+    kind: Widget
+    plural: widgets
+  versions:
+  - name: v1alpha1
+    served: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            properties:
+              forProvider:
+                type: object
+                properties:
+                  name:
+                    type: string
+                  aliases:
+                    type: array
+                    items:
+                      type: string
+                  labels:
+                    type: array
+                    items:
+                      type: string
+                  immutableC:
+                    type: array
+                    items:
+                      type: string
+                    x-kubernetes-validations:
+                    - message: immutableC is immutable
+                      rule: "self == oldSelf"
+          status:
+            type: object
+            properties:
+              atProvider:
+                type: object
+                properties:
+                  name:
+                    type: string
+`
+
+// TestClearCellReportUncoveredCellWithIneligibleMemberDispositionedRendersOnlyEligible
+// is the render-site-2 pin `TestClearCellReportMixedCellCreditsOnlyEligibleMembers`
+// does not reach: a cell that is UNCOVERED (no member earns clear-direction
+// credit), non-vacuous (it carries eligible members), and every eligible
+// member is dispositioned via skip: — the one shape that walks the
+// "uncovered, every eligible member dispositioned" branch. It must fail if
+// that branch reverts to iterating Members unfiltered, which would name
+// the ineligible immutableC as dispositioned even though skip: was never
+// authored on it.
+func TestClearCellReportUncoveredCellWithIneligibleMemberDispositionedRendersOnlyEligible(t *testing.T) {
+	crd := decodeCRD(t, uncoveredDispositionedMixedCellFixtureCRD)
+	m := &manifest.Manifest{
+		Tests: []manifest.UpdateTest{
+			{
+				Field: "aliases",
+				Skip: manifest.SkipInfo{
+					Reason:      manifest.SkipVendorDefect,
+					Evidence:    "observed a 400",
+					Disposition: manifest.DispositionOneLivePatch,
+				},
+			},
+			{
+				Field: "labels",
+				Skip: manifest.SkipInfo{
+					Reason:      manifest.SkipWriteOnly,
+					Disposition: manifest.DispositionStaticallyProvable,
+				},
+			},
+		},
+	}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+	cell := clearCellReportsByKey(BuildClearCellReport(findings))["list/top"]
+
+	if cell.Vacuous {
+		t.Fatalf("cell reported Vacuous — it carries eligible members: %+v", cell)
+	}
+	if cell.Covered {
+		t.Fatalf("cell reported Covered — no member in this fixture earns clear-direction credit: %+v", cell)
+	}
+	if len(cell.UndispositionedMembers) != 0 {
+		t.Fatalf("UndispositionedMembers = %v, want empty — both eligible members carry an authored skip: disposition", cell.UndispositionedMembers)
+	}
+	if !reflect.DeepEqual(cell.IneligibleMembers, []string{"immutableC"}) {
+		t.Fatalf("IneligibleMembers = %v, want [immutableC]", cell.IneligibleMembers)
+	}
+	if !reflect.DeepEqual(cell.EligibleMembers(), []string{"aliases", "labels"}) {
+		t.Fatalf("EligibleMembers() = %v, want [aliases labels] — immutableC subtracted", cell.EligibleMembers())
+	}
+
+	var out []string
+	PrintClearCellReport(func(format string, args ...interface{}) {
+		out = append(out, fmt.Sprintf(format, args...))
+	}, []ClearCellReport{cell})
+	full := strings.Join(out, "")
+
+	dispositionedLine := ""
+	excludedLine := ""
+	for _, line := range out {
+		if strings.Contains(line, "every eligible member dispositioned") {
+			dispositionedLine = line
+		}
+		if strings.Contains(line, "excluded (ineligible)") {
+			excludedLine = line
+		}
+	}
+	if dispositionedLine == "" {
+		t.Fatalf("no 'every eligible member dispositioned' line rendered:\n%s", full)
+	}
+	if strings.Contains(dispositionedLine, "immutableC") {
+		t.Errorf("dispositioned-member line names the INELIGIBLE member as dispositioned: %q", dispositionedLine)
+	}
+	if !strings.Contains(dispositionedLine, "every eligible member dispositioned: aliases, labels") {
+		t.Errorf("dispositioned-member line = %q, want the list [aliases labels] and nothing else", dispositionedLine)
+	}
+	if excludedLine == "" || !strings.Contains(excludedLine, "immutableC") {
+		t.Errorf("ineligible member immutableC must remain VISIBLE as excluded, not silently dropped from output entirely:\n%s", full)
+	}
+}

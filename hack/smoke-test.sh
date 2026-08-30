@@ -30,6 +30,12 @@
 # rather than copied here, so this test validates the documented script and
 # fails if the README drifts away from it.
 #
+# This is an EXEC-TRANSCRIPT harness: it forces UPDATE_TESTER_KUBE_BACKEND=exec
+# below and asserts on the kubectl argv the exec backend issues. It does not
+# exercise the default client-go backend at all — that path has no fake to
+# assert against here and is covered instead by internal/runner's client-go
+# unit tests and by live E2E runs against a real cluster.
+#
 # Requirements: go, bash, coreutils. No cluster, no network (the module cache
 # is already warm if this repo builds).
 #
@@ -183,6 +189,12 @@ mkdir -p "$TREE/examples/burst"
 cp "$TESTDATA/fake-kubectl.sh" "$BIN/kubectl"
 chmod +x "$BIN/kubectl"
 export PATH="$BIN:$PATH"
+
+# This harness asserts on the kubectl argv transcript (fake-kubectl.sh above),
+# so it must force every cluster operation onto the exec backend — see "This
+# is an EXEC-TRANSCRIPT harness" at the top of this file. Without this, the
+# operations client-go now serves by default never touch the fake at all.
+export UPDATE_TESTER_KUBE_BACKEND="exec"
 
 # Small values keep the run quick: `converge` sleeps poll-interval * 1.5 per
 # invocation, and `run` polls up to --timeout for a field that never lands.
@@ -418,9 +430,13 @@ else
   ok "every kubectl invocation was one the fake recognises"
 fi
 
+# The event-list argv carries a server-side field selector narrowing the
+# query to this one resource; the selector's key order is alphabetical
+# (kind, name, namespace) because the client builds it with a sorted
+# key/value set, not a map, so the ordering is deterministic across calls.
 for expected in \
   "get -f $NETWORK_MANIFEST -o name" \
-  "get events --all-namespaces -o json" \
+  "get events --all-namespaces -o json --field-selector involvedObject.kind=Network,involvedObject.name=example-network-v6,involvedObject.namespace=" \
   "wait networks.network.example.crossplane.io/example-network-v6 --for=condition=Ready --timeout=5s"; do
   if grep -qxF "$expected" "$TMP/state-network-v6/kubectl.log"; then
     ok "issued: $expected"

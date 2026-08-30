@@ -358,7 +358,7 @@ func (r *Runner) convergeArm(m *manifest.Manifest, opts ConvergeOptions) (*conve
 		Events:      beforeEvents,
 		Gen:         gen,
 		Notes:       notes,
-		ArmedAt:     r.now(),
+		ArmedAt:     time.Now(),
 		PodIdentity: podIdentity,
 	}, nil, nil
 }

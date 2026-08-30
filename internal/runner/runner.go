@@ -79,14 +79,6 @@ type Runner struct {
 	// leaves it zero and evidenceOutcome falls back to evidenceRetryWindow.
 	evidenceWindow time.Duration
 
-	// nowFunc, when set, overrides the "current instant" convergeArm stamps
-	// onto a baseline's ArmedAt and every other clock read this package
-	// treats as "now". Tests inject a fixed instant so a baseline lines up
-	// deterministically against canned controller-log fixtures instead of
-	// racing the real wall clock on every run; production code leaves it
-	// nil and now() falls back to time.Now().
-	nowFunc func() time.Time
-
 	// podSettleThreshold and podSettleTimeout, when set (> 0), override
 	// controllerPodSettleThreshold and controllerPodSettleTimeout
 	// respectively — the age a provider controller Pod must reach before
@@ -179,18 +171,6 @@ func (r *Runner) sleep(d time.Duration) {
 		return
 	}
 	time.Sleep(d)
-}
-
-// now returns the current instant, calling nowFunc instead of time.Now when
-// a test has overridden it. convergeArm stamps a baseline's ArmedAt through
-// this method so it can be pinned to a fixed instant under test, deterministic
-// against the controller-log fixtures countUpdateLogLinesIn attributes
-// against that same instant.
-func (r *Runner) now() time.Time {
-	if r.nowFunc != nil {
-		return r.nowFunc()
-	}
-	return time.Now()
 }
 
 // NewRunner creates a Runner for the given manifest file.

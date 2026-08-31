@@ -32,6 +32,15 @@ const AnnotationKey = "crossplane.io/update-test"
 // it, and the checks gated on it are skipped.
 const ExpectExternalNamePrefixKey = "crossplane.io/expect-external-name-prefix"
 
+// ReadyConditionsKey names the SAME annotation uptest itself reads to learn
+// which status condition(s) mean a resource is ready — it is uptest's
+// annotation, not one this project defines, and this constant exists only so
+// a converge check can honour the SAME declaration uptest's own per-resource
+// assertion already honours, rather than inventing a second one. Comma
+// separated, e.g. "Synced" or "Synced,Ready" — see EffectiveReadyConditions
+// for how an absent or blank value defaults.
+const ReadyConditionsKey = "uptest.upbound.io/conditions"
+
 // UpdateTest represents a single field update test parsed from the annotation.
 type UpdateTest struct {
 	Field  string      `yaml:"field"`
@@ -718,6 +727,36 @@ type Manifest struct {
 	// relative Path would re-anchor at each hop to whatever the process
 	// CWD happened to be, not to the referring manifest's own directory.
 	Path string
+	// ReadyConditions lists the status condition TYPES that must all read
+	// "True" for this resource to be considered ready, parsed from the
+	// ReadyConditionsKey annotation (comma separated). Empty means the
+	// manifest declares no override — see EffectiveReadyConditions for the
+	// default this falls back to.
+	//
+	// This exists for a resource whose sanctioned steady state is
+	// permanently NOT Ready by design (e.g. one that intentionally holds a
+	// non-functional credential because a working one cannot be
+	// committed): a converge check's readiness-flap comparison must judge
+	// such a resource against the SAME condition uptest's own per-resource
+	// assertion already honours, or it fails a resource for exhibiting its
+	// documented, intended state.
+	ReadyConditions []string
+}
+
+// defaultReadyCondition is the condition type every converge check honours
+// when a manifest declares no ReadyConditionsKey override — the behaviour
+// every manifest had before that annotation was read here at all.
+const defaultReadyCondition = "Ready"
+
+// EffectiveReadyConditions returns the condition types that determine this
+// manifest's readiness for a converge check: its own declared
+// ReadyConditions when present, else the single default "Ready" condition.
+// A caller never needs to special-case the empty declaration itself.
+func (m *Manifest) EffectiveReadyConditions() []string {
+	if len(m.ReadyConditions) > 0 {
+		return m.ReadyConditions
+	}
+	return []string{defaultReadyCondition}
 }
 
 // manifestDoc is the intermediate YAML structure for parsing.
@@ -821,6 +860,21 @@ func decodeManifestDocs(data []byte) ([]manifestDoc, error) {
 	return docs, nil
 }
 
+// parseReadyConditions splits ReadyConditionsKey's comma-separated value
+// into condition types, trimming surrounding whitespace and dropping empty
+// entries — the same shape uptest's own consumer of this annotation
+// tolerates. An absent annotation, or one that is empty or all-whitespace,
+// returns nil, which EffectiveReadyConditions then defaults from.
+func parseReadyConditions(raw string) []string {
+	var out []string
+	for _, c := range strings.Split(raw, ",") {
+		if c = strings.TrimSpace(c); c != "" {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 // manifestFromDoc converts a single decoded manifestDoc into a Manifest,
 // parsing its update-test annotation (if present).
 func manifestFromDoc(doc manifestDoc) (*Manifest, error) {
@@ -837,6 +891,7 @@ func manifestFromDoc(doc manifestDoc) (*Manifest, error) {
 	}
 
 	m.ExpectExternalNamePrefix = doc.Metadata.Annotations[ExpectExternalNamePrefixKey]
+	m.ReadyConditions = parseReadyConditions(doc.Metadata.Annotations[ReadyConditionsKey])
 
 	annotation, ok := doc.Metadata.Annotations[AnnotationKey]
 	if !ok {

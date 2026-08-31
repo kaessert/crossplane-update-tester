@@ -483,9 +483,17 @@ func (r *Runner) recordConvergeBaseline(m *manifest.Manifest) (snapshot []byte, 
 }
 
 // recordConvergeOutcome snapshots atProvider, the update-event count, the
-// generation, and the Ready condition after the convergence wait completes.
-// Generation and readiness are both read from a single decoded object so
-// the two facts describe the exact same read of the resource.
+// generation, and the declared ready condition(s) after the convergence wait
+// completes. Generation and readiness are both read from a single decoded
+// object so the two facts describe the exact same read of the resource.
+//
+// Readiness is judged against m.EffectiveReadyConditions() rather than a
+// hardcoded "Ready" — a resource whose sanctioned steady state is a
+// permanently-not-Ready condition (declared via the
+// manifest.ReadyConditionsKey annotation uptest itself already honours)
+// must not be reported as flapping for reaching exactly that state. A
+// manifest declaring no override still resolves to ["Ready"], so this is a
+// pure superset of the prior, hardcoded behaviour.
 func (r *Runner) recordConvergeOutcome(m *manifest.Manifest) (snapshot []byte, events int, gen int64, ready bool, err error) {
 	snapshot, err = r.Snapshot()
 	if err != nil {
@@ -503,7 +511,7 @@ func (r *Runner) recordConvergeOutcome(m *manifest.Manifest) (snapshot []byte, e
 	if err != nil {
 		return nil, 0, 0, false, fmt.Errorf("reading generation: %w", err)
 	}
-	ready = isReadyTrue(obj)
+	ready = conditionsAllTrue(obj, m.EffectiveReadyConditions())
 	return snapshot, events, gen, ready, nil
 }
 
@@ -573,8 +581,15 @@ func buildConvergeResult(diff []differ.FieldChange, gen, afterGen int64, beforeE
 		// diff list above: a readiness flap is a distinct failure mode from
 		// a field drifting, even though both are reported through the same
 		// Diagnostics slice.
+		//
+		// Worded generically rather than naming "Ready" specifically: this
+		// fires against whichever condition(s) recordConvergeOutcome judged
+		// afterReady from — the manifest's own declared override (see
+		// manifest.Manifest.EffectiveReadyConditions) when one exists, else
+		// the "Ready" default every resource was judged against before that
+		// override existed.
 		passed = false
-		problems = append(problems, "readiness flap: Ready condition was not True at the final snapshot")
+		problems = append(problems, "readiness flap: declared ready condition(s) were not all True at the final snapshot")
 	}
 
 	diagnostics := append(append([]string{}, notes...), problems...)
@@ -1135,6 +1150,26 @@ func isReadyTrue(obj map[string]interface{}) bool {
 		return s == "True"
 	}
 	return false
+}
+
+// conditionsAllTrue reports whether obj's status.conditions carries EVERY
+// named type with status "True", using the same namedCondition read
+// waitSynced already relies on. A type that is absent, or present with any
+// other status, fails the whole check — this is an AND over the declared
+// set, matching uptest's own "every declared condition must be met" meaning
+// for its multi-value uptest.upbound.io/conditions annotation.
+//
+// Every caller supplies a non-empty slice: manifest.Manifest.
+// EffectiveReadyConditions defaults an undeclared manifest to ["Ready"], so
+// this is never asked to judge an empty declaration.
+func conditionsAllTrue(obj map[string]interface{}, conditionTypes []string) bool {
+	for _, t := range conditionTypes {
+		status, _, found := namedCondition(obj, t)
+		if !found || status != "True" {
+			return false
+		}
+	}
+	return true
 }
 
 // extractObservedGeneration reads the minimum observedGeneration across all

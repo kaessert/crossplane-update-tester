@@ -100,6 +100,115 @@ metadata:
 	}
 }
 
+// TestParseBytesReadyConditions covers ParseBytes's handling of the
+// uptest.upbound.io/conditions annotation — uptest's own declaration of
+// which status condition(s) mean a resource is ready, which
+// EffectiveReadyConditions falls back to consulting. Present, comma
+// separated with whitespace, single-valued, blank, and absent.
+func TestParseBytesReadyConditions(t *testing.T) {
+	cases := map[string]struct {
+		reason string
+		yaml   string
+		want   []string
+	}{
+		"Absent": {
+			reason: "manifests without the annotation parse with a nil ReadyConditions — this is the default for every existing example, and EffectiveReadyConditions is what supplies the fallback",
+			yaml: `
+apiVersion: example.crossplane.io/v1alpha1
+kind: Example
+metadata:
+  name: example
+`,
+			want: nil,
+		},
+		"SingleValue": {
+			reason: "the common case measured live on provider-f5xc's CodeBaseIntegration — a resource whose sanctioned steady state is Synced but never Ready",
+			yaml: `
+apiVersion: example.crossplane.io/v1alpha1
+kind: Example
+metadata:
+  name: example
+  annotations:
+    uptest.upbound.io/conditions: "Synced"
+`,
+			want: []string{"Synced"},
+		},
+		"CommaSeparatedWithWhitespace": {
+			reason: "uptest's own annotation format tolerates whitespace around each comma-separated entry",
+			yaml: `
+apiVersion: example.crossplane.io/v1alpha1
+kind: Example
+metadata:
+  name: example
+  annotations:
+    uptest.upbound.io/conditions: "Synced, Ready"
+`,
+			want: []string{"Synced", "Ready"},
+		},
+		"Blank": {
+			reason: "an empty annotation value is indistinguishable from an absent one — both fall back to the default in EffectiveReadyConditions",
+			yaml: `
+apiVersion: example.crossplane.io/v1alpha1
+kind: Example
+metadata:
+  name: example
+  annotations:
+    uptest.upbound.io/conditions: ""
+`,
+			want: nil,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			m, err := ParseBytes([]byte(tc.yaml))
+			if err != nil {
+				t.Fatalf("%s: ParseBytes() error = %v", tc.reason, err)
+			}
+			if !reflect.DeepEqual(m.ReadyConditions, tc.want) {
+				t.Errorf("%s: ReadyConditions = %#v, want %#v", tc.reason, m.ReadyConditions, tc.want)
+			}
+		})
+	}
+}
+
+// TestManifestEffectiveReadyConditions covers the fallback
+// EffectiveReadyConditions applies: a manifest's own declaration when
+// present, else the single "Ready" default every manifest was implicitly
+// judged against before ReadyConditions existed.
+func TestManifestEffectiveReadyConditions(t *testing.T) {
+	cases := map[string]struct {
+		reason string
+		m      Manifest
+		want   []string
+	}{
+		"NoDeclarationDefaultsToReady": {
+			reason: "a manifest that never declares uptest.upbound.io/conditions must keep judging readiness against \"Ready\" exactly as every manifest did before this field existed",
+			m:      Manifest{},
+			want:   []string{"Ready"},
+		},
+		"DeclaredOverrideIsUsedVerbatim": {
+			reason: "a declared override replaces the default outright, it is not unioned with it",
+			m:      Manifest{ReadyConditions: []string{"Synced"}},
+			want:   []string{"Synced"},
+		},
+		"MultiValueDeclarationIsUsedVerbatim": {
+			reason: "a multi-condition declaration is returned as-is for the caller to AND together",
+			m:      Manifest{ReadyConditions: []string{"Synced", "Ready"}},
+			want:   []string{"Synced", "Ready"},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := tc.m.EffectiveReadyConditions()
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("%s: EffectiveReadyConditions() = %#v, want %#v", tc.reason, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestParseBytesMultiDocumentSelectsAnnotatedDoc covers ParseBytes's document
 // selection rule for multi-document ("---"-separated) manifests. A companion
 // object (a Secret, a ProviderConfig) shipped in the same file as the managed

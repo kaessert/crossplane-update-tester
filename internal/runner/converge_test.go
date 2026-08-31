@@ -567,6 +567,99 @@ func TestBuildConvergeResultReadinessTimeoutNoteSurvivesAPass(t *testing.T) {
 	}
 }
 
+// TestConditionsAllTrue covers conditionsAllTrue's AND-over-declared-types
+// semantics — the primitive recordConvergeOutcome uses to judge readiness
+// against a manifest's declared uptest.upbound.io/conditions override
+// instead of a hardcoded "Ready". Every declared type must be present AND
+// "True"; one missing, or one present with any other status, fails the
+// whole check.
+func TestConditionsAllTrue(t *testing.T) {
+	readyTrue := map[string]interface{}{"type": "Ready", "status": "True"}
+	readyFalse := map[string]interface{}{"type": "Ready", "status": "False"}
+	syncedTrue := map[string]interface{}{"type": "Synced", "status": "True"}
+	syncedFalse := map[string]interface{}{"type": "Synced", "status": "False"}
+
+	cases := map[string]struct {
+		reason string
+		obj    map[string]interface{}
+		types  []string
+		want   bool
+	}{
+		"SingleDeclaredTypeTrue": {
+			reason: "the default, single-condition case behind every manifest that never declares an override",
+			obj:    objWithConditions(readyTrue),
+			types:  []string{"Ready"},
+			want:   true,
+		},
+		"SingleDeclaredTypeFalse": {
+			obj:   objWithConditions(readyFalse),
+			types: []string{"Ready"},
+			want:  false,
+		},
+		"DeclaredTypeAbsentFails": {
+			reason: "a resource that has never reported the declared condition at all is not ready, not an error",
+			obj:    objWithConditions(syncedTrue),
+			types:  []string{"Ready"},
+			want:   false,
+		},
+		"DeclaredNonReadyConditionTrueDespiteReadyFalse": {
+			reason: "the exact CodeBaseIntegration shape: Ready is permanently False, but the manifest declares Synced as its ready condition and Synced is True",
+			obj:    objWithConditions(readyFalse, syncedTrue),
+			types:  []string{"Synced"},
+			want:   true,
+		},
+		"MultiValueDeclarationRequiresAllTrue": {
+			obj:   objWithConditions(readyTrue, syncedTrue),
+			types: []string{"Ready", "Synced"},
+			want:  true,
+		},
+		"MultiValueDeclarationOneFalseFailsTheWhole": {
+			obj:   objWithConditions(readyTrue, syncedFalse),
+			types: []string{"Ready", "Synced"},
+			want:  false,
+		},
+		"NoConditionsAtAll": {
+			reason: "a resource that has not been reconciled yet reports not-ready, not an error",
+			obj:    map[string]interface{}{jsonKeyStatus: map[string]interface{}{}},
+			types:  []string{"Ready"},
+			want:   false,
+		},
+		"MissingStatus": {
+			obj:   map[string]interface{}{},
+			types: []string{"Ready"},
+			want:  false,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := conditionsAllTrue(tc.obj, tc.types)
+			if got != tc.want {
+				reason := tc.reason
+				if reason == "" {
+					reason = name
+				}
+				t.Errorf("%s: conditionsAllTrue() = %v, want %v", reason, got, tc.want)
+			}
+		})
+	}
+}
+
+// objWithConditions builds a decoded resource object (the shape
+// conditionsAllTrue/namedCondition read) carrying exactly the given
+// status.conditions entries, in order.
+func objWithConditions(conds ...map[string]interface{}) map[string]interface{} {
+	raw := make([]interface{}, len(conds))
+	for i, c := range conds {
+		raw[i] = c
+	}
+	return map[string]interface{}{
+		jsonKeyStatus: map[string]interface{}{
+			"conditions": raw,
+		},
+	}
+}
+
 // TestWaitReady covers the three mandatory readiness-gate paths named in
 // this change's acceptance criteria: Ready immediately (the gate is a
 // no-op), Ready after a dip (the resource settles mid-poll), and Ready
@@ -788,6 +881,85 @@ func TestRunConvergeReadinessGate(t *testing.T) {
 		}
 		if result.Message != "RESOURCE NOT IN STEADY STATE" {
 			t.Errorf("Message = %q, want %q — nothing here is evidence of a reconciliation loop, only that Ready never went True", result.Message, "RESOURCE NOT IN STEADY STATE")
+		}
+	})
+}
+
+// TestRunConvergeHonoursDeclaredReadyCondition is this ticket's central
+// falsifiability proof, exercised end to end through RunConverge against
+// the fake cluster rather than against buildConvergeResult in isolation —
+// proving the override is actually WIRED all the way from the manifest's
+// annotation-derived field through to the flap verdict.
+//
+// Both subtests share the IDENTICAL fake-cluster shape — permanently
+// unready (neverReady), permanently synced (alwaysSynced), a stable
+// atProvider snapshot — so the only variable between them is the
+// manifest's own ReadyConditions declaration. That isolates the effect to
+// the declaration itself, exactly matching the live reproducer measured on
+// provider-f5xc's CodeBaseIntegration: Synced settles, Ready never does,
+// and that is the resource's documented, intended steady state.
+func TestRunConvergeHonoursDeclaredReadyCondition(t *testing.T) {
+	opts := ConvergeOptions{
+		PollInterval:     time.Millisecond,
+		ReadinessTimeout: 5 * time.Millisecond,
+		Timeout:          time.Second,
+	}
+	newFakeAlwaysSyncedNeverReady := func() *fakeCluster {
+		return &fakeCluster{
+			generation:   1,
+			neverReady:   true,
+			alwaysSynced: true,
+			atProvider:   map[string]interface{}{"zone": "a"},
+		}
+	}
+
+	t.Run("DeclaredNonReadyConditionPasses", func(t *testing.T) {
+		m := &manifest.Manifest{
+			Kind: testKindExample, Name: testNameExample,
+			ReadyConditions: []string{"Synced"},
+		}
+		f := newFakeAlwaysSyncedNeverReady()
+		r := newFakeRunner(f)
+		r.sleepFunc = func(time.Duration) {}
+
+		result, err := r.RunConverge(m, opts)
+		if err != nil {
+			t.Fatalf("RunConverge() error = %v", err)
+		}
+		if !result.Passed {
+			t.Fatalf("expected Passed=true: the manifest declares %q as its ready condition and it is True throughout, got %+v", "Synced", result)
+		}
+		for _, d := range result.Diagnostics {
+			if strings.Contains(d, "readiness flap") {
+				t.Errorf("did not expect a readiness flap: Ready is permanently False, but the manifest never declared Ready as its condition, got %v", result.Diagnostics)
+			}
+		}
+	})
+
+	t.Run("UndeclaredConditionStillFailsOnTheSamePermanentlyFalseReady", func(t *testing.T) {
+		// No ReadyConditions declared — EffectiveReadyConditions falls
+		// back to the "Ready" default, exactly as every manifest was
+		// judged before this override existed.
+		m := &manifest.Manifest{Kind: testKindExample, Name: testNameExample}
+		f := newFakeAlwaysSyncedNeverReady()
+		r := newFakeRunner(f)
+		r.sleepFunc = func(time.Duration) {}
+
+		result, err := r.RunConverge(m, opts)
+		if err != nil {
+			t.Fatalf("RunConverge() error = %v", err)
+		}
+		if result.Passed {
+			t.Fatalf("expected Passed=false: no override is declared, the default \"Ready\" condition governs, and Ready is permanently False, got %+v", result)
+		}
+		var sawFlap bool
+		for _, d := range result.Diagnostics {
+			if strings.Contains(d, "readiness flap") {
+				sawFlap = true
+			}
+		}
+		if !sawFlap {
+			t.Errorf("expected a readiness flap diagnostic, got %v", result.Diagnostics)
 		}
 	})
 }

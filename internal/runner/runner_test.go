@@ -259,6 +259,13 @@ type fakeCluster struct {
 	// used to exercise waitSynced's timeout path in isolation. Takes
 	// priority over syncedConflictReads.
 	neverSynced bool
+	// alwaysSynced, when true, makes handleGet embed a Synced condition
+	// whose status is permanently "True" at the current generation from
+	// the very first read — the settled-Synced, permanently-not-Ready
+	// resource shape a manifest.ReadyConditionsKey override of "Synced"
+	// exists for (see TestRunConvergeHonoursDeclaredReadyCondition). Takes
+	// priority over both neverSynced and syncedConflictReads.
+	alwaysSynced bool
 
 	// silentWipeField and silentWipeValue, when silentWipeField is
 	// non-empty, simulate a backend that resets an UNRELATED atProvider
@@ -337,6 +344,13 @@ func (f *fakeCluster) readyCondition() (cond map[string]interface{}, ok bool) {
 // f.getObjectCalls is already the current read's 1-based index) — handleGet
 // calls readyCondition() first, always.
 func (f *fakeCluster) syncedCondition() (cond map[string]interface{}, ok bool) {
+	if f.alwaysSynced {
+		return map[string]interface{}{
+			"type":               "Synced",
+			"status":             "True",
+			"observedGeneration": f.generation,
+		}, true
+	}
 	if f.neverSynced {
 		return map[string]interface{}{
 			"type":               "Synced",

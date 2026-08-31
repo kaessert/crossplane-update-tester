@@ -174,8 +174,13 @@ controller; set `UPDATE_TESTER_PROVIDER_DEPLOYMENT` to disambiguate.
    cycle.
 7. Assert that `status.atProvider` is unchanged (minus `--ignore-fields`),
    that the generation is unchanged, that **zero** new update Events were
-   recorded, and that `Ready` is still `True`. A `Ready` flap at this point is
-   reported as its own diagnostic, separate from the `atProvider` diff.
+   recorded, and that the manifest's declared ready condition(s) are all still
+   `True` — `Ready` unless the manifest carries uptest's own
+   `uptest.upbound.io/conditions` annotation, in which case every condition
+   type it names (comma separated) must read `True`. A flap of those
+   conditions at this point is reported as its own diagnostic, separate from
+   the `atProvider` diff. Step 3's pre-check is unaffected: it waits on `Ready`
+   either way and never fails the check.
 
 **Controller-Pod-restart awareness.** If the provider controller Pod is
 replaced during the wait — an event-burst reset (see `run` above), an OOM

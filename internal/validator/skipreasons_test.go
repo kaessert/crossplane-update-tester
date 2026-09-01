@@ -210,8 +210,8 @@ func TestCheckSkipReasonsIgnoresLegacyAndOtherReasons(t *testing.T) {
 		Kind: kindWidget,
 		Tests: []manifest.UpdateTest{
 			{Field: "legacyField", Skip: manifest.LegacySkip("free prose, nothing to check")},
-			{Field: "vendorField", Skip: manifest.SkipInfo{Reason: manifest.SkipVendorDefect, Evidence: "e", Ticket: "TCK-000001"}},
-			{Field: "fixtureField", Skip: manifest.SkipInfo{Reason: manifest.SkipFixtureMissing, Ticket: "TCK-000002"}},
+			{Field: "vendorField", Skip: manifest.SkipInfo{Reason: manifest.SkipVendorDefect, Evidence: "e"}},
+			{Field: "fixtureField", Skip: manifest.SkipInfo{Reason: manifest.SkipFixtureMissing, Evidence: "e"}},
 			{Field: "writeOnlyField", Skip: manifest.SkipInfo{Reason: manifest.SkipWriteOnly}},
 		},
 	}

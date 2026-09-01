@@ -724,7 +724,7 @@ The must-test set is derived from the classification, not asserted by hand:
   nothing to resolve against. The other four structured reasons
   (`union-arm`, `covered-elsewhere`, `vendor-defect`, `fixture-missing`) are
   accepted — each carries its own citation (`sibling:`, `by:`, or
-  `evidence:` with an optional `ticket:` for either of the last two)
+  `evidence:` for either of the last two)
   resolved elsewhere (see `validate`'s `skip: reasons` checks below).
 
 CEL-immutability never excuses `value-changed` or `defaulted-by-server`: a
@@ -1004,8 +1004,8 @@ than declared here.
 |---|---|---|
 | `union-arm` | `sibling:` naming another field | yes — `sibling:` must be a field declared on the same `<Kind>Parameters` struct |
 | `covered-elsewhere` | `by:` as `<path>#<field>` | yes — that manifest and field must exist, and the named entry must itself be directly tested (not skipped, not missing, and not a `covered-elsewhere` cycle) |
-| `vendor-defect` | `evidence:`; `ticket:` optional | no — `evidence:` is checked for presence; `ticket:`, when present, is checked for shape, not presence |
-| `fixture-missing` | `evidence:`; `ticket:` optional | no — `evidence:` is checked for presence; `ticket:`, when present, is checked for shape, not presence |
+| `vendor-defect` | `evidence:` | no — `evidence:` is checked for presence |
+| `fixture-missing` | `evidence:` | no — `evidence:` is checked for presence |
 | `write-only` | none | no |
 
 `covered-elsewhere`'s `<path>` is resolved relative to the directory of the
@@ -1027,12 +1027,10 @@ crossplane.io/update-test: |
     skip:
       reason: fixture-missing
       evidence: "no fixture backend exposes a second firewall group to move this field between"
-      ticket: "8213021"
   - field: dnsVolterraManaged
     skip:
       reason: vendor-defect
       evidence: "HTTP 400 'Change of domain type ... is not supported'"
-      ticket: "https://support.f5.com/csp/case/00482113"
 ```
 
 The pre-existing free-prose string form (`skip: "some reason"`) still parses
@@ -1072,13 +1070,11 @@ crossplane.io/update-test: |
     skip:
       reason: vendor-defect
       evidence: "os_id is structurally absent from the update request the controller sends"
-      ticket: "482113"
       disposition: statically-provable
   - field: displayName
     skip:
       reason: vendor-defect
       evidence: "HTTP 409, and the display name is permanently reserved regardless of response code"
-      ticket: "INC0012345"
       disposition: declared-exclusion
       declared-by: a human
       reconfirm: "2027-01-01"

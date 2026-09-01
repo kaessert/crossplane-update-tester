@@ -1273,23 +1273,8 @@ func TestParseAnnotationStructuredSkipAccepted(t *testing.T) {
 `,
 			want: SkipInfo{Reason: SkipCoveredElsewhere, By: "examples/x/y.yaml#comment"},
 		},
-		"VendorDefect": {
-			reason: "vendor-defect carries both evidence: and an externally resolvable ticket:",
-			annotation: `
-- field: dnsVolterraManaged
-  skip:
-    reason: vendor-defect
-    evidence: "HTTP 400 'Change of domain type ... is not supported'"
-    ticket: https://support.f5.com/csp/case/00482113
-`,
-			want: SkipInfo{
-				Reason:   SkipVendorDefect,
-				Evidence: "HTTP 400 'Change of domain type ... is not supported'",
-				Ticket:   "https://support.f5.com/csp/case/00482113",
-			},
-		},
 		"VendorDefectEvidenceOnly": {
-			reason: "ticket: is optional — vendor-defect parses on evidence: alone",
+			reason: "vendor-defect parses on evidence: alone",
 			annotation: `
 - field: comment
   skip:
@@ -1298,23 +1283,8 @@ func TestParseAnnotationStructuredSkipAccepted(t *testing.T) {
 `,
 			want: SkipInfo{Reason: SkipVendorDefect, Evidence: "observed a 400"},
 		},
-		"FixtureMissing": {
-			reason: "fixture-missing carries both evidence: and an externally resolvable ticket:",
-			annotation: `
-- field: firewallGroupId
-  skip:
-    reason: fixture-missing
-    evidence: "no fixture backend exposes a second firewall group to move this field between"
-    ticket: "8213021"
-`,
-			want: SkipInfo{
-				Reason:   SkipFixtureMissing,
-				Evidence: "no fixture backend exposes a second firewall group to move this field between",
-				Ticket:   "8213021",
-			},
-		},
 		"FixtureMissingEvidenceOnly": {
-			reason: "ticket: is optional — fixture-missing parses on evidence: alone",
+			reason: "fixture-missing parses on evidence: alone",
 			annotation: `
 - field: comment
   skip:
@@ -1334,17 +1304,6 @@ func TestParseAnnotationStructuredSkipAccepted(t *testing.T) {
     reason: write-only
 `,
 			want: SkipInfo{Reason: SkipWriteOnly},
-		},
-		"TicketBareInteger": {
-			reason: "a bare integer ticket: is a plausible vendor case number and must be accepted",
-			annotation: `
-- field: comment
-  skip:
-    reason: vendor-defect
-    evidence: "observed a 400"
-    ticket: "482113"
-`,
-			want: SkipInfo{Reason: SkipVendorDefect, Evidence: "observed a 400", Ticket: "482113"},
 		},
 	}
 
@@ -1525,7 +1484,6 @@ func TestParseAnnotationDispositionNeverInferredFromReason(t *testing.T) {
   skip:
     reason: vendor-defect
     evidence: "HTTP 409, permanently reserved regardless of response code"
-    ticket: IAM-DISPLAYNAME
 `)
 	if err != nil {
 		t.Fatalf("ParseAnnotation() error = %v", err)
@@ -1595,16 +1553,15 @@ func TestParseAnnotationStructuredSkipRejectsInvalidShapes(t *testing.T) {
 			wantErrSubstr: "must be shaped",
 		},
 		"VendorDefectMissingEvidence": {
-			reason: "vendor-defect requires a non-empty evidence: — ticket: is optional and does not substitute for it",
+			reason: "vendor-defect requires a non-empty evidence:",
 			annotation: `
 - field: comment
   skip:
     reason: vendor-defect
-    ticket: "482113"
 `,
 			wantErrSubstr: "requires a non-empty evidence:",
 		},
-		"FixtureMissingNoTicketOrEvidence": {
+		"FixtureMissingNoEvidence": {
 			reason: "fixture-missing requires a non-empty evidence:",
 			annotation: `
 - field: comment
@@ -1613,37 +1570,16 @@ func TestParseAnnotationStructuredSkipRejectsInvalidShapes(t *testing.T) {
 `,
 			wantErrSubstr: "requires a non-empty evidence:",
 		},
-		"FixtureMissingTicketOnly": {
-			reason: "ticket: alone does not substitute for the required evidence:",
-			annotation: `
-- field: comment
-  skip:
-    reason: fixture-missing
-    ticket: "8213021"
-`,
-			wantErrSubstr: "requires a non-empty evidence:",
-		},
-		"TicketUUIDRejected": {
-			reason: "a bare UUID is certainly not an externally resolvable reference",
+		"TicketKeyRejected": {
+			reason: "the ticket: key no longer exists — any value authored under it is rejected naming evidence: as the replacement, regardless of shape",
 			annotation: `
 - field: comment
   skip:
     reason: vendor-defect
     evidence: "observed a 400"
-    ticket: 3f0f55de-1234-4321-89ab-1234567890ab
+    ticket: "https://support.example.invalid/case/00482113"
 `,
-			wantErrSubstr: "looks like a bare UUID",
-		},
-		"TicketFactorySlugRejected": {
-			reason: "a factory ticket slug is certainly not an externally resolvable reference",
-			annotation: `
-- field: comment
-  skip:
-    reason: vendor-defect
-    evidence: "observed a 400"
-    ticket: FX-DNS-DELEGATION
-`,
-			wantErrSubstr: "looks like a factory ticket slug",
+			wantErrSubstr: "ticket:",
 		},
 		"LegacyAndReasonMutuallyExclusive": {
 			reason: "legacy: and reason: are alternatives, not a merge",
@@ -1856,23 +1792,17 @@ func TestSkipInfoDescribe(t *testing.T) {
 			want:   "covered-elsewhere (by: examples/x/y.yaml#comment)",
 		},
 		"VendorDefect": {
-			reason: "vendor-defect names both evidence and ticket",
-			skip:   SkipInfo{Reason: SkipVendorDefect, Evidence: "observed a 400", Ticket: "https://support.f5.com/csp/case/00482113"},
-			want:   "vendor-defect (observed a 400; ticket: https://support.f5.com/csp/case/00482113)",
-		},
-		"VendorDefectNoTicket": {
-			reason: "ticket: is optional and omitted entirely from the rendering when empty",
+			reason: "vendor-defect names its evidence",
 			skip:   SkipInfo{Reason: SkipVendorDefect, Evidence: "observed a 400"},
 			want:   "vendor-defect (observed a 400)",
 		},
 		"FixtureMissing": {
-			reason: "fixture-missing names both its evidence and its ticket",
+			reason: "fixture-missing names its evidence",
 			skip: SkipInfo{
 				Reason:   SkipFixtureMissing,
 				Evidence: "no fixture backend exposes a second firewall group to move this field between",
-				Ticket:   "8213021",
 			},
-			want: "fixture-missing (no fixture backend exposes a second firewall group to move this field between; ticket: 8213021)",
+			want: "fixture-missing (no fixture backend exposes a second firewall group to move this field between)",
 		},
 		"WriteOnly": {
 			reason: "write-only carries no companion data to render",
@@ -2424,7 +2354,6 @@ func TestParseAnnotationRejectsSkipTestedMix(t *testing.T) {
   skip:
     reason: fixture-missing
     evidence: "no second fixture to move this field to"
-    ticket: TEST-1234
 `)
 		if err == nil {
 			t.Fatal("ParseAnnotation() error = nil, want an error rejecting the skip/tested mix")

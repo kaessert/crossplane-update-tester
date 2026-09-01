@@ -343,7 +343,6 @@ func TestContainerClearCoverageReportsDispositionOnUncoveredLeaf(t *testing.T) {
 				Skip: manifest.SkipInfo{
 					Reason:      manifest.SkipVendorDefect,
 					Evidence:    "observed a 400",
-					Ticket:      "FX-DNS-DELEGATION",
 					Disposition: manifest.DispositionOneLivePatch,
 				},
 			},
@@ -1180,7 +1179,6 @@ func TestClearCellReportImpossibilityIsUniversalAsymmetric(t *testing.T) {
 				Skip: manifest.SkipInfo{
 					Reason:      manifest.SkipVendorDefect,
 					Evidence:    "observed a 400 on an empty-list PATCH",
-					Ticket:      "https://example.invalid/issues/1",
 					Disposition: manifest.DispositionOneLivePatch,
 				},
 			},
@@ -1213,7 +1211,6 @@ func TestClearCellReportImpossibilityIsUniversalBothDisposed(t *testing.T) {
 	disposedSkip := manifest.SkipInfo{
 		Reason:      manifest.SkipVendorDefect,
 		Evidence:    "observed a 400 on an empty-list PATCH",
-		Ticket:      "https://example.invalid/issues/1",
 		Disposition: manifest.DispositionOneLivePatch,
 	}
 	m := &manifest.Manifest{

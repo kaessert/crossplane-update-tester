@@ -9,7 +9,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 
@@ -167,17 +166,14 @@ func (t *UpdateTest) UnmarshalYAML(node *yaml.Node) error {
 	// enforcing anything it used to would trade a loud stopgap for an
 	// invisible one. Record what was observed in skip: (reason
 	// vendor-defect or fixture-missing, with evidence: describing the
-	// observation; ticket: is optional and, when present, must be an
-	// externally resolvable reference — never a factory-internal
-	// identifier) if the field genuinely cannot be tested, or withValues:
+	// observation) if the field genuinely cannot be tested, or withValues:
 	// if it can be tested once a coupled sibling field also carries a
 	// literal value.
 	for i := 0; i+1 < len(node.Content); i += 2 {
 		if node.Content[i].Value == "knownDefect" {
 			return fmt.Errorf(
 				"update-test entry carries a \"knownDefect:\" key, which no longer exists — use skip: with reason "+
-					"vendor-defect or fixture-missing, recording what was observed in evidence: (ticket: is "+
-					"optional and, when present, must be an externally resolvable reference), or withValues: if "+
+					"vendor-defect or fixture-missing, recording what was observed in evidence:, or withValues: if "+
 					"the test can be expressed once a coupled sibling field also carries a literal value in the "+
 					"same patch; valid skip: reasons are %s",
 				validSkipReasonList())
@@ -226,19 +222,11 @@ const (
 	SkipCoveredElsewhere SkipReason = "covered-elsewhere"
 	// SkipVendorDefect marks a field whose update path cannot be tested
 	// because of an observed vendor/backend defect, recorded in Evidence.
-	// Ticket is optional and, when present, must be an externally
-	// resolvable reference (a vendor support case, an upstream issue
-	// URL) rather than an internal tracking identifier — see Ticket. Not
-	// resolvable offline — Evidence is checked for presence; Ticket, when
-	// present, is checked for shape only.
+	// Not resolvable offline — Evidence is checked for presence.
 	SkipVendorDefect SkipReason = "vendor-defect"
 	// SkipFixtureMissing marks a field that cannot be tested because the
 	// fixture data it needs does not exist yet, recorded in Evidence.
-	// Ticket is optional and, when present, must be an externally
-	// resolvable reference (a vendor support case, an upstream issue
-	// URL) rather than an internal tracking identifier — see Ticket. Not
-	// resolvable offline — Evidence is checked for presence; Ticket, when
-	// present, is checked for shape only.
+	// Not resolvable offline — Evidence is checked for presence.
 	SkipFixtureMissing SkipReason = "fixture-missing"
 	// SkipWriteOnly marks a field with no readable counterpart to assert
 	// against. Accepted here with no companion key, unlike the other four
@@ -372,15 +360,6 @@ type SkipInfo struct {
 	// path untestable. Required whenever Reason is SkipVendorDefect or
 	// SkipFixtureMissing.
 	Evidence string
-	// Ticket is an optional externally resolvable reference for why this
-	// field cannot be tested yet — a vendor support case number, or an
-	// upstream issue URL. It is never a factory-internal ticket
-	// identifier: a provider repository is a shipped, published
-	// artifact, and an identifier meaningful only inside the factory
-	// that built it is unresolvable to anyone reading the shipped code.
-	// validateSkipInfo rejects a value shaped like a bare UUID or a
-	// factory ticket slug.
-	Ticket string
 	// Disposition is the optional evidence-tier disposition declared
 	// alongside Reason — see Disposition. Empty when no disposition: key
 	// was authored; an absent disposition is reported as absent, never
@@ -433,9 +412,9 @@ func (s SkipInfo) Describe() string {
 	case s.Reason == SkipCoveredElsewhere:
 		base = fmt.Sprintf("covered-elsewhere (by: %s)", s.By)
 	case s.Reason == SkipVendorDefect:
-		base = describeEvidenceTicket("vendor-defect", s.Evidence, s.Ticket)
+		base = describeEvidence("vendor-defect", s.Evidence)
 	case s.Reason == SkipFixtureMissing:
-		base = describeEvidenceTicket("fixture-missing", s.Evidence, s.Ticket)
+		base = describeEvidence("fixture-missing", s.Evidence)
 	case s.Reason == SkipWriteOnly:
 		base = "write-only"
 	default:
@@ -450,15 +429,10 @@ func (s SkipInfo) Describe() string {
 	return fmt.Sprintf("%s [disposition: %s]", base, s.Disposition)
 }
 
-// describeEvidenceTicket renders the common "<reason> (<evidence>[; ticket:
-// <ticket>])" shape SkipVendorDefect and SkipFixtureMissing share. ticket is
-// omitted entirely when empty — it is optional, and an entry authored
-// without one must not render a dangling "; ticket: ".
-func describeEvidenceTicket(reason, evidence, ticket string) string {
-	if ticket == "" {
-		return fmt.Sprintf("%s (%s)", reason, evidence)
-	}
-	return fmt.Sprintf("%s (%s; ticket: %s)", reason, evidence, ticket)
+// describeEvidence renders the common "<reason> (<evidence>)" shape
+// SkipVendorDefect and SkipFixtureMissing share.
+func describeEvidence(reason, evidence string) string {
+	return fmt.Sprintf("%s (%s)", reason, evidence)
 }
 
 // UnmarshalYAML implements yaml.Unmarshaler so a "skip:" key accepts any of
@@ -482,13 +456,26 @@ func (s *SkipInfo) UnmarshalYAML(value *yaml.Node) error {
 		*s = LegacySkip(raw)
 		return nil
 	case yaml.MappingNode:
+		// A "ticket:" key is a parse-time error, not a silently ignored
+		// unknown key: the key was removed because it had zero users
+		// fleet-wide and its only guard was a shape heuristic that could
+		// not actually confirm a value was externally resolvable. Letting
+		// an authored "ticket:" decode and vanish would trade a loud
+		// rejection for a silent no-op — the same failure class this
+		// removal exists to end.
+		for i := 0; i+1 < len(value.Content); i += 2 {
+			if value.Content[i].Value == "ticket" {
+				return fmt.Errorf(
+					"skip: mapping carries a \"ticket:\" key, which no longer exists — record what was " +
+						"observed in evidence: instead")
+			}
+		}
 		var m struct {
 			Reason      string `yaml:"reason"`
 			Legacy      string `yaml:"legacy"`
 			Sibling     string `yaml:"sibling"`
 			By          string `yaml:"by"`
 			Evidence    string `yaml:"evidence"`
-			Ticket      string `yaml:"ticket"`
 			Disposition string `yaml:"disposition"`
 			DeclaredBy  string `yaml:"declared-by"`
 			Reconfirm   string `yaml:"reconfirm"`
@@ -501,7 +488,6 @@ func (s *SkipInfo) UnmarshalYAML(value *yaml.Node) error {
 			Sibling:     m.Sibling,
 			By:          m.By,
 			Evidence:    m.Evidence,
-			Ticket:      m.Ticket,
 			Disposition: Disposition(m.Disposition),
 			DeclaredBy:  m.DeclaredBy,
 			Reconfirm:   m.Reconfirm,
@@ -518,36 +504,6 @@ func (s *SkipInfo) UnmarshalYAML(value *yaml.Node) error {
 	default:
 		return fmt.Errorf("skip: must be a string or a mapping, got YAML node kind %d", value.Kind)
 	}
-}
-
-// ticketUUIDPattern matches a bare UUID (any RFC 4122 layout,
-// case-insensitive) — the shape a factory ticket identifier can take when
-// auto-generated rather than assigned a slug.
-var ticketUUIDPattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
-
-// ticketFactorySlugPattern matches a factory ticket slug: an all-caps
-// project code of 2-5 letters, followed by two or more hyphen-separated
-// all-caps/digit segments (e.g. "FX-DNS-DELEGATION"). This is the shape the
-// factory's own ticket IDs take when a human names them by hand.
-var ticketFactorySlugPattern = regexp.MustCompile(`^[A-Z]{2,5}-[A-Z0-9]+(-[A-Z0-9]+)+$`)
-
-// validateTicketReference rejects the two shapes a ticket: value can take
-// that are CERTAINLY not externally resolvable: a bare UUID, and a factory
-// ticket slug. This is a shape heuristic, not a resolvability proof — it
-// cannot confirm that some other shape IS a resolvable reference, only that
-// these two are not. It must accept a URL, a vendor support case number, and
-// a bare integer without complaint.
-func validateTicketReference(ticket string) error {
-	const reason = "a provider repository is a shipped, published artifact and a factory-internal identifier " +
-		"is meaningless to its readers; ticket: must be an externally resolvable reference (a vendor support " +
-		"case number, an upstream issue URL)"
-	if ticketUUIDPattern.MatchString(ticket) {
-		return fmt.Errorf("skip: ticket: %q looks like a bare UUID — %s", ticket, reason)
-	}
-	if ticketFactorySlugPattern.MatchString(ticket) {
-		return fmt.Errorf("skip: ticket: %q looks like a factory ticket slug — %s", ticket, reason)
-	}
-	return nil
 }
 
 // validateDisposition enforces the closed disposition set and
@@ -601,7 +557,7 @@ func validateSkipInfo(s SkipInfo) error {
 
 	// The legacy: shape carries no reason code at all, so none of the
 	// reason-set/companion-key checks below apply to it — only the
-	// reason-independent ticket: and disposition: checks further down do.
+	// reason-independent disposition: check further down does.
 	if !s.Legacy {
 		if s.Reason == "immutable" {
 			return fmt.Errorf(
@@ -633,23 +589,12 @@ func validateSkipInfo(s SkipInfo) error {
 				return fmt.Errorf("skip: reason %q by: %q must be shaped \"<path>#<field>\"", s.Reason, s.By)
 			}
 		case SkipVendorDefect, SkipFixtureMissing:
-			// ticket: used to be a required companion here too. It no longer
-			// is — see Ticket's own doc comment — so only evidence: is
-			// checked for presence.
 			if s.Evidence == "" {
 				return fmt.Errorf("skip: reason %q requires a non-empty evidence: to be recorded", s.Reason)
 			}
 		case SkipWriteOnly:
 			// No required companion keys — see the SkipWriteOnly doc comment
 			// for why resolution is deferred rather than performed here.
-		}
-	}
-
-	// ticket: is optional everywhere, but when authored it must be an
-	// externally resolvable reference, regardless of reason: vs legacy:.
-	if s.Ticket != "" {
-		if err := validateTicketReference(s.Ticket); err != nil {
-			return err
 		}
 	}
 

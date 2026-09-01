@@ -30,12 +30,12 @@ func TestClassifyWaiversTwoBucketTable(t *testing.T) {
 		},
 		"defaulted-by-server row is false": {
 			row:        Row{Path: "az", Classification: ClassDefaultedByServer, MirrorFound: true, MirrorValue: "az-1"},
-			skip:       manifest.SkipInfo{Reason: manifest.SkipVendorDefect, Evidence: "e", Ticket: "t"},
+			skip:       manifest.SkipInfo{Reason: manifest.SkipVendorDefect, Evidence: "e"},
 			wantBucket: BucketFalse,
 		},
 		"present-in-spec-absent-from-mirror without write-only is false": {
 			row:        Row{Path: "secret", Classification: ClassPresentInSpecAbsentFromMirror, SpecFound: true, SpecValue: "s"},
-			skip:       manifest.SkipInfo{Reason: manifest.SkipVendorDefect, Evidence: "e", Ticket: "t"},
+			skip:       manifest.SkipInfo{Reason: manifest.SkipVendorDefect, Evidence: "e"},
 			wantBucket: BucketFalse,
 		},
 		"present-in-spec-absent-from-mirror with confirmed write-only is keep": {

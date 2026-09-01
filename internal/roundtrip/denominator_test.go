@@ -65,13 +65,13 @@ func TestDenominatorReportClassificationVerdicts(t *testing.T) {
 		"defaulted-by-server with vendor-defect skip is still a finding": {
 			field:   "region",
 			row:     Row{Path: "region", Classification: ClassDefaultedByServer, SpecFound: false, MirrorFound: true, MirrorValue: "us-east"},
-			skip:    manifest.SkipInfo{Reason: manifest.SkipVendorDefect, Evidence: "backend always defaults it", Ticket: "TICK-1"},
+			skip:    manifest.SkipInfo{Reason: manifest.SkipVendorDefect, Evidence: "backend always defaults it"},
 			wantErr: true,
 		},
 		"defaulted-by-server with fixture-missing skip is still a finding": {
 			field:   "region",
 			row:     Row{Path: "region", Classification: ClassDefaultedByServer, SpecFound: false, MirrorFound: true, MirrorValue: "us-east"},
-			skip:    manifest.SkipInfo{Reason: manifest.SkipFixtureMissing, Ticket: "TICK-2"},
+			skip:    manifest.SkipInfo{Reason: manifest.SkipFixtureMissing, Evidence: "e"},
 			wantErr: true,
 		},
 		"present-in-spec-absent-from-mirror with write-only skip is CONFIRMED": {
@@ -83,7 +83,7 @@ func TestDenominatorReportClassificationVerdicts(t *testing.T) {
 		"present-in-spec-absent-from-mirror with vendor-defect skip is a finding": {
 			field:   "privateKey",
 			row:     Row{Path: "privateKey", Classification: ClassPresentInSpecAbsentFromMirror, SpecFound: true, SpecValue: "secret"},
-			skip:    manifest.SkipInfo{Reason: manifest.SkipVendorDefect, Evidence: "e", Ticket: "t"},
+			skip:    manifest.SkipInfo{Reason: manifest.SkipVendorDefect, Evidence: "e"},
 			wantErr: true,
 		},
 		"present-in-spec-absent-from-mirror with legacy skip is a finding": {
@@ -139,7 +139,7 @@ func TestDenominatorReportNoRow(t *testing.T) {
 			wantFinding: true,
 		},
 		"structured fixture-missing skip with no row is accepted here": {
-			skip:        manifest.SkipInfo{Reason: manifest.SkipFixtureMissing, Ticket: "T-1"},
+			skip:        manifest.SkipInfo{Reason: manifest.SkipFixtureMissing, Evidence: "e"},
 			wantFinding: false,
 		},
 	}
@@ -453,7 +453,7 @@ func TestDenominatorReportImmutableClassificationVerdicts(t *testing.T) {
 		"immutable present-in-spec-absent-from-mirror with vendor-defect skip is STILL excluded — the exclusion does not depend on the skip: reason at all": {
 			field:       "reusable",
 			row:         Row{Path: "reusable", Classification: ClassPresentInSpecAbsentFromMirror, SpecFound: true, SpecValue: true, Immutable: true},
-			skip:        manifest.SkipInfo{Reason: manifest.SkipVendorDefect, Evidence: "e", Ticket: "t"},
+			skip:        manifest.SkipInfo{Reason: manifest.SkipVendorDefect, Evidence: "e"},
 			wantFinding: false,
 			wantExclude: true,
 		},
@@ -474,7 +474,7 @@ func TestDenominatorReportImmutableClassificationVerdicts(t *testing.T) {
 		"immutable defaulted-by-server with vendor-defect skip is a finding — the contradiction arm": {
 			field:       "region",
 			row:         Row{Path: "region", Classification: ClassDefaultedByServer, SpecFound: false, MirrorFound: true, MirrorValue: "us-east", Immutable: true},
-			skip:        manifest.SkipInfo{Reason: manifest.SkipVendorDefect, Evidence: "backend always defaults it", Ticket: "TICK-1"},
+			skip:        manifest.SkipInfo{Reason: manifest.SkipVendorDefect, Evidence: "backend always defaults it"},
 			wantFinding: true,
 			wantExclude: false,
 		},

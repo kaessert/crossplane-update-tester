@@ -257,7 +257,9 @@ exclusion set — using it alone across a fleet with divergent per-resource
 exclusions (a load-balancer's `forwardRules` field means nothing to a network
 resource) would silently widen every resource's exclusion set to the union of
 all of them. Prefer the per-manifest directive for anything not shared by the
-whole fleet; see ticket dcbdabdb for the mechanism that added it.
+whole fleet — the `ignore-fields:` line inside a manifest's
+`crossplane.io/update-test` annotation, described below, which scopes the
+exclusion to that one resource instead of the whole invocation.
 
 Manifest paths are accepted either as one comma-separated list or as repeated
 positional arguments — both forms are equivalent:

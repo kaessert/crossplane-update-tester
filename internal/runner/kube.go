@@ -93,16 +93,36 @@ type KubeClient interface {
 	// --since syntax, e.g. "30s").
 	ProviderLogs(namespace, selector, since string) (string, error)
 
-	// RolloutRestart, RolloutStatus and GetPodsJSONPath back the
-	// event-burst-reset workaround (see restartControllerDeployment and
-	// resolveControllerDeploymentName). They are expected to be deleted,
-	// not ported to a future client-go backend, once the fleet-wide
-	// event-burst-size flip lands everywhere and this workaround is no
-	// longer needed — tickets IN-EVENT-BURST-ON (provider-infobloxnios)
-	// and FLEET-EVENT-BURST-ON (the remaining providers).
+	// ControllerRevisionLabels returns the unique, non-empty
+	// providerDeploymentSelector ("pkg.crossplane.io/revision") label
+	// values carried by every Pod currently matching selector in
+	// namespace, in first-seen order. resolveControllerDeploymentName
+	// reduces this to exactly one Deployment name — see
+	// providerDeploymentSelector's own doc comment for why a Pod's label
+	// is read rather than the Deployment object itself.
+	ControllerRevisionLabels(namespace, selector string) ([]string, error)
+
+	// ControllerPodIdentities returns the name and creation time of every
+	// Pod currently matching selector in namespace.
+	// resolveControllerPodIdentityLive reduces this to whichever entry was
+	// created most recently — the Pod actually running now, since an
+	// older entry seen during a rollout can only be one mid-termination.
+	ControllerPodIdentities(namespace, selector string) ([]controllerPodIdentity, error)
+
+	// RolloutRestart and RolloutStatus back restartControllerDeployment,
+	// the mechanism resetEventBurst uses to discard a provider
+	// controller's in-process event-spam-filter state. Every provider's
+	// own event-burst-size flip has now landed fleet-wide, so production
+	// code no longer reaches either method — but they are kept here,
+	// deliberately unported, because the smoke-test harness asserts on
+	// the exact kubectl argv they issue and drives the compiled binary as
+	// a subprocess with no seam to substitute a fake backend in their
+	// place. They are retained solely as that harness's subject — no
+	// longer a production rollback hatch — and go away only once that
+	// harness itself is rewritten to stop depending on an exec-forced
+	// kubectl transcript (a fake API server or equivalent).
 	RolloutRestart(namespace, target string) (string, error)
 	RolloutStatus(namespace, target, timeout string) (string, error)
-	GetPodsJSONPath(namespace, selector, jsonPath string) (string, error)
 }
 
 // execKubeClient is the KubeClient backend that shells out to kubectl. Every
@@ -175,8 +195,44 @@ func (c *execKubeClient) RolloutStatus(namespace, target, timeout string) (strin
 	return c.r.exec("rollout", "status", target, "-n", namespace, "--timeout="+timeout)
 }
 
-func (c *execKubeClient) GetPodsJSONPath(namespace, selector, jsonPath string) (string, error) {
+// getPodsJSONPath issues `kubectl get pods -n <namespace> -l <selector> -o
+// <jsonPath>` — the exec backend's shared argv-building block for
+// ControllerRevisionLabels and ControllerPodIdentities below. It is
+// deliberately NOT part of the KubeClient interface: the client-go
+// backend needs no JSONPath template at all, so promoting this to a full
+// interface method (as the pre-port GetPodsJSONPath was) would expose a
+// shape only one backend can honour. It survives, unexported, purely as
+// this backend's own building block, and is what keeps both methods'
+// kubectl argv byte-identical to what this project issued before the
+// pod-identity lookup moved off it.
+func (c *execKubeClient) getPodsJSONPath(namespace, selector, jsonPath string) (string, error) {
 	return c.r.exec("get", "pods", "-n", namespace, "-l", selector, "-o", jsonPath)
+}
+
+// ControllerRevisionLabels backs resolveControllerDeploymentName on the
+// exec backend: the exact `kubectl get pods -l <selector> -o jsonpath=...`
+// invocation this project has always issued for it, reduced client-side by
+// uniqueNonEmptyLines to the deduplicated, non-empty label values.
+func (c *execKubeClient) ControllerRevisionLabels(namespace, selector string) ([]string, error) {
+	out, err := c.getPodsJSONPath(namespace, selector,
+		`jsonpath={range .items[*]}{.metadata.labels.pkg\.crossplane\.io/revision}{"\n"}{end}`)
+	if err != nil {
+		return nil, err
+	}
+	return uniqueNonEmptyLines(out), nil
+}
+
+// ControllerPodIdentities backs resolveControllerPodIdentityLive on the
+// exec backend: the exact `kubectl get pods -l <selector> -o jsonpath=...`
+// invocation this project has always issued for it, parsed client-side by
+// parseControllerPodIdentities into name/creation-time pairs.
+func (c *execKubeClient) ControllerPodIdentities(namespace, selector string) ([]controllerPodIdentity, error) {
+	out, err := c.getPodsJSONPath(namespace, selector,
+		`jsonpath={range .items[*]}{.metadata.name}{"\t"}{.metadata.creationTimestamp}{"\n"}{end}`)
+	if err != nil {
+		return nil, err
+	}
+	return parseControllerPodIdentities(out), nil
 }
 
 // eventFieldSelector builds the involvedObject field selector every
@@ -210,11 +266,13 @@ func eventFieldSelector(kind, name, namespace string) string {
 const kubeBackendEnvVar = "UPDATE_TESTER_KUBE_BACKEND"
 
 // clientGoKubeClient overrides event listing, resource reads, manifest-name
-// resolution, the two merge-patch operations, the Ready wait, and the
-// controller-log read with direct client-go calls. Every other KubeClient
-// operation is promoted from the embedded exec backend unchanged — this
-// type exists to migrate one operation at a time, not to grow into a
-// second full backend. A shared informer or watch cache is deliberately
+// resolution, the two merge-patch operations, the Ready wait, the
+// controller-log read, and the controller-pod list that backs
+// deployment-name resolution and pod-identity reads, with direct client-go
+// calls. Only RolloutRestart and RolloutStatus are still promoted from the
+// embedded exec backend unchanged — this type exists to migrate one
+// operation at a time, not to grow into a second full backend. A shared
+// informer or watch cache is deliberately
 // NOT used for the event listing, resource read or manifest-name
 // resolution overrides: the evidence check those feed is a before/after
 // delta on the same object, and a lagging cache would return a stale
@@ -911,21 +969,82 @@ func (r *Runner) podLogStream(cs kubernetes.Interface, namespace, podName, conta
 	return cs.CoreV1().Pods(namespace).GetLogs(podName, opts).Stream(context.Background())
 }
 
+// listControllerPods lists Pods matching selector in namespace via a
+// direct client-go call — the shared building block behind
+// ControllerRevisionLabels and ControllerPodIdentities on this backend.
+// Unlike the exec backend's getPodsJSONPath, no JSONPath template is
+// built or parsed on this side at all: each override below reads the
+// field(s) it needs directly off the typed corev1.Pod list this returns.
+func (c *clientGoKubeClient) listControllerPods(namespace, selector string) ([]corev1.Pod, error) {
+	cs, err := c.clientset()
+	if err != nil {
+		return nil, fmt.Errorf("resolving client-go client: %w", err)
+	}
+	pods, err := cs.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return nil, fmt.Errorf("listing pods for %q via client-go: %w", selector, err)
+	}
+	return pods.Items, nil
+}
+
+// ControllerRevisionLabels is listControllerPods narrowed to the field
+// resolveControllerDeploymentName needs: the unique, non-empty
+// providerDeploymentSelector label values, in first-seen order — the same
+// reduction the exec backend's jsonpath template performs, done here as a
+// plain Go map read instead.
+func (c *clientGoKubeClient) ControllerRevisionLabels(namespace, selector string) ([]string, error) {
+	pods, err := c.listControllerPods(namespace, selector)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool)
+	var labels []string
+	for _, pod := range pods {
+		v := pod.Labels[providerDeploymentSelector]
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		labels = append(labels, v)
+	}
+	return labels, nil
+}
+
+// ControllerPodIdentities is listControllerPods narrowed to the fields
+// resolveControllerPodIdentityLive needs: each matching Pod's own name and
+// creation time, read directly off its metadata rather than parsed out of
+// a jsonpath-formatted string.
+func (c *clientGoKubeClient) ControllerPodIdentities(namespace, selector string) ([]controllerPodIdentity, error) {
+	pods, err := c.listControllerPods(namespace, selector)
+	if err != nil {
+		return nil, err
+	}
+	identities := make([]controllerPodIdentity, 0, len(pods))
+	for _, pod := range pods {
+		identities = append(identities, controllerPodIdentity{Name: pod.Name, CreatedAt: pod.CreationTimestamp.Time})
+	}
+	return identities, nil
+}
+
 // kube returns the KubeClient backend for this Runner. It is a method
 // rather than a field populated at construction so a Runner built as a bare
 // struct literal resolves to a working backend with no separate wiring
 // step. Selection order:
 //
 //  1. kubeBackendEnvVar set to "exec" forces the exec backend for every
-//     operation — the rollback path and differential diagnostic if the
-//     client-go path ever misbehaves on a provider this migration's own
-//     runs did not cover.
+//     operation — the differential diagnostic that separates "the tool
+//     changed" from "the provider changed" on a run whose client-go path
+//     misbehaves in a way this migration's own runs did not cover.
 //  2. Otherwise: the client-go backend for event listing, resource reads,
 //     manifest-name resolution, the two merge-patch operations, the Ready
-//     wait, and the controller-log read (the default, production
-//     behaviour), built from kubeClientsetFunc/kubeDynamicFunc/restMapperFunc
-//     when a test has set them, or from the ambient kubeconfig otherwise.
-//     Every other operation still delegates to the embedded exec backend.
+//     wait, the controller-log read, and the controller-pod list that
+//     backs deployment-name resolution and pod-identity reads (the
+//     default, production behaviour), built from
+//     kubeClientsetFunc/kubeDynamicFunc/restMapperFunc when a test has set
+//     them, or from the ambient kubeconfig otherwise. Only
+//     RolloutRestart/RolloutStatus still delegate to the embedded exec
+//     backend unconditionally — see their own doc comment on the
+//     KubeClient interface for why they are not part of this default.
 //
 // A test Runner built as a bare struct literal takes exactly this same
 // path: there is no longer a separate branch for "a test harness with no
@@ -960,5 +1079,5 @@ func kubeBackendSelectionLine(forcedExec bool) string {
 	if forcedExec {
 		return fmt.Sprintf("kube backend: exec (all operations — forced by %s=exec)", kubeBackendEnvVar)
 	}
-	return "kube backend: client-go (event list, resource read, manifest resolve, patch, wait, log), exec (all other operations)"
+	return "kube backend: client-go (event list, resource read, manifest resolve, patch, wait, log, controller pod list), exec (rollout restart/status only)"
 }

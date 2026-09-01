@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -51,9 +53,6 @@ func TestKubeClientArgvEquivalence(t *testing.T) {
 		condition = "condition=Ready"
 		timeout   = "300s"
 		selector  = "pkg.crossplane.io/revision"
-		podSel    = "pkg.crossplane.io/revision=release-name"
-		jsonPath1 = `jsonpath={range .items[*]}{.metadata.labels.pkg\.crossplane\.io/revision}{"\n"}{end}`
-		jsonPath2 = `jsonpath={range .items[*]}{.metadata.name}{"\t"}{.metadata.creationTimestamp}{"\n"}{end}`
 		target    = "deploy/release-name"
 		since     = "30s"
 	)
@@ -131,20 +130,6 @@ func TestKubeClientArgvEquivalence(t *testing.T) {
 			},
 			wantArgs: []string{"rollout", "status", target, "-n", providerDeploymentNamespace, "--timeout=300s"},
 		},
-		"GetPodsJSONPath deployment-name lookup shape": {
-			reason: "resolveControllerDeploymentName listed pods by the bare revision-label selector",
-			call: func(c KubeClient) (string, error) {
-				return c.GetPodsJSONPath(providerDeploymentNamespace, selector, jsonPath1)
-			},
-			wantArgs: []string{"get", "pods", "-n", providerDeploymentNamespace, "-l", selector, "-o", jsonPath1},
-		},
-		"GetPodsJSONPath pod-identity lookup shape": {
-			reason: "resolveControllerPodIdentityLive listed pods by the same selector pinned to one deployment's revision value",
-			call: func(c KubeClient) (string, error) {
-				return c.GetPodsJSONPath(providerDeploymentNamespace, podSel, jsonPath2)
-			},
-			wantArgs: []string{"get", "pods", "-n", providerDeploymentNamespace, "-l", podSel, "-o", jsonPath2},
-		},
 	}
 
 	for tn, tc := range tests {
@@ -161,6 +146,147 @@ func TestKubeClientArgvEquivalence(t *testing.T) {
 				t.Errorf("%s:\n got  %#v\n want %#v", tc.reason, gotArgs, tc.wantArgs)
 			}
 		})
+	}
+}
+
+// TestExecControllerRevisionLabelsArgvAndParsing pins the exec backend's
+// ControllerRevisionLabels to the exact `kubectl get pods ... -o
+// jsonpath=...` argv resolveControllerDeploymentName has always issued
+// (unchanged by the pod-identity port — see hack/smoke-test.sh section 6,
+// which asserts on this exact line), and proves the raw jsonpath output is
+// reduced to deduplicated, non-empty label values.
+func TestExecControllerRevisionLabelsArgvAndParsing(t *testing.T) {
+	t.Setenv(kubeBackendEnvVar, "exec")
+
+	var gotArgs []string
+	r := &Runner{execFunc: func(args []string) (string, error) {
+		gotArgs = args
+		return "release-a\nrelease-a\nrelease-b\n", nil
+	}}
+
+	got, err := r.kube().ControllerRevisionLabels(providerDeploymentNamespace, providerDeploymentSelector)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	wantArgs := []string{"get", "pods", "-n", providerDeploymentNamespace, "-l", providerDeploymentSelector, "-o",
+		`jsonpath={range .items[*]}{.metadata.labels.pkg\.crossplane\.io/revision}{"\n"}{end}`}
+	if !reflect.DeepEqual(gotArgs, wantArgs) {
+		t.Errorf("argv:\n got  %#v\n want %#v", gotArgs, wantArgs)
+	}
+
+	want := []string{"release-a", "release-b"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("ControllerRevisionLabels() = %v, want %v (deduplicated, order-preserved)", got, want)
+	}
+}
+
+// TestExecControllerPodIdentitiesArgvAndParsing pins the exec backend's
+// ControllerPodIdentities to the exact `kubectl get pods ... -o
+// jsonpath=...` argv resolveControllerPodIdentityLive has always issued,
+// and proves the raw "<name>\t<creationTimestamp>" output is parsed into
+// typed identities exactly as parseControllerPodIdentities always did.
+func TestExecControllerPodIdentitiesArgvAndParsing(t *testing.T) {
+	t.Setenv(kubeBackendEnvVar, "exec")
+
+	var gotArgs []string
+	r := &Runner{execFunc: func(args []string) (string, error) {
+		gotArgs = args
+		return "pod-a\t2026-01-02T03:04:05Z\n", nil
+	}}
+
+	podSel := providerDeploymentSelector + "=release-name"
+	got, err := r.kube().ControllerPodIdentities(providerDeploymentNamespace, podSel)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	wantArgs := []string{"get", "pods", "-n", providerDeploymentNamespace, "-l", podSel, "-o",
+		`jsonpath={range .items[*]}{.metadata.name}{"\t"}{.metadata.creationTimestamp}{"\n"}{end}`}
+	if !reflect.DeepEqual(gotArgs, wantArgs) {
+		t.Errorf("argv:\n got  %#v\n want %#v", gotArgs, wantArgs)
+	}
+
+	want := []controllerPodIdentity{{Name: "pod-a", CreatedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("ControllerPodIdentities() = %+v, want %+v", got, want)
+	}
+}
+
+// TestClientGoControllerRevisionLabelsAndPodIdentities proves the DEFAULT
+// (client-go) backend routing serves ControllerRevisionLabels and
+// ControllerPodIdentities entirely through a fake client-go Clientset — no
+// execFunc is set here at all, so a regression that silently fell back to
+// the promoted exec backend would try to invoke a real "kubectl" binary
+// and fail loudly rather than passing quietly. This is what proves the
+// pod-identity port actually reaches client-go by default, not merely that
+// the exec backend still behaves as before.
+func TestClientGoControllerRevisionLabelsAndPodIdentities(t *testing.T) {
+	pod := func(name, revision string, created time.Time) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              name,
+				Namespace:         providerDeploymentNamespace,
+				Labels:            map[string]string{providerDeploymentSelector: revision},
+				CreationTimestamp: metav1.NewTime(created),
+			},
+		}
+	}
+	t0 := time.Date(2026, 1, 2, 3, 0, 0, 0, time.UTC)
+
+	cs := fake.NewSimpleClientset(pod("provider-example-aaa", testProviderDeployment, t0))
+	r := &Runner{kubeClientsetFunc: func() (kubernetes.Interface, error) { return cs, nil }}
+
+	labels, err := r.kube().ControllerRevisionLabels(providerDeploymentNamespace, providerDeploymentSelector)
+	if err != nil {
+		t.Fatalf("ControllerRevisionLabels: unexpected error: %v", err)
+	}
+	if want := []string{testProviderDeployment}; !reflect.DeepEqual(labels, want) {
+		t.Errorf("ControllerRevisionLabels() = %v, want %v", labels, want)
+	}
+
+	got1, err := r.kube().ControllerPodIdentities(providerDeploymentNamespace, providerDeploymentSelector+"="+testProviderDeployment)
+	if err != nil {
+		t.Fatalf("ControllerPodIdentities: unexpected error: %v", err)
+	}
+	want1 := []controllerPodIdentity{{Name: "provider-example-aaa", CreatedAt: t0}}
+	if !reflect.DeepEqual(got1, want1) {
+		t.Errorf("ControllerPodIdentities() (first read) = %+v, want %+v", got1, want1)
+	}
+
+	// A NO-CHANGE window: reading again with nothing having replaced the
+	// Pod reports the same identity — the "clean window" convergeAssertAttempt
+	// relies on to conclude the observation window was not spoiled.
+	got2, err := r.kube().ControllerPodIdentities(providerDeploymentNamespace, providerDeploymentSelector+"="+testProviderDeployment)
+	if err != nil {
+		t.Fatalf("ControllerPodIdentities: unexpected error on second read: %v", err)
+	}
+	if !reflect.DeepEqual(got2, want1) {
+		t.Errorf("ControllerPodIdentities() (no-change window) = %+v, want %+v (unchanged from the first read)", got2, want1)
+	}
+
+	// A REPLACEMENT: the old Pod is gone, a new one with a later
+	// CreatedAt and a different name stands in for it — the shape
+	// convergeAssertAttempt relies on to detect a restart mid-window.
+	ctx := context.Background()
+	if err := cs.CoreV1().Pods(providerDeploymentNamespace).Delete(ctx, "provider-example-aaa", metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("deleting the original pod: %v", err)
+	}
+	t1 := t0.Add(5 * time.Minute)
+	if _, err := cs.CoreV1().Pods(providerDeploymentNamespace).Create(ctx, pod("provider-example-bbb", testProviderDeployment, t1), metav1.CreateOptions{}); err != nil {
+		t.Fatalf("creating the replacement pod: %v", err)
+	}
+
+	got3, err := r.kube().ControllerPodIdentities(providerDeploymentNamespace, providerDeploymentSelector+"="+testProviderDeployment)
+	if err != nil {
+		t.Fatalf("ControllerPodIdentities: unexpected error after replacement: %v", err)
+	}
+	want3 := []controllerPodIdentity{{Name: "provider-example-bbb", CreatedAt: t1}}
+	if !reflect.DeepEqual(got3, want3) {
+		t.Errorf("ControllerPodIdentities() (after replacement) = %+v, want %+v", got3, want3)
+	}
+	if got3[0].Name == got1[0].Name {
+		t.Error("replacement was not detected: identity name unchanged after the Pod was replaced")
 	}
 }
 

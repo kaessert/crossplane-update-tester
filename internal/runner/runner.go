@@ -1202,13 +1202,11 @@ func (r *Runner) resolveControllerDeploymentName() (string, error) {
 		return override, nil
 	}
 
-	out, err := r.kube().GetPodsJSONPath(providerDeploymentNamespace, providerDeploymentSelector,
-		`jsonpath={range .items[*]}{.metadata.labels.pkg\.crossplane\.io/revision}{"\n"}{end}`)
+	names, err := r.kube().ControllerRevisionLabels(providerDeploymentNamespace, providerDeploymentSelector)
 	if err != nil {
 		return "", err
 	}
 
-	names := uniqueNonEmptyLines(out)
 	switch len(names) {
 	case 0:
 		return "", fmt.Errorf("no pod found with label %s in namespace %s",
@@ -1280,13 +1278,12 @@ func (r *Runner) resolveControllerPodIdentityLive() (controllerPodIdentity, erro
 		return controllerPodIdentity{}, fmt.Errorf("resolving provider deployment: %w", err)
 	}
 
-	out, err := r.kube().GetPodsJSONPath(providerDeploymentNamespace, providerDeploymentSelector+"="+name,
-		`jsonpath={range .items[*]}{.metadata.name}{"\t"}{.metadata.creationTimestamp}{"\n"}{end}`)
+	identities, err := r.kube().ControllerPodIdentities(providerDeploymentNamespace, providerDeploymentSelector+"="+name)
 	if err != nil {
 		return controllerPodIdentity{}, fmt.Errorf("listing controller pods for deployment %s: %w", name, err)
 	}
 
-	identity, found := latestControllerPodIdentity(parseControllerPodIdentities(out))
+	identity, found := latestControllerPodIdentity(identities)
 	if !found {
 		return controllerPodIdentity{}, fmt.Errorf("no controller pod found for deployment %s in namespace %s", name, providerDeploymentNamespace)
 	}

@@ -932,27 +932,37 @@ func newFakeClientGoDynamicClient(r *Runner) dynamic.Interface {
 }
 
 // newFakeClientGoClientset builds the kubernetes.Interface newFakeRunner
-// wires as kubeClientsetFunc: a static single provider Pod, so
-// ProviderLogs' client-go pod listing finds exactly the one pod `kubectl
-// logs -l <selector>` always found in these tests (none of which vary pod
-// COUNT for the log-reading path — that knob, f.providerPods, exists for
-// the separate get-pods-by-jsonpath lookups restartControllerDeployment
-// and resolveControllerPodIdentityLive make, which stay exec-backed and
-// untouched by this migration). Events are reactored into r.execFunc
-// exactly like the dynamic client's get/patch reactors above (see that
-// constructor's doc comment for why r.execFunc, not fakeCluster.exec
-// directly), so event-count simulation (generations, siblings, budgets,
-// restarts) is untouched by the flip.
-func newFakeClientGoClientset(r *Runner) kubernetes.Interface {
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "provider-example-pod",
-			Namespace: providerDeploymentNamespace,
-			Labels:    map[string]string{providerDeploymentSelector: testProviderDeployment},
-		},
-		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "package-runtime"}}},
+// wires as kubeClientsetFunc. providerPods mirrors fakeCluster's own field
+// of the same name: one Pod per entry, each carrying that entry as its
+// providerDeploymentSelector label — so ControllerRevisionLabels'
+// ambiguous-lookup detection and ControllerPodIdentities' pod-count
+// handling see the SAME fixture shape via the client-go default routing
+// that fakeCluster's own "get pods" handler gives the exec backend. nil
+// (the default every caller but the ambiguous-deployment test passes)
+// falls back to a single testProviderDeployment-labelled Pod, matching
+// every other test's expectation. ProviderLogs' client-go pod listing
+// finds the SAME Pod(s) `kubectl logs -l <selector>` would have found via
+// exec. Events are reactored into r.execFunc exactly like the dynamic
+// client's get/patch reactors above (see that constructor's doc comment
+// for why r.execFunc, not fakeCluster.exec directly), so event-count
+// simulation (generations, siblings, budgets, restarts) is untouched by
+// the flip.
+func newFakeClientGoClientset(r *Runner, providerPods []string) kubernetes.Interface {
+	if len(providerPods) == 0 {
+		providerPods = []string{testProviderDeployment}
 	}
-	cs := fake.NewSimpleClientset(pod)
+	objs := make([]runtime.Object, 0, len(providerPods))
+	for i, revision := range providerPods {
+		objs = append(objs, &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      fmt.Sprintf("provider-example-pod-%d", i),
+				Namespace: providerDeploymentNamespace,
+				Labels:    map[string]string{providerDeploymentSelector: revision},
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "package-runtime"}}},
+		})
+	}
+	cs := fake.NewSimpleClientset(objs...)
 
 	cs.PrependReactor("list", "events", func(ktesting.Action) (bool, runtime.Object, error) {
 		raw, err := r.execFunc([]string{kubectlGetSubcommand, "events", "--all-namespaces", "-o", "json"})
@@ -1003,19 +1013,20 @@ func newFakeRunner(f *fakeCluster) *Runner {
 	// restMapperFunc/kubeDynamicFunc/kubeClientsetFunc/podLogStreamFunc:
 	// route the migrated KubeClient operations (GetObjectJSON, PatchMerge,
 	// PatchMergeStatus, WaitForCondition, ListEventsForObject,
-	// ProviderLogs, and — via RunResolveRecover's internal ResolveResource
-	// call — ResolveManifestName) through fake client-go clients whose
+	// ProviderLogs, ControllerRevisionLabels, ControllerPodIdentities, and
+	// — via RunResolveRecover's internal ResolveResource call —
+	// ResolveManifestName) through fake client-go clients whose
 	// Get/Patch/List/Events/Logs handling all delegate back into r.execFunc
 	// (and so, by default, into fakeCluster's own simulation) — see the
 	// constructors above. Assigned after r exists, rather than as struct
 	// literal fields, because each closure reads r.execFunc at CALL time —
 	// see newFakeClientGoDynamicClient's doc comment for why that matters.
-	// RolloutRestart, RolloutStatus and GetPodsJSONPath remain on execFunc
-	// unconditionally: they are promoted from the embedded exec backend
-	// unchanged by kube(), migration or no.
+	// RolloutRestart and RolloutStatus remain on execFunc unconditionally:
+	// they are the only two operations still promoted from the embedded
+	// exec backend unchanged by kube().
 	r.restMapperFunc = func() (meta.RESTMapper, error) { return runnerTestRESTMapper{}, nil }
 	r.kubeDynamicFunc = func() (dynamic.Interface, error) { return newFakeClientGoDynamicClient(r), nil }
-	r.kubeClientsetFunc = func() (kubernetes.Interface, error) { return newFakeClientGoClientset(r), nil }
+	r.kubeClientsetFunc = func() (kubernetes.Interface, error) { return newFakeClientGoClientset(r, f.providerPods), nil }
 	r.podLogStreamFunc = newFakePodLogStreamFunc(r)
 	return r
 }
@@ -1773,7 +1784,7 @@ func TestEvidenceOutcomeRetriesUntilEventVisible(t *testing.T) {
 		sleepFunc:      func(time.Duration) {},
 		evidenceWindow: time.Second,
 	}
-	r.kubeClientsetFunc = func() (kubernetes.Interface, error) { return newFakeClientGoClientset(r), nil }
+	r.kubeClientsetFunc = func() (kubernetes.Interface, error) { return newFakeClientGoClientset(r, nil), nil }
 
 	checked, evidenced, err := r.evidenceOutcome("", "", "", "", 0, nil)
 	if err != nil {
@@ -1802,7 +1813,7 @@ func TestEvidenceOutcomeReportsNotEvidencedWhenNeverGrows(t *testing.T) {
 		sleepFunc:      func(time.Duration) {},
 		evidenceWindow: testEvidenceWindow,
 	}
-	r.kubeClientsetFunc = func() (kubernetes.Interface, error) { return newFakeClientGoClientset(r), nil }
+	r.kubeClientsetFunc = func() (kubernetes.Interface, error) { return newFakeClientGoClientset(r, nil), nil }
 
 	checked, evidenced, err := r.evidenceOutcome("", "", "", "", 0, nil)
 	if err != nil {
@@ -2761,6 +2772,12 @@ func TestRunTestsRestartFailureDoesNotAbortRun(t *testing.T) {
 // left the untrusted evidence looking pristine.
 func TestRunTestsAmbiguousProviderDeploymentDegradesToUntrusted(t *testing.T) {
 	t.Setenv(providerDeploymentEnvVar, "")
+	// NOT forced to exec: this exercises the full RunTests flow (manifest
+	// resolution, patches, waits — all client-go by default), so the
+	// ambiguous multi-Pod fixture below (f.providerPods) must be visible
+	// to the DEFAULT client-go routing too. newFakeRunner threads
+	// f.providerPods into newFakeClientGoClientset for exactly this
+	// reason — see that constructor's doc comment.
 
 	const numFields = defaultEventBurstCeiling + 2
 	f := &fakeCluster{
@@ -2810,6 +2827,12 @@ func TestRunTestsAmbiguousProviderDeploymentDegradesToUntrusted(t *testing.T) {
 // entirely.
 func TestRestartControllerDeploymentResolvesViaPodLabel(t *testing.T) {
 	t.Setenv(providerDeploymentEnvVar, "")
+	// Force exec: this bare-struct Runner only wires execFunc, and the
+	// point of the test is the exec backend's own argv (see doc comment
+	// above). No kubeClientsetFunc is set, so the default client-go
+	// routing would try a real kubeconfig and fail before ever reaching
+	// this test's assertions.
+	t.Setenv(kubeBackendEnvVar, "exec")
 
 	var gotArgs [][]string
 	r := &Runner{
@@ -2885,6 +2908,10 @@ func TestRestartControllerDeploymentResolvesViaPodLabel(t *testing.T) {
 // treated as a no-op restart.
 func TestRestartControllerDeploymentPodResolutionFailure(t *testing.T) {
 	t.Setenv(providerDeploymentEnvVar, "")
+	// Force exec: bare-struct Runner, execFunc-only — see
+	// TestRestartControllerDeploymentResolvesViaPodLabel's doc comment for
+	// why the default client-go routing cannot be used here.
+	t.Setenv(kubeBackendEnvVar, "exec")
 
 	r := &Runner{
 		execFunc: func(args []string) (string, error) {
@@ -2967,6 +2994,13 @@ func TestResolveControllerDeploymentName(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv(providerDeploymentEnvVar, tc.override)
+			// Force exec: this table drives its pod fixtures (tc.pods)
+			// through fakeCluster's own "get pods" handler, which the
+			// exec backend reaches via the wrapped execFunc below. The
+			// default client-go routing would instead hit newFakeRunner's
+			// fixed single-Pod fixture and could not express an ambiguous
+			// or empty pod set.
+			t.Setenv(kubeBackendEnvVar, "exec")
 
 			f := &fakeCluster{providerPods: tc.pods}
 			r := newFakeRunner(f)
@@ -3129,6 +3163,12 @@ func TestLatestControllerPodIdentity(t *testing.T) {
 // parse the newest entry out of the result.
 func TestResolveControllerPodIdentityLive(t *testing.T) {
 	t.Setenv(providerDeploymentEnvVar, "")
+	// Force exec: bare-struct Runner, execFunc-only — see
+	// TestRestartControllerDeploymentResolvesViaPodLabel's doc comment for
+	// why the default client-go routing cannot be used here. The client-go
+	// path itself is proven separately by
+	// TestClientGoControllerRevisionLabelsAndPodIdentities.
+	t.Setenv(kubeBackendEnvVar, "exec")
 
 	var gotPodArgs []string
 	r := &Runner{
@@ -3171,6 +3211,10 @@ func TestResolveControllerPodIdentityLive(t *testing.T) {
 // zero-value identity.
 func TestResolveControllerPodIdentityLivePropagatesDeploymentResolutionFailure(t *testing.T) {
 	t.Setenv(providerDeploymentEnvVar, "")
+	// Force exec: bare-struct Runner, execFunc-only — see
+	// TestRestartControllerDeploymentResolvesViaPodLabel's doc comment for
+	// why the default client-go routing cannot be used here.
+	t.Setenv(kubeBackendEnvVar, "exec")
 
 	r := &Runner{
 		execFunc: func(args []string) (string, error) {

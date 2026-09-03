@@ -747,7 +747,7 @@ const conditionTypeSynced = "Synced"
 // arrive.
 //
 // The (bool, ..., error) shape mirrors waitGenerationSettled and waitReady
-// deliberately: err is reserved for a genuine kubectl/parse failure, and a
+// deliberately: err is reserved for a genuine API/parse failure, and a
 // plain timeout — the resource is still catching up — is reported as
 // synced=false with no error, so each caller decides for itself whether
 // "still catching up" should fail outright (reconcileOnce, mid a field
@@ -782,8 +782,8 @@ func (r *Runner) waitSynced(timeout time.Duration) (synced bool, status string, 
 
 // countUpdateEvents counts occurrences of update-related events for the
 // given involvedObject kind/name/namespace/apiVersion, whose reason is
-// UpdatedExternalResource or CannotUpdateExternalResource. The kubectl list
-// itself queries across all namespaces (see countEventsByReason); namespace
+// UpdatedExternalResource or CannotUpdateExternalResource. The list itself
+// queries across all namespaces (see countEventsByReason); namespace
 // and apiVersion are what actually scope the count to one resource. Pass
 // namespace="" for a cluster-scoped resource — that matches only events
 // whose involvedObject itself carries no namespace, never "any namespace".
@@ -828,8 +828,9 @@ type reconcileRequest struct {
 }
 
 // updateLogWindowSlack widens the log QUERY past the convergence window,
-// because kubectl's --since takes whole seconds and a line written a
-// fraction before the window opened would otherwise be lost to rounding.
+// because PodLogOptions.SinceSeconds (the same field kubectl's own --since
+// flag sets) takes whole seconds and a line written a fraction before the
+// window opened would otherwise be lost to rounding.
 // Widening the query is safe in a way it previously was not: attribution no
 // longer trusts the query's own boundary. countUpdateLogLinesIn discards
 // every line timestamped at or before the barrier's own ArmedAt, so a wider
@@ -889,8 +890,8 @@ func (r *Runner) countUpdateLogCalls(m *manifest.Manifest, window time.Duration,
 // it, because it describes something that happened before this window
 // opened — most commonly the test harness's own pre-arm mutation (a
 // post-assert rename immediately preceding the barrier) landing inside
-// kubectl's whole-second --since rounding, which is exactly the false
-// RECONCILIATION LOOP this anchor exists to stop. A line whose leading
+// PodLogOptions.SinceSeconds's whole-second rounding, which is exactly the
+// false RECONCILIATION LOOP this anchor exists to stop. A line whose leading
 // timestamp cannot be parsed is KEPT rather than discarded — the anchor
 // exists to narrow an over-wide query, never to suppress a signal it cannot
 // itself place in time — so an unparseable timestamp degrades to the

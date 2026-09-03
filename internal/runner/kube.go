@@ -35,10 +35,11 @@ import (
 	watchtools "k8s.io/client-go/tools/watch"
 )
 
-// KubeClient is the typed seam over every kubectl operation Runner needs.
-// It exists so a future backend (e.g. an in-process client-go client) can
-// replace how these operations are carried out without touching any of the
-// call sites that use them — only the backend construction changes.
+// KubeClient is the typed seam over every cluster operation Runner needs,
+// implemented today by a single in-process client-go client. It exists so a
+// different implementation could replace how these operations are carried
+// out without touching any of the call sites that use them — only the
+// backend construction changes.
 //
 // Each method takes the resource's namespace explicitly rather than reading
 // it off a shared field, because the backend has no notion of "the current
@@ -440,21 +441,21 @@ func manifestResourceIdentifier(gvr schema.GroupVersionResource, name string) st
 // dynamic Get per document — never a YAML decode alone.
 //
 // `kubectl get -f <manifest>` is a LIVE lookup of every document, not a
-// parse of the file. Measured against a real cluster ahead of this
-// implementation (a two-document manifest, second object deleted):
-// kubectl printed NOTHING on stdout for the whole invocation and exited
-// non-zero the moment the second document failed to resolve, even though
-// the FIRST document's object still existed — a manifest containing both
-// present objects printed both lines, in document order, on a clean exit.
-// A decode-and-map implementation that never touches the cluster cannot
-// reproduce the failing case: it would print a line for every document
-// regardless of whether the object was ever created, changing exactly the
-// lines selectResourceName sees, and only on a manifest where some
-// document does not exist. This implementation reproduces the measured
-// behaviour by construction, not by special-casing it: it Gets each
-// document in order and returns the first error immediately, with no
-// partial output — there is no separate "accumulate then decide" step for
-// a special case to hide in.
+// parse of the file. Measured once, directly with the kubectl CLI against a
+// real cluster, ahead of writing this implementation (a two-document
+// manifest, second object deleted): the kubectl CLI printed NOTHING on
+// stdout for that invocation and exited non-zero the moment the second
+// document failed to resolve, even though the FIRST document's object still
+// existed — a manifest containing both present objects printed both lines,
+// in document order, on a clean exit. A decode-and-map implementation that
+// never touches the cluster cannot reproduce the failing case: it would
+// print a line for every document regardless of whether the object was ever
+// created, changing exactly the lines selectResourceName sees, and only on
+// a manifest where some document does not exist. This implementation
+// reproduces that measured behaviour by construction, not by
+// special-casing it: it Gets each document in order and returns the first
+// error immediately, with no partial output — there is no separate
+// "accumulate then decide" step for a special case to hide in.
 func (c *clientGoKubeClient) ResolveManifestName(namespace, manifestPath string) (string, error) {
 	// #nosec G304 -- manifestPath is an operator-supplied example manifest
 	// path, not attacker-controlled input.
@@ -542,8 +543,8 @@ func (c *clientGoKubeClient) GetObjectJSON(namespace, name string) (string, erro
 // explicit `null` (a removal) and an absent key (a no-op) collapse into the
 // same Go zero value, and every clear/withValues patch this tool builds
 // depends on that distinction surviving. A rejected patch (e.g. an HTTP 400)
-// is returned as a non-nil error, unwrapped into no special case — exactly
-// how a rejected kubectl patch's non-zero exit reaches every caller today.
+// is returned as a non-nil error, unwrapped into no special case — the same
+// shape a rejected `kubectl patch`'s non-zero exit takes at every caller.
 func (c *clientGoKubeClient) PatchMerge(namespace, name, patchJSON string) (string, error) {
 	return c.dynamicMergePatch(namespace, name, patchJSON)
 }

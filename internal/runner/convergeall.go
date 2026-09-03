@@ -21,9 +21,10 @@ type ConvergeTarget struct {
 }
 
 // ConvergeAllResult is one target's verdict. Exactly one of Result and Err
-// is non-nil: Err carries a failure to *evaluate* the resource (kubectl
-// error, unresolvable manifest), which is distinct from a ConvergeResult
-// whose Passed is false — a verdict the check reached successfully.
+// is non-nil: Err carries a failure to *evaluate* the resource (a client-go
+// read error, unresolvable manifest), which is distinct from a
+// ConvergeResult whose Passed is false — a verdict the check reached
+// successfully.
 type ConvergeAllResult struct {
 	Label  string
 	Result *ConvergeResult
@@ -31,10 +32,11 @@ type ConvergeAllResult struct {
 }
 
 // defaultConvergeAllConcurrency bounds how many resources are armed or
-// asserted at once. Each step shells out to kubectl, so this is a cap on
-// concurrent processes rather than on anything the cluster experiences; the
-// API server handles far more, but an unbounded fan-out over a 65-resource
-// provider would spawn 65 processes per phase on a 5-vCPU nest.
+// asserted at once. Every step reads through the one long-lived client-go
+// client behind the shared QPS/Burst limiter kubeRESTConfig sets, so this
+// now caps in-flight API-server requests rather than concurrent processes —
+// an unbounded fan-out over a 65-resource provider would still queue behind
+// that shared limiter, but this keeps the fan-out itself bounded too.
 const defaultConvergeAllConcurrency = 8
 
 // RunConvergeAll evaluates every target against a SINGLE shared observation
@@ -52,8 +54,8 @@ const defaultConvergeAllConcurrency = 8
 //
 // # Why it is safe
 //
-// convergeArm and convergeAssert perform reads only — kubectl get on the
-// resource and on its events. Neither mutates the cluster or the backend,
+// convergeArm and convergeAssert perform reads only — a client-go get on
+// the resource and on its events. Neither mutates the cluster or the backend,
 // so no target can perturb another's observation, and the checks may be
 // interleaved freely. This is what distinguishes convergence from the
 // per-field update tests in RunTests, which patch the resource under test

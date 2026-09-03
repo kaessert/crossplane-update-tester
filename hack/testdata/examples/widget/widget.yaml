@@ -4,8 +4,8 @@
 # (converge → run → converge) for this manifest and skip both identity checks.
 #
 # Being namespaced also exercises the runner's namespace handling: every
-# kubectl call for this resource carries "-n <namespace>", which the
-# cluster-scoped network-v6 example never produces.
+# client-go call for this resource is scoped to its namespace, which the
+# cluster-scoped network-v6 example never exercises.
 apiVersion: widget.example.crossplane.io/v1alpha1
 kind: Widget
 metadata:

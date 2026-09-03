@@ -1,10 +1,9 @@
 // Command faketestserver is an in-memory, HTTP-served stand-in for a
 // Kubernetes API server, used ONLY by hack/smoke-test.sh to drive the real
 // compiled crossplane-update-tester binary — via an ordinary kubeconfig
-// pointed at this process — with no live cluster and no exec-forced
-// kubectl transcript. It exists so the smoke test can exercise the
-// project's DEFAULT client-go backend end to end (stub module, symlinked
-// hook, `go -C`, real binary) instead of the retired exec backend.
+// pointed at this process — with no live cluster required. It exists so the
+// smoke test can exercise the project's client-go backend end to end (stub
+// module, symlinked hook, `go -C`, real binary).
 //
 // It is deliberately NOT a general-purpose fake API server: it serves
 // exactly the requests this project's own client-go backend issues against
@@ -13,8 +12,7 @@
 // spec.forProvider merge patch bumps metadata.generation, is mirrored into
 // status.atProvider, and emits one UpdatedExternalResource event; the
 // object is always Ready), and does not attempt to be a real apiserver.
-// The failure-injection scenarios (drift/stuck/loop/wipe) this project
-// used to simulate through hack/testdata/fake-kubectl.sh now live as
+// The failure-injection scenarios (drift/stuck/loop/wipe) are covered as
 // internal/runner unit tests against the client-go fake clientset/dynamic
 // client — see internal/runner's own *_test.go files — because those
 // scenarios exercise this tool's OWN evidence logic, not the shape of an
@@ -74,10 +72,9 @@ func findKindByGroup(group string) (gvkInfo, bool) {
 }
 
 // storedObject is one live fixture object: the JSON tree a GET renders,
-// plus the bookkeeping fields (external-name, paused, event counters) the
-// original hack/testdata/fake-kubectl.sh modelled as separate files under
-// its per-resource state directory. See render and patchMerge for the
-// exact behaviour this reproduces.
+// plus the bookkeeping fields (external-name, paused, event counters) that
+// model a single resource's persisted state in memory. See render and
+// patchMerge for the exact behaviour this implements.
 type storedObject struct {
 	mu sync.Mutex
 
@@ -109,9 +106,9 @@ func (o *storedObject) key(group string) string {
 // as a `GET` (or the synthetic ADDED event a watch opens with) would
 // return it: external-name/paused folded into metadata.annotations, and
 // status.conditions computed fresh from the current generation rather than
-// stored — this fake's "controller" reconciles instantly, exactly like
-// fake-kubectl.sh's render_object did, and a ClearConditions status patch
-// (see patchStatus) is a deliberate no-op for the same reason.
+// stored — this fake's "controller" reconciles instantly, so a
+// ClearConditions status patch (see patchStatus) is a deliberate no-op for
+// the same reason.
 func (o *storedObject) render() map[string]interface{} {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -153,8 +150,8 @@ func (o *storedObject) render() map[string]interface{} {
 }
 
 // patchMerge applies an RFC 7386 merge-patch document to the object's main
-// body, reproducing fake-kubectl.sh's cmd_patch dispatch: a
-// spec.forProvider change is mirrored into status.atProvider (uppercased
+// body: a spec.forProvider change is mirrored into status.atProvider
+// (uppercased
 // when the field is named in uppercaseFields, exercising a manifest entry
 // whose declared `expect:` differs from its `value:`) and bumps
 // metadata.generation and the update-event counter exactly once per call;
@@ -280,11 +277,10 @@ func newServerState(uppercaseFields map[string]bool) *serverState {
 // seedFromDir walks dir for YAML manifests and materialises one
 // storedObject per document whose Kind is registered (see
 // registeredKinds), mirroring spec.forProvider into status.atProvider —
-// exactly hack/testdata/fake-kubectl.sh's seed_from_manifest, run once at
-// startup instead of lazily on first read, because this server (unlike
-// that per-invocation script) has no per-request access to the manifest
-// path: the request carries only the resolved GVK/namespace/name a
-// document was already required to declare.
+// done once at startup rather than lazily on first read, because this
+// server has no per-request access to the manifest path: the request
+// carries only the resolved GVK/namespace/name a document was already
+// required to declare.
 func (s *serverState) seedFromDir(dir string) error {
 	return filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {

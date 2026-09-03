@@ -3,17 +3,17 @@
 A command-line tool that validates the `Update()` path of a Crossplane v2
 provider during end-to-end test runs.
 
-It drives everything through `kubectl` and annotations placed on the provider's
-own example manifests. It contains no knowledge of any particular provider,
-API group, or backend, so a single copy serves every provider that follows the
-annotation convention.
+It drives everything through a direct client-go connection to the cluster and
+annotations placed on the provider's own example manifests. It contains no
+knowledge of any particular provider, API group, or backend, so a single copy
+serves every provider that follows the annotation convention.
 
 Everything it asserts is derived from two sources:
 
 - the example manifest under test (`apiVersion`, `kind`, `metadata.name`,
   `metadata.namespace`, and the annotations described below), and
-- the live cluster, read via `kubectl` — the managed resource's
-  `spec.forProvider`, `status.atProvider`, `metadata.generation`,
+- the live cluster, read via a direct client-go connection — the managed
+  resource's `spec.forProvider`, `status.atProvider`, `metadata.generation`,
   `status.conditions[].observedGeneration`, and the Kubernetes Events that
   `crossplane-runtime`'s managed reconciler emits.
 
@@ -219,7 +219,7 @@ appears while several controllers are reconciling at once falls between the
 windows and is never seen. `converge-all` observes every resource over the
 same stretch instead, which is both faster and a strictly stronger check.
 
-This is safe because convergence performs `kubectl` reads only — no patches,
+This is safe because convergence performs client-go reads only — no patches,
 no controller restarts. No target can perturb another's observation, so every
 target's arm and assert step can be interleaved freely.
 
@@ -247,9 +247,11 @@ The steps:
    it does not reopen or extend the shared window for anyone else.
 
 `--concurrency` (default `8`) bounds how many targets are armed or asserted at
-once. Each step shells out to `kubectl`, so this caps concurrent processes, not
-anything the API server itself experiences — an unbounded fan-out over a large
-catalog would spawn one process per resource per phase.
+once. Every step reads through the one long-lived client-go client behind the
+shared QPS/Burst limiter this tool applies, so this now caps in-flight
+API-server requests, not concurrent processes — an unbounded fan-out over a
+large catalog would still be bounded by that shared limiter, but this keeps
+the fan-out itself bounded too.
 
 `--ignore-fields` here is a FLEET-WIDE default, unioned onto every target's own
 per-manifest `ignore-fields:` directive rather than replacing it. It is
@@ -668,8 +670,8 @@ difference inside one array element (a backend adding a sibling key to one
 list entry) surfaces as `value-changed` on the array's own path, not as a
 separate per-element sub-path.
 
-This command is entirely read-only (`kubectl get`, nothing else) and, like
-the check it replaced, is always advisory: a finding is printed, never a
+This command is entirely read-only (a single client-go get, nothing else) and,
+like the check it replaced, is always advisory: a finding is printed, never a
 reason to fail. `converge-all` inlines the same report next to a **FAILING**
 target's own verdict line when `UPDATE_TESTER_ROOT` is set — see
 "Environment" below — so the finding is visible at the moment the run
@@ -1493,9 +1495,10 @@ including in E2E logs when a result needs explaining after the fact.
 ## Contributing
 
 - `go test ./...` must pass. The packages are unit-testable without a cluster:
-  `kubectl` invocations go through an injectable exec function, and the
-  filesystem-dependent derivation rules are tested against real temporary
-  trees.
+  the client-go clientset, dynamic client and pod-log stream are all
+  constructed through injectable seams that tests replace with in-memory
+  fakes, and the filesystem-dependent derivation rules are tested against
+  real temporary trees.
 - **Keep it dependency-light.** The only non-stdlib dependency is
   `gopkg.in/yaml.v3`, and it should stay that way. This tool is built from
   source inside every E2E run of every consuming provider; each added

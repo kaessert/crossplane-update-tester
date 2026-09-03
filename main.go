@@ -278,7 +278,7 @@ type runOptions struct {
 // silently discarded by flag.FlagSet.Parse.
 func parseRunArgs(args []string) (runOptions, error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
-	timeout := fs.Int("timeout", 120, "Timeout in seconds for kubectl wait")
+	timeout := fs.Int("timeout", 120, "Timeout in seconds waiting for the resource to become Ready")
 	pollInterval := fs.Duration("poll-interval", 60*time.Second,
 		"Provider poll interval; calibrates the slow-observe annotation. Does NOT change what run waits for — that is --timeout")
 	if err := fs.Parse(cli.ReorderArgs(fs, args)); err != nil {
@@ -1026,7 +1026,7 @@ const defaultBatchCLIParallel = 1
 
 func parseBatchArgs(args []string) (batchOptions, error) {
 	fs := flag.NewFlagSet("batch", flag.ContinueOnError)
-	timeout := fs.Int("timeout", 120, "Timeout in seconds for kubectl wait, applied to every fixture")
+	timeout := fs.Int("timeout", 120, "Timeout in seconds waiting for Ready, applied to every fixture")
 	pollInterval := fs.Duration("poll-interval", 60*time.Second,
 		"Provider poll interval; calibrates the slow-observe annotation for every fixture")
 	parallel := fs.Int("parallel", defaultBatchCLIParallel,
@@ -1163,7 +1163,7 @@ type timeoutOptions struct {
 
 func parseTimeoutArgs(command string, defaultTimeout int, usage string, args []string) (timeoutOptions, error) {
 	fs := flag.NewFlagSet(command, flag.ContinueOnError)
-	timeout := fs.Int("timeout", defaultTimeout, "Timeout in seconds for kubectl calls")
+	timeout := fs.Int("timeout", defaultTimeout, "Timeout in seconds for cluster reads")
 	if err := fs.Parse(cli.ReorderArgs(fs, args)); err != nil {
 		return timeoutOptions{}, err
 	}
@@ -1287,7 +1287,7 @@ type roundtripDiffOptions struct {
 func parseRoundtripDiffArgs(args []string) (roundtripDiffOptions, error) {
 	fs := flag.NewFlagSet("roundtrip-diff", flag.ContinueOnError)
 	root := fs.String("root", "", "Provider repo root holding package/crds (default: working directory)")
-	timeout := fs.Int("timeout", 30, "Timeout in seconds for kubectl calls")
+	timeout := fs.Int("timeout", 30, "Timeout in seconds for cluster reads")
 	if err := fs.Parse(cli.ReorderArgs(fs, args)); err != nil {
 		return roundtripDiffOptions{}, err
 	}
@@ -1320,8 +1320,8 @@ func parseRoundtripDiffArgs(args []string) (roundtripDiffOptions, error) {
 }
 
 // cmdRoundtripDiff prints the advisory spec.forProvider <-> status.atProvider
-// round-trip report for one or more already-live manifests — one `kubectl
-// get` per manifest, plus a scan of --root/package/crds to find each one's
+// round-trip report for one or more already-live manifests — one client-go
+// get per manifest, plus a scan of --root/package/crds to find each one's
 // CRD. Like the Python tool it replaces (see package roundtrip's doc
 // comment), this is read-only end to end and its own exit status reflects
 // only whether it could RUN, never what it found: a manifest that cannot be
@@ -1390,7 +1390,7 @@ type roundtripVerifyOptions struct {
 func parseRoundtripVerifyArgs(args []string) (roundtripVerifyOptions, error) {
 	fs := flag.NewFlagSet("roundtrip-verify", flag.ContinueOnError)
 	root := fs.String("root", "", "Provider repo root holding package/crds (default: working directory)")
-	timeout := fs.Int("timeout", 30, "Timeout in seconds for kubectl calls")
+	timeout := fs.Int("timeout", 30, "Timeout in seconds for cluster reads")
 	backend := fs.String("backend", "", "REQUIRED. Declared backend classification for cell-denominator provenance: real or simulator")
 	if err := fs.Parse(cli.ReorderArgs(fs, args)); err != nil {
 		return roundtripVerifyOptions{}, err
@@ -1758,7 +1758,7 @@ func manifestScope(m *manifest.Manifest) string {
 // rows) so the full report shape — including every cell-denominator field
 // this ticket adds — is unit-testable without a live cluster. See
 // CheckExternalNamePrefix's own doc comment for why this carve-out exists:
-// the edge cases need proving without kubectl.
+// the edge cases need proving without a live cluster.
 //
 // anyFindings mirrors cmdRoundtripVerify's own exit-code decision and is
 // derived SOLELY from findings (roundtrip.DenominatorReport's own

@@ -242,16 +242,16 @@ func (r *Runner) ResolveResource(m *manifest.Manifest) error {
 	return nil
 }
 
-// selectResourceName picks the `kubectl get -o name` line that identifies
-// the manifest document under test.
+// selectResourceName picks the `kubectl get -o name`-shaped line that
+// identifies the manifest document under test.
 //
 // Lines are matched on the bare object name first, because that is what the
 // manifest parser keys on. A name collision between documents is normal
 // (a managed resource and its companion Secret are routinely named alike),
 // so the kind breaks the tie. An output that still cannot be narrowed to
 // exactly one line is reported as an error: any pick made here is silently
-// carried by every later kubectl call in the run, so a wrong pick would
-// report results for an object nobody asked about.
+// carried by every later call against this resource in the run, so a wrong
+// pick would report results for an object nobody asked about.
 func selectResourceName(out, kind, name string) (string, error) {
 	var byName []string
 	for _, line := range strings.Split(out, "\n") {
@@ -266,7 +266,7 @@ func selectResourceName(out, kind, name string) (string, error) {
 
 	switch len(byName) {
 	case 0:
-		return "", fmt.Errorf("kubectl returned no object named %q (kind %s); output was %q",
+		return "", fmt.Errorf("no object named %q (kind %s) was resolved; output was %q",
 			name, kind, strings.TrimSpace(out))
 	case 1:
 		return byName[0], nil
@@ -281,7 +281,7 @@ func selectResourceName(out, kind, name string) (string, error) {
 	if len(byKind) == 1 {
 		return byKind[0], nil
 	}
-	return "", fmt.Errorf("kubectl returned %d objects named %q (%s) and none of them uniquely matches kind %q",
+	return "", fmt.Errorf("%d objects named %q (%s) were resolved and none of them uniquely matches kind %q",
 		len(byName), name, strings.Join(byName, ", "), kind)
 }
 
@@ -326,10 +326,11 @@ func resourceTypeMatchesKind(resourceType, kind string) bool {
 // Snapshot reads the current status.atProvider as JSON bytes, for the
 // differ to compare against a later one.
 //
-// It fetches the whole object with `kubectl get -o json` and marshals the
-// subtree here, for the same reason ReadField parses the object itself: no
-// read in this package depends on how a given kubectl renders a non-scalar
-// value. The stakes are highest for this one, because these bytes go
+// It fetches the whole object via GetObjectJSON and marshals the subtree
+// here, for the same reason ReadField parses the object itself: no read in
+// this package depends on how a jsonpath expression would render a
+// non-scalar value. The stakes are highest for this one, because these
+// bytes go
 // straight to a JSON parser — a Go-syntax rendering would fail every
 // convergence check while PARSING the snapshot rather than reporting a
 // verdict, so the check would lose its meaning rather than its formatting.
@@ -480,18 +481,19 @@ func (r *Runner) ExternalName() (string, error) {
 	return name, nil
 }
 
-// ReadField reads a single field from status.atProvider by fetching the whole
-// object with `kubectl get -o json` and parsing it here, rather than asking
-// kubectl to extract the field with a jsonpath expression. Parsing the object
-// ourselves keeps the result independent of how kubectl renders a non-scalar
-// jsonpath result, which has changed across kubectl versions: kubectl before
-// ~1.21 printed nested objects in Go syntax ("map[key:value]"), while current
+// ReadField reads a single field from status.atProvider by fetching the
+// whole object via GetObjectJSON and parsing it here, rather than
+// extracting the field with a jsonpath expression the way `kubectl -o
+// jsonpath` would. Parsing the object ourselves keeps the result
+// independent of how a jsonpath renderer treats a non-scalar result, which
+// has changed across kubectl versions historically: kubectl before ~1.21
+// printed nested objects in Go syntax ("map[key:value]"), while current
 // versions JSON-marshal them. Complex types (maps, arrays) come back as
 // canonical JSON; scalars (string, number, bool) as their unquoted value.
 //
 // Snapshot does the same for the whole subtree, so this is the rule for the
-// package rather than a local choice: kubectl is asked for objects, and any
-// value that is not a scalar is rendered here.
+// package rather than a local choice: any value that is not a scalar is
+// rendered the same way here.
 func (r *Runner) ReadField(field string) (string, error) {
 	obj, err := r.GetObject()
 	if err != nil {
@@ -532,9 +534,10 @@ func (r *Runner) readCurrentValue(field string) (string, error) {
 
 // stringifyFieldValue converts a decoded-JSON value into the string
 // representation used throughout this package for comparisons: strings are
-// returned unquoted (consistent with kubectl jsonpath behaviour and how YAML
-// annotation values are represented), everything else (numbers, booleans,
-// maps, arrays, and nil) is returned as canonical JSON.
+// returned unquoted (consistent with kubectl's own jsonpath output
+// convention and how YAML annotation values are represented), everything
+// else (numbers, booleans, maps, arrays, and nil) is returned as canonical
+// JSON.
 func stringifyFieldValue(val interface{}, field string) (string, error) {
 	if val == nil {
 		return "", nil
@@ -1269,32 +1272,6 @@ func (r *Runner) resolveControllerPodIdentityLive() (controllerPodIdentity, erro
 	return identity, nil
 }
 
-// parseControllerPodIdentities parses the "<pod-name>\t<creationTimestamp>"
-// lines resolveControllerPodIdentityLive's kubectl query produces, one per
-// Pod. A line whose timestamp component is missing or fails to parse as
-// RFC3339 (the format kubectl's jsonpath always emits for a
-// metav1.Time) reports a zero CreatedAt rather than an error — read by
-// every caller as "very old", the correct conservative default for a
-// shape this parser cannot otherwise make sense of.
-func parseControllerPodIdentities(out string) []controllerPodIdentity {
-	var identities []controllerPodIdentity
-	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		parts := strings.SplitN(line, "\t", 2)
-		id := controllerPodIdentity{Name: parts[0]}
-		if len(parts) == 2 {
-			if ts, err := time.Parse(time.RFC3339, strings.TrimSpace(parts[1])); err == nil {
-				id.CreatedAt = ts
-			}
-		}
-		identities = append(identities, id)
-	}
-	return identities
-}
-
 // latestControllerPodIdentity returns whichever identity carries the
 // greatest CreatedAt — the Pod currently running, since an older entry can
 // only be one mid-termination during a rollout (see
@@ -1329,7 +1306,7 @@ func (r *Runner) runFieldTest(t manifest.UpdateTest, snapshot []byte, kind, name
 	// Determine expected value for comparison and display.
 	// Use JSON equality (jsonEqual) to handle complex types (maps, arrays)
 	// where fmt.Sprintf("%v") produces Go-format strings (map[key:val])
-	// that don't match the JSON returned by kubectl.
+	// that don't match the canonical JSON GetObjectJSON returns.
 	expectedVal := t.Value
 	if t.Expect != nil {
 		expectedVal = t.Expect
@@ -1462,7 +1439,7 @@ func (r *Runner) applyPatchAndReconcile(t manifest.UpdateTest) error {
 // Clearing BEFORE nudging matters independently of that gap: NudgeReconcile's
 // annotation patch can trigger a reconcile that completes (Observe + status
 // write) within milliseconds — often faster than this process can issue its
-// own next kubectl call. Clearing conditions after the nudge would then have
+// own next API call. Clearing conditions after the nudge would then have
 // a real chance of wiping the fresh Ready condition the nudge just produced,
 // forcing WaitReady to fall back on the provider's background poll tick —
 // exactly the failure mode this whole sequence exists to avoid. Clearing
@@ -1577,8 +1554,8 @@ const evidenceRetryInterval = 2 * time.Second
 // the involvedObject match itself) or was still climbing when the deadline
 // hit (pointing at the window being too short). The log line turns that
 // question into something a rerun answers directly instead of by
-// reconstructing it from `kubectl get events` timestamps captured after the
-// cluster is already gone.
+// reconstructing it from a manual `kubectl get events` after the fact, with
+// the cluster already gone.
 func (r *Runner) evidenceOutcome(kind, name, namespace, apiVersion string, eventsBefore int, eventsBeforeErr error) (checked, evidenced bool, err error) {
 	if eventsBeforeErr != nil {
 		return false, false, fmt.Errorf("counting update events before patch: %w", eventsBeforeErr)
@@ -1651,7 +1628,7 @@ func (r *Runner) pollField(field string, expectedVal interface{}, start time.Tim
 // CheckExternalNamePrefix classifies a live external-name annotation value
 // against the prefix a manifest declares it must have (via the
 // crossplane.io/expect-external-name-prefix annotation). It is a pure
-// function — no kubectl calls — so the negative path (mismatch, empty
+// function — no cluster calls — so the negative path (mismatch, empty
 // name) is exercised by a plain unit test rather than requiring a live
 // cluster or a deliberately broken controller build to prove the check can
 // actually fail. The CLI wraps it to check a live resource's ExternalName().

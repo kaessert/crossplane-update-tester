@@ -120,10 +120,10 @@ type KubeClient interface {
 	// the client-go backend (clientGoKubeClient.RolloutRestart/
 	// RolloutStatus below), which is what a default (non-forced-exec)
 	// Runner reaches. The exec implementation on execKubeClient is left
-	// unchanged alongside it: a smoke-test harness that forces the exec
-	// backend still asserts on the exact kubectl argv these two issue,
-	// and that assertion remains valid coverage of the exec code path for
-	// as long as it exists.
+	// unchanged alongside it as the rollback path kubeBackendEnvVar
+	// exists to offer; the exact kubectl argv these two issue is asserted
+	// by internal/runner's own exec-backend unit tests, not by any
+	// harness under hack/.
 	RolloutRestart(namespace, target string) (string, error)
 	RolloutStatus(namespace, target, timeout string) (string, error)
 }

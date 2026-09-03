@@ -632,6 +632,136 @@ func TestParseGoTypes(t *testing.T) {
 	}
 }
 
+// snippetTypesUnbalancedCommentSrc reproduces the exact shape found in
+// provider-f5xc's IRuleParameters: a doc comment, immediately preceding the
+// struct's LAST field, that quotes a snippet of another language (TCL)
+// carrying more "}" than "{". Brace-depth tracking that counts characters
+// across the whole line — comments included — reads the unbalanced "}" as
+// the struct's own closing brace and stops several lines early, silently
+// dropping every field after the comment. The trailing "code" field here
+// must still be parsed.
+const snippetTypesUnbalancedCommentSrc = `package v1alpha1
+
+// SnippetParameters are the configurable fields of a Snippet.
+type SnippetParameters struct {
+	Name *string ` + "`json:\"name\"`" + `
+
+	// www.internal.example.f5.com")} DNS::drop}
+	// snippet content
+	Code *string ` + "`json:\"code,omitempty\"`" + `
+}
+`
+
+// TestParseGoTypesCommentWithUnbalancedBrace is the regression test for the
+// IRuleParameters truncation this ticket fixes: a struct whose doc comment
+// carries a net-unbalanced "}" must not end struct parsing before the
+// struct's real closing brace, and every field after that comment —
+// "code" here — must still be returned.
+func TestParseGoTypesCommentWithUnbalancedBrace(t *testing.T) {
+	path := writeFixture(t, "snippet_types.go", snippetTypesUnbalancedCommentSrc)
+
+	fields, err := ParseGoTypes(path, "Snippet")
+	if err != nil {
+		t.Fatalf("ParseGoTypes: %v", err)
+	}
+
+	want := []FieldInfo{
+		{GoName: "Name", JSONName: fieldName, GoType: "*string"},
+		{GoName: "Code", JSONName: "code", GoType: "*string", Omitempty: true},
+	}
+	if len(fields) != len(want) {
+		t.Fatalf("got %d fields, want %d (the field after the unbalanced-brace comment must not be dropped): %+v", len(fields), len(want), fields)
+	}
+	for i, w := range want {
+		if fields[i] != w {
+			t.Errorf("field %d: got %+v, want %+v", i, fields[i], w)
+		}
+	}
+}
+
+// snippetTypesBalancedCommentSrc is the non-regression counterpart: a doc
+// comment carrying a BALANCED "{}" pair in ordinary prose (e.g. "pass an
+// empty `{}`") is common and must not change parsing behaviour — the net
+// brace delta it contributes is zero either way, so the trailing field must
+// still be parsed exactly as it always was.
+const snippetTypesBalancedCommentSrc = `package v1alpha1
+
+// SnippetParameters are the configurable fields of a Snippet.
+type SnippetParameters struct {
+	Name *string ` + "`json:\"name\"`" + `
+
+	// Config accepts an empty {} object to reset to defaults.
+	Config *string ` + "`json:\"config,omitempty\"`" + `
+}
+`
+
+// TestParseGoTypesCommentWithBalancedBraces confirms a comment carrying a
+// balanced brace pair is not a regression case: both fields, including the
+// one following the comment, are still parsed.
+func TestParseGoTypesCommentWithBalancedBraces(t *testing.T) {
+	path := writeFixture(t, "snippet_types.go", snippetTypesBalancedCommentSrc)
+
+	fields, err := ParseGoTypes(path, "Snippet")
+	if err != nil {
+		t.Fatalf("ParseGoTypes: %v", err)
+	}
+
+	want := []FieldInfo{
+		{GoName: "Name", JSONName: fieldName, GoType: "*string"},
+		{GoName: "Config", JSONName: "config", GoType: "*string", Omitempty: true},
+	}
+	if len(fields) != len(want) {
+		t.Fatalf("got %d fields, want %d: %+v", len(fields), len(want), fields)
+	}
+	for i, w := range want {
+		if fields[i] != w {
+			t.Errorf("field %d: got %+v, want %+v", i, fields[i], w)
+		}
+	}
+}
+
+// TestStripLineComment covers the brace-tracking helper directly: an
+// unquoted "//" starts a comment, a "//" inside a backtick-quoted struct
+// tag (e.g. a tag carrying a "https://..." default value) is not mistaken
+// for one, and a line with no "//" at all is returned unchanged.
+func TestStripLineComment(t *testing.T) {
+	cases := map[string]struct {
+		reason string
+		line   string
+		want   string
+	}{
+		"PlainCommentLine": {
+			reason: "a full comment line is stripped entirely",
+			line:   `// www.internal.example.f5.com")} DNS::drop}`,
+			want:   "",
+		},
+		"TrailingComment": {
+			reason: "code before a trailing comment is preserved, the comment is not",
+			line:   `Name *string ` + "`json:\"name\"`" + ` // trailing note }`,
+			want:   `Name *string ` + "`json:\"name\"`" + ` `,
+		},
+		"NoComment": {
+			reason: "a line with no // is returned unchanged",
+			line:   `Name *string ` + "`json:\"name\"`",
+			want:   `Name *string ` + "`json:\"name\"`",
+		},
+		"SlashesInsideBacktickTag": {
+			reason: "a // inside a backtick-quoted struct tag (e.g. a URL default) is not a comment marker",
+			line:   "Endpoint *string `json:\"endpoint\" default:\"https://example.com\"`",
+			want:   "Endpoint *string `json:\"endpoint\" default:\"https://example.com\"`",
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := stripLineComment(tc.line)
+			if got != tc.want {
+				t.Errorf("%s: stripLineComment(%q) = %q, want %q", tc.reason, tc.line, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestParseGoTypesStructNotFound confirms a clear error when the target
 // Parameters struct doesn't exist in the file.
 func TestParseGoTypesStructNotFound(t *testing.T) {

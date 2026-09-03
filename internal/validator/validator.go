@@ -181,8 +181,13 @@ func (p *goTypesParser) handleLine(line string) {
 		return
 	}
 
-	// Track brace depth to detect the end of the current struct.
-	p.braceDepth += strings.Count(line, "{") - strings.Count(line, "}")
+	// Track brace depth to detect the end of the current struct. Braces are
+	// counted only in the code portion of the line — see
+	// stripLineComment — so a doc comment quoting unbalanced brace
+	// characters (e.g. a snippet of another language embedded in a field's
+	// doc comment) cannot be mistaken for the struct's own closing brace.
+	codeOnly := stripLineComment(line)
+	p.braceDepth += strings.Count(codeOnly, "{") - strings.Count(codeOnly, "}")
 	if p.braceDepth <= 0 {
 		if p.inTarget {
 			// Done parsing the target struct.
@@ -237,6 +242,30 @@ func (p *goTypesParser) parseFieldLine(line string) {
 	default:
 		p.prevLines = nil
 	}
+}
+
+// stripLineComment returns the portion of line preceding a "//" line
+// comment, so brace-depth tracking in handleLine never counts a brace
+// character that only appears inside prose — a Go doc comment quoting a
+// code or config snippet from another language is free to carry
+// unbalanced "{"/"}" without being mistaken for the struct's own closing
+// brace. This is comment-line exclusion, not a full Go tokenizer, but it
+// does track backtick-quoted struct-tag strings well enough to skip a "//"
+// that appears inside one (e.g. a tag carrying a "https://..." default
+// value) rather than misreading it as the start of a comment — a
+// realistic collision a bare substring search would get wrong. A line
+// with no unquoted "//" is returned unchanged.
+func stripLineComment(line string) string {
+	inTag := false
+	for i := 0; i < len(line); i++ {
+		switch {
+		case line[i] == '`':
+			inTag = !inTag
+		case !inTag && line[i] == '/' && i+1 < len(line) && line[i+1] == '/':
+			return line[:i]
+		}
+	}
+	return line
 }
 
 // isCommentOrMarkerLine reports whether line is a comment or a kubebuilder/

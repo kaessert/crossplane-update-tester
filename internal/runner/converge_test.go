@@ -1315,6 +1315,171 @@ func TestBuildConvergeResultLogInstrumentSilenceIsReported(t *testing.T) {
 	}
 }
 
+// TestRunConvergeDetectsAtProviderDrift drives a genuine atProvider drift
+// through a real RunConverge call — re-homing hack/smoke-test.sh's "7a.
+// failure injection: reconcile loop (drifting atProvider)" scenario as a
+// Go-value assertion. The harness's other two checks for this scenario —
+// the hook aborting after this step and never reaching the "run" step's
+// patch — are consequences of Passed=false that belong to the caller
+// sequencing the 5 steps, not to converge's own detection logic:
+// RunConverge itself never calls Patch, which patchCalls==0 below proves
+// directly.
+func TestRunConvergeDetectsAtProviderDrift(t *testing.T) {
+	m := &manifest.Manifest{
+		Kind:       testKindExample,
+		Name:       testNameExample,
+		APIVersion: testAPIVersionClusterScoped,
+	}
+	f := &fakeCluster{
+		generation:      1,
+		readyAfterCalls: 1,
+		atProvider:      map[string]interface{}{"zone": "a"},
+		kind:            testKindExample,
+		name:            testNameExample,
+		apiVersion:      testAPIVersionClusterScoped,
+		driftField:      "zone",
+		driftValue:      "b",
+		// convergeArm reads the resource 4 times before the baseline
+		// snapshot is captured (waitGenerationSettled, waitSynced,
+		// waitReady, then the baseline Snapshot() itself) — call 5 is
+		// convergeAssert's post-window Snapshot(), the first read that
+		// must see the drift. Firing any earlier would bake the drift
+		// into the baseline itself and the diff would see no change at
+		// all.
+		driftAfterGetCalls: 5,
+	}
+	r := newFakeRunner(f)
+	r.sleepFunc = func(time.Duration) {}
+
+	result, err := r.RunConverge(m, ConvergeOptions{
+		PollInterval:     time.Millisecond,
+		ReadinessTimeout: time.Second,
+		Timeout:          time.Second,
+	})
+	if err != nil {
+		t.Fatalf("RunConverge() error = %v", err)
+	}
+	if result.Passed {
+		t.Fatalf("expected Passed=false: a genuine atProvider drift must fail, got %+v", result)
+	}
+	if result.Message != "RECONCILIATION LOOP DETECTED" {
+		t.Errorf("Message = %q, want RECONCILIATION LOOP DETECTED", result.Message)
+	}
+	if !strings.Contains(strings.Join(result.Diagnostics, "\n"), "atProvider changed") {
+		t.Errorf("Diagnostics = %v, want an entry naming the atProvider change", result.Diagnostics)
+	}
+	if f.patchCalls != 0 {
+		t.Errorf("patchCalls = %d, want 0 — a convergence check is read-only and must never patch the resource it is only observing", f.patchCalls)
+	}
+}
+
+// TestRunConvergeDetectsLoopFromEventCountAlone drives a genuine
+// event-count-only loop (repeated update events, no atProvider drift at
+// all) through a real RunConverge call — re-homing hack/smoke-test.sh's
+// "7c. failure injection: reconciliation loop via repeated update events
+// (no atProvider drift)" scenario. The controller log stays quiet
+// throughout (the default fakeCluster logLines, a single benign reconcile
+// line), so this proves the event delta alone is sufficient to catch the
+// loop, independent of the log instrument
+// TestRunConvergeDetectsLoopFromControllerLogAlone covers below.
+func TestRunConvergeDetectsLoopFromEventCountAlone(t *testing.T) {
+	m := &manifest.Manifest{
+		Kind:       testKindExample,
+		Name:       testNameExample,
+		APIVersion: testAPIVersionClusterScoped,
+	}
+	f := &fakeCluster{
+		generation:      1,
+		readyAfterCalls: 1,
+		atProvider:      map[string]interface{}{"zone": "a"},
+		kind:            testKindExample,
+		name:            testNameExample,
+		apiVersion:      testAPIVersionClusterScoped,
+		// Every `get events` read bumps the aggregated count by 1, with
+		// zero atProvider change — the loop this test isolates. RunConverge
+		// reads events exactly twice (baseline, then outcome), so the
+		// observed delta is exactly 1.
+		generations:              []int32{0},
+		eventGrowthPerEventsCall: 1,
+	}
+	r := newFakeRunner(f)
+	r.sleepFunc = func(time.Duration) {}
+
+	result, err := r.RunConverge(m, ConvergeOptions{
+		PollInterval:     time.Millisecond,
+		ReadinessTimeout: time.Second,
+		Timeout:          time.Second,
+	})
+	if err != nil {
+		t.Fatalf("RunConverge() error = %v", err)
+	}
+	if result.Passed {
+		t.Fatalf("expected Passed=false: a growing update-event count with no atProvider drift must still fail, got %+v", result)
+	}
+	if result.Message != "RECONCILIATION LOOP DETECTED" {
+		t.Errorf("Message = %q, want RECONCILIATION LOOP DETECTED", result.Message)
+	}
+	if !strings.Contains(strings.Join(result.Diagnostics, "\n"), "1 new update event(s) observed") {
+		t.Errorf("Diagnostics = %v, want an entry naming a non-zero new-event count — converge must still be COUNTING events, not just diffing atProvider", result.Diagnostics)
+	}
+	if f.patchCalls != 0 {
+		t.Errorf("patchCalls = %d, want 0 — a convergence check is read-only and must never patch the resource it is only observing", f.patchCalls)
+	}
+}
+
+// TestRunConvergeLogloopDiagnosticsNameCallCountAndKeepEventDeltaAtZero is
+// TestRunConvergeDetectsLoopFromControllerLogAlone's diagnostics
+// counterpart, re-homing hack/smoke-test.sh's "7e..." diagnostic checks:
+// the reported Update() call count must be non-zero and the event-delta
+// diagnostic must never appear, proving the verdict came from the LOG
+// alone rather than from an event delta this scenario deliberately holds
+// at zero — the measured live failure client-go's event rate limiter
+// produces.
+func TestRunConvergeLogloopDiagnosticsNameCallCountAndKeepEventDeltaAtZero(t *testing.T) {
+	m := &manifest.Manifest{
+		Kind:       testKindExample,
+		Name:       testNameExample,
+		APIVersion: testAPIVersionClusterScoped,
+	}
+	f := &fakeCluster{
+		generation:      3,
+		readyAfterCalls: 1,
+		atProvider:      map[string]interface{}{"zone": "a"},
+		kind:            testKindExample,
+		name:            testNameExample,
+		apiVersion:      testAPIVersionClusterScoped,
+		// The event channel never moves — the rate limiter has not flushed.
+		generations: []int32{0},
+		logLines: strings.Join([]string{
+			testReconcileLogLine,
+			newTestUpdateLogLine(testNameExample, ""),
+			newTestUpdateLogLine(testNameExample, ""),
+		}, "\n"),
+	}
+	r := newFakeRunner(f)
+	r.sleepFunc = func(time.Duration) {}
+
+	result, err := r.RunConverge(m, ConvergeOptions{
+		PollInterval:     time.Millisecond,
+		ReadinessTimeout: time.Second,
+		Timeout:          time.Second,
+	})
+	if err != nil {
+		t.Fatalf("RunConverge() error = %v", err)
+	}
+
+	joined := strings.Join(result.Diagnostics, "\n")
+	if !strings.Contains(joined, "Update() call(s) in the controller log") {
+		t.Errorf("Diagnostics = %v, want an entry naming the controller-log Update() call count", result.Diagnostics)
+	}
+	if strings.Contains(joined, "0 Update() call(s) in the controller log") {
+		t.Errorf("Diagnostics = %v, the reported Update() call count must be non-zero", result.Diagnostics)
+	}
+	if strings.Contains(joined, "new update event(s) observed") {
+		t.Errorf("Diagnostics = %v, the event delta must stay silent — this scenario isolates the LOG as the only signal", result.Diagnostics)
+	}
+}
+
 // TestRunConvergeDetectsLoopFromControllerLogAlone drives the whole check
 // end to end against a fake cluster whose resource is stable in every way
 // the old instruments could see, and which is calling Update() on every

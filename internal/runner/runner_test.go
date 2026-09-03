@@ -309,6 +309,30 @@ type fakeCluster struct {
 	listElementInjectField string
 	listElementInjectKey   string
 	listElementInjectValue string
+
+	// freezeAtProviderOnPatch, when true, makes handlePatch accept the
+	// spec.forProvider merge (bumping generation, recording an update
+	// event exactly as it does today) WITHOUT mirroring the change into
+	// status.atProvider — simulating a backend that acknowledges a write
+	// and never actually applies it. This is what pollField's timeout
+	// path exists to catch: a field genuinely patched but that never
+	// converges to its expected value within the poll deadline. Left
+	// false (the default), every accepted patch still mirrors into
+	// atProvider instantly, matching every pre-existing test in this
+	// file.
+	freezeAtProviderOnPatch bool
+
+	// eventGrowthPerEventsCall, when non-zero, bumps the active
+	// generation's aggregated event count by this amount on EVERY
+	// handleGetEvents call — independent of any patch — simulating a
+	// controller that is genuinely stuck calling Update() on every poll
+	// tick with no atProvider drift at all: a `get events` read taken at
+	// any two points in time observes a growing count with nothing else
+	// having changed. This is the event-count half of what a convergence
+	// check exists to catch, independent of the atProvider-diff half
+	// driftField/driftValue/driftAfterGetCalls exercises. Zero (the
+	// default) disables this entirely, matching every pre-existing test.
+	eventGrowthPerEventsCall int32
 }
 
 // readyCondition reports the status.conditions entry handleGet should embed
@@ -527,6 +551,12 @@ func (f *fakeCluster) handleGetPods(args []string) (string, error) {
 // read the last one.
 func (f *fakeCluster) handleGetEvents() (string, error) {
 	f.siblingEventCallCount++
+	if f.eventGrowthPerEventsCall != 0 && len(f.generations) > 0 {
+		// Simulate a controller stuck calling Update() on every poll tick:
+		// the aggregated count grows on every READ, not only on a patch —
+		// see eventGrowthPerEventsCall's doc comment.
+		f.generations[len(f.generations)-1] += f.eventGrowthPerEventsCall
+	}
 	list := eventList{}
 	for i, count := range f.generations {
 		if count <= 0 {
@@ -608,8 +638,12 @@ func (f *fakeCluster) handlePatch(args []string) (string, error) {
 	mergeInto(f.forProvider, forProviderRaw)
 	// Simulate a controller that converges instantly, so pollField's first
 	// read already matches — these tests are about the no-op guard, not
-	// about polling behaviour.
-	mergeInto(f.atProvider, forProviderRaw)
+	// about polling behaviour. freezeAtProviderOnPatch skips this mirror
+	// entirely — see its doc comment for the "stuck" scenario it exists
+	// to model.
+	if !f.freezeAtProviderOnPatch {
+		mergeInto(f.atProvider, forProviderRaw)
+	}
 
 	// Simulate a backend that silently resets an unrelated atProvider field
 	// on EVERY write, regardless of which field the merge patch actually
@@ -1860,6 +1894,57 @@ func TestRunFieldTestNoOpUsesExpectOverride(t *testing.T) {
 	}
 }
 
+// TestPollFieldNeverConvergesInAtProviderFailsAfterReachingThePatch drives
+// a field whose patch is accepted (spec.forProvider updates, an update
+// event fires) but never lands in status.atProvider — re-homing
+// hack/smoke-test.sh's "7b. failure injection: update never lands in
+// status.atProvider" scenario as a Go-value assertion. It calls Patch and
+// pollField directly rather than the full runFieldTest/reconcileOnce chain:
+// reconcileOnce's WaitReady/waitSynced gate is orthogonal to the property
+// under test here (a patched value that never converges) and — unlike
+// pollField's own deadline — is not routed through r.sleep, so driving it
+// through a deliberately tiny r.timeout would race the fake informer's own
+// async cache sync rather than exercise pollField's timeout branch.
+//
+// r.timeout is set to a single nanosecond so pollField's deadline has
+// already elapsed by its first read, which takes the exact same "actual
+// never reached expected" branch a real unbounded timeout would, without
+// this test spending pollField's real 5-second poll-retry sleep to get
+// there.
+//
+// The harness's remaining check for this scenario — the hook aborting
+// inside "run" rather than continuing to the post-update converge — is a
+// consequence of this result's Passed=false that belongs to the caller
+// sequencing the 5 steps, not to the field test itself.
+func TestPollFieldNeverConvergesInAtProviderFailsAfterReachingThePatch(t *testing.T) {
+	f := &fakeCluster{
+		forProvider:             map[string]interface{}{testFieldNotifyDelay: float64(0)},
+		atProvider:              map[string]interface{}{testFieldNotifyDelay: float64(0)},
+		generation:              1,
+		kind:                    testKindExample,
+		name:                    testNameExample,
+		recordUpdateEvent:       true,
+		freezeAtProviderOnPatch: true,
+	}
+	r := newFakeRunner(f)
+	r.timeout = "1ns"
+
+	if err := r.Patch(testFieldNotifyDelay, float64(1), nil, nil); err != nil {
+		t.Fatalf("Patch: unexpected error: %v", err)
+	}
+	if f.patchCalls != 1 {
+		t.Fatalf("patchCalls = %d, want 1 — the failing step must reach the patch (it fails on the assertion, not before it)", f.patchCalls)
+	}
+
+	actual, err := r.pollField(testFieldNotifyDelay, float64(1), time.Now(), nil, nil)
+	if err != nil {
+		t.Fatalf("pollField: unexpected error: %v", err)
+	}
+	if compareFieldValue(float64(1), actual, nil, nil) {
+		t.Fatalf("pollField reported %q as matching the expected value 1 — notifyDelay was patched but must never reach status.atProvider in this scenario", actual)
+	}
+}
+
 // TestReadCurrentValuePrefersSpecForProvider verifies readCurrentValue reads
 // spec.forProvider ahead of status.atProvider — the value a merge patch is
 // about to overwrite, not the (possibly stale) observed value.
@@ -2678,6 +2763,46 @@ func TestRunTestsAssertUnchangedReportsDriftOnceAcrossMultipleFieldTests(t *test
 	if violations[0].AfterField != testFieldNotifyDelay {
 		t.Errorf("violation attributed to %q, want %q (the first field test whose patch exposed the drift)",
 			violations[0].AfterField, testFieldNotifyDelay)
+	}
+}
+
+// TestRunTestsRejectsUnresolvableAssertUnchangedPathBeforeAnyPatch drives
+// an assert-unchanged field naming a path that does not resolve on the
+// object through a real RunTests call — re-homing hack/smoke-test.sh's
+// "7d. failure injection: assert-unchanged silent-wipe guard"'s negative
+// case (a declared path that does not resolve on the object at all).
+// readAssertUnchangedBaselines's own unit tests already pin the exact
+// error text (TestReadAssertUnchangedBaselines/UnresolvablePathIsAnError);
+// what is not covered elsewhere is the property this test exists for: NO
+// patch is ever issued, because the baseline read happens before the
+// field-test loop starts, so a bad path is rejected before any field test
+// can run — the residual value of driving the same check through a real
+// run rather than through readAssertUnchangedBaselines alone.
+func TestRunTestsRejectsUnresolvableAssertUnchangedPathBeforeAnyPatch(t *testing.T) {
+	f := &fakeCluster{
+		forProvider: map[string]interface{}{testFieldNotifyDelay: float64(0)},
+		atProvider:  map[string]interface{}{testFieldNotifyDelay: float64(0)},
+		generation:  1,
+		kind:        testKindExample,
+		name:        testNameExample,
+	}
+	r := newFakeRunner(f)
+
+	m := &manifest.Manifest{
+		Kind: testKindExample, Name: testNameExample,
+		Tests:           []manifest.UpdateTest{{Field: testFieldNotifyDelay, Value: float64(1)}},
+		AssertUnchanged: []string{"ruleChoice.legacyRuleList"},
+	}
+
+	_, _, err := r.RunTests(m)
+	if err == nil {
+		t.Fatal("expected an error for an assert-unchanged path that does not resolve on the object, got nil")
+	}
+	if !strings.Contains(err.Error(), "no such field") {
+		t.Errorf("error = %q, want it to name \"no such field\"", err.Error())
+	}
+	if f.patchCalls != 0 {
+		t.Errorf("patchCalls = %d, want 0 — the baseline check must reject the unresolvable path before any field test patches anything", f.patchCalls)
 	}
 }
 

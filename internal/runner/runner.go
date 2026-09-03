@@ -52,7 +52,8 @@ type Runner struct {
 	// restartFunc, when set, overrides restartControllerDeployment as the
 	// mechanism resetEventBurst uses to earn back a fresh event-spam-filter
 	// burst (see eventBurstCeiling). Tests inject a fake here; production
-	// code leaves it nil and resetEventBurst shells out to kubectl for real.
+	// code leaves it nil and resetEventBurst restarts the controller
+	// Deployment for real through the client-go backend.
 	restartFunc func() error
 
 	// podIdentityFunc, when set, overrides resolveControllerPodIdentity as

@@ -220,6 +220,121 @@ func TestValidateManifestMissingField(t *testing.T) {
 	}
 }
 
+// TestValidateManifestFieldTargetUnknown covers ValidateManifest's
+// unknown-target check for "field:" itself — the primary annotation
+// target, and until now the only one of the four (field:, clear:,
+// withValues:, assert-unchanged:) with no such guard. Table-driven per
+// the five required shapes: an unknown top-level field:, a known
+// top-level field:, a dotted path with a known first segment (must NOT
+// regress — f5xc carries exactly this shape today), a dotted path with an
+// unknown first segment, and a skip: entry naming an unknown field (a
+// skip is still a false claim about a real field, so it fails too).
+//
+// The dotted-known-first-segment case asserts only the narrow property
+// this ticket owns — no fieldTargetUnknownStatus entry is produced for a
+// legitimately-resolving nested path. It deliberately does NOT assert
+// AllGood or the declared field's own status: ValidateManifest's coverage
+// map is keyed on the entry's full literal "field:" string, so a dotted
+// entry never lands under its top-level field's own JSONName key in
+// `tested` either — that field still reports MISSING, exactly as it did
+// before this check existed (the ticket's own census measured "useMtlsObj"
+// and "useTls.useMtlsObj" as producing byte-identical output). Whether a
+// dotted field: should credit its own top-level field is a distinct,
+// pre-existing question this ticket's scope excludes (validator.go's
+// unknown-target check only, never the runner or the coverage-crediting
+// behavior clear:/withValues:/assert-unchanged: already had before this
+// change).
+func TestValidateManifestFieldTargetUnknown(t *testing.T) {
+	fields := []FieldInfo{
+		{GoName: "UseTls", JSONName: "useTls"},
+	}
+
+	cases := map[string]struct {
+		reason      string
+		test        manifest.UpdateTest
+		wantInvalid bool // a fieldTargetUnknownStatus entry must (not) appear
+		invalidName string
+	}{
+		"UnknownTopLevelField": {
+			reason:      "a field: naming no declared field at all must be flagged, not silently dropped",
+			test:        manifest.UpdateTest{Field: "useMtlsObj", Value: true},
+			wantInvalid: true,
+			invalidName: "useMtlsObj",
+		},
+		"KnownTopLevelField": {
+			reason:      "a field: naming a real declared field must validate normally with no unknown-target flag",
+			test:        manifest.UpdateTest{Field: "useTls", Value: true},
+			wantInvalid: false,
+			invalidName: "useTls",
+		},
+		"DottedPathKnownFirstSegment": {
+			reason:      "a dotted field: (useTls.useMtlsObj) is judged on its first segment only — useTls is declared, so this must NOT regress into field-target-unknown",
+			test:        manifest.UpdateTest{Field: "useTls.useMtlsObj", Value: true},
+			wantInvalid: false,
+			invalidName: "useTls.useMtlsObj",
+		},
+		"DottedPathUnknownFirstSegment": {
+			reason:      "a dotted field: whose first segment resolves to nothing declared must be flagged the same as a bare unknown field",
+			test:        manifest.UpdateTest{Field: "noSuchField.child", Value: true},
+			wantInvalid: true,
+			invalidName: "noSuchField.child",
+		},
+		"SkipEntryUnknownField": {
+			reason:      "a skip: entry is still a claim about a real field — skipping a nonexistent one must fail exactly like a tested entry would",
+			test:        manifest.UpdateTest{Field: "useMtlsObj", Skip: manifest.LegacySkip("not applicable")},
+			wantInvalid: true,
+			invalidName: "useMtlsObj",
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			m := &manifest.Manifest{
+				Kind:  kindWidget,
+				Tests: []manifest.UpdateTest{tc.test},
+			}
+
+			result := ValidateManifest(m, fields)
+
+			statusByName := statusMap(result)
+			got, present := statusByName[tc.invalidName]
+			gotInvalid := present && got == fieldTargetUnknownStatus
+			if gotInvalid != tc.wantInvalid {
+				t.Errorf("%s: status[%q] = (present=%v, value=%q), want fieldTargetUnknownStatus present=%v; fields: %+v", tc.reason, tc.invalidName, present, got, tc.wantInvalid, result.Fields)
+			}
+			if tc.wantInvalid && !result.AllGood {
+				// expected — an invalid field: entry must fail validation
+			} else if tc.wantInvalid && result.AllGood {
+				t.Errorf("%s: expected AllGood=false when a field-target-unknown entry is present", tc.reason)
+			}
+		})
+	}
+}
+
+// TestValidateManifestFieldTargetUnknownValidEntryStillCredited proves the
+// unknown-target check for a NON-dotted, correctly-resolving field: entry
+// does not disturb ordinary coverage crediting — the field still reports
+// "tested" and AllGood is true, exactly as it was before this check
+// existed.
+func TestValidateManifestFieldTargetUnknownValidEntryStillCredited(t *testing.T) {
+	fields := []FieldInfo{
+		{GoName: "UseTls", JSONName: "useTls"},
+	}
+	m := &manifest.Manifest{
+		Kind:  kindWidget,
+		Tests: []manifest.UpdateTest{{Field: "useTls", Value: true}},
+	}
+
+	result := ValidateManifest(m, fields)
+
+	if !result.AllGood {
+		t.Fatalf("expected AllGood=true for a correctly-resolving field: entry; got fields: %+v", result.Fields)
+	}
+	if got := statusMap(result)["useTls"]; got != statusTested {
+		t.Errorf(`status["useTls"] = %q, want %q`, got, statusTested)
+	}
+}
+
 // TestValidateManifestClearCreditsSwitchSiblings proves (AC a): a
 // non-skipped entry's clear: list credits every named sibling, in addition
 // to its own field, under a status distinct from "tested" — never folded

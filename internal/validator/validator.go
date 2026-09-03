@@ -44,7 +44,7 @@ type ValidationResult struct {
 // FieldValidation holds the status of a single field in validation.
 type FieldValidation struct {
 	JSONName string
-	Status   string // "tested", "skipped", "skipped-unstructured", "immutable", "reference-plumbing", "MISSING", "tested-via-switch", "clear-target-unknown", "withValues-target-unknown", "guarded-assert-unchanged"
+	Status   string // "tested", "skipped", "skipped-unstructured", "immutable", "reference-plumbing", "MISSING", "tested-via-switch", "clear-target-unknown", "withValues-target-unknown", "guarded-assert-unchanged", "field-target-unknown"
 }
 
 // clearCreditStatus is the status a field is credited under when the ONLY
@@ -86,6 +86,35 @@ const clearTargetUnknownStatus = "clear-target-unknown"
 // clearTargetUnknownStatus so the rendered detail names the directive that
 // was actually misused. See ValidateManifest.
 const withValuesTargetUnknownStatus = "withValues-target-unknown"
+
+// fieldTargetUnknownStatus flags an update-test entry — tested or skipped
+// alike — whose "field:" does not resolve to a declared field on the
+// target type, checked against the FIRST path segment only (see
+// topPathSegment): a legitimate nested path such as "useTls.useMtlsObj"
+// is judged on "useTls", exactly as the assert-unchanged credit below
+// judges a dot-separated status.atProvider path on its own first segment.
+// "field:" is the primary target of the whole annotation, and until this
+// check existed it was the only one of the four annotation targets
+// (field:, clear:, withValues:, assert-unchanged:) with no unknown-target
+// guard: a misspelled or stale field: silently dropped out of the
+// coverage arithmetic with no signal at all, reading as a present test
+// covering nothing. A skip: entry is checked too — skipping a nonexistent
+// field is still a false claim about a real one, not a lesser one. See
+// ValidateManifest.
+const fieldTargetUnknownStatus = "field-target-unknown"
+
+// topPathSegment returns the first dot-separated segment of a field path,
+// or the whole string when it carries no dot. A dotted "field:" or
+// "assert-unchanged:" entry names a top-level struct field followed by
+// its own internal subpath; this validator's flat FieldInfo list only
+// ever enumerates top-level fields, so every resolution against fieldSet
+// is against this first segment, never the full dotted string.
+func topPathSegment(field string) string {
+	if idx := strings.Index(field, "."); idx >= 0 {
+		return field[:idx]
+	}
+	return field
+}
 
 // assertUnchangedCreditStatus is the status a field is credited under when
 // its ONLY coverage is being named — as its own top-level field, or as the
@@ -359,26 +388,11 @@ func ParseStructFields(path, structName string) ([]FieldInfo, error) {
 // ValidateManifest checks that the manifest's update-test annotation covers
 // all mutable fields from the Go types.
 func ValidateManifest(m *manifest.Manifest, fields []FieldInfo) *ValidationResult {
-	// Build a set of tested/skipped fields from the annotation. This pass
-	// records only each entry's own "field:" — a second pass below layers
-	// clear: credit on top, so that a field's OWN direct entry (whichever
-	// order the two appear in m.Tests) always wins over a weaker credit
-	// picked up only because some other entry's clear: happened to name it.
-	tested := make(map[string]string) // jsonName → "tested", "skipped" or "skipped-unstructured"
-	for _, t := range m.Tests {
-		switch {
-		case t.Skip.Legacy:
-			tested[t.Field] = legacySkipStatus
-		case t.Skip.Present():
-			tested[t.Field] = "skipped"
-		default:
-			tested[t.Field] = "tested"
-		}
-	}
-
-	// Build the set of all field JSON names in this struct so reference-
-	// plumbing detection can confirm a matching base value field exists,
-	// and so a clear: entry can be checked against the type it claims to
+	// Build the set of all field JSON names in this struct first — every
+	// pass below needs it: reference-plumbing detection confirms a matching
+	// base value field exists, the field: unknown-target check right below
+	// resolves an entry's own top-level segment against it, and the clear:/
+	// withValues: checks further down check the type each one claims to
 	// describe.
 	fieldSet := make(map[string]bool, len(fields))
 	for _, f := range fields {
@@ -388,6 +402,37 @@ func ValidateManifest(m *manifest.Manifest, fields []FieldInfo) *ValidationResul
 	result := &ValidationResult{
 		Kind:    m.Kind,
 		AllGood: true,
+	}
+
+	// Build a set of tested/skipped fields from the annotation. This pass
+	// records only each entry's own "field:" — a second pass below layers
+	// clear: credit on top, so that a field's OWN direct entry (whichever
+	// order the two appear in m.Tests) always wins over a weaker credit
+	// picked up only because some other entry's clear: happened to name it.
+	// An entry whose field: does not resolve to a declared field — judged
+	// on its first path segment only, exactly like the assert-unchanged
+	// credit below — is flagged under fieldTargetUnknownStatus instead of
+	// being recorded here at all: it is not a coverage entry for anything,
+	// tested or skipped alike, so it must not silently occupy a `tested`
+	// slot no declared field will ever be looked up under.
+	tested := make(map[string]string) // jsonName → "tested", "skipped" or "skipped-unstructured"
+	for _, t := range m.Tests {
+		if !fieldSet[topPathSegment(t.Field)] {
+			result.Fields = append(result.Fields, FieldValidation{
+				JSONName: t.Field,
+				Status:   fieldTargetUnknownStatus,
+			})
+			result.AllGood = false
+			continue
+		}
+		switch {
+		case t.Skip.Legacy:
+			tested[t.Field] = legacySkipStatus
+		case t.Skip.Present():
+			tested[t.Field] = "skipped"
+		default:
+			tested[t.Field] = "tested"
+		}
 	}
 
 	// assert-unchanged coverage credit: a field named by the manifest's
@@ -412,10 +457,7 @@ func ValidateManifest(m *manifest.Manifest, fields []FieldInfo) *ValidationResul
 	// ("legacyRuleList.rules" guarding a legacyRuleList that keeps its
 	// own skip: entry). Its own entry wins.
 	for _, a := range m.AssertUnchanged {
-		top := a
-		if idx := strings.Index(a, "."); idx >= 0 {
-			top = a[:idx]
-		}
+		top := topPathSegment(a)
 		if !fieldSet[top] {
 			continue
 		}
@@ -532,6 +574,7 @@ var statusOrder = []statusIconDetail{
 	{Status: clearCreditStatus, Icon: "✓", Detail: "covered (nulled by a sibling entry's clear: — proven clearable, not independently value-tested)"},
 	{Status: assertUnchangedCreditStatus, Icon: "⊙", Detail: "guarded (assert-unchanged) — proven never to drift, not independently value-tested"},
 	{Status: "MISSING", Icon: "✗", Detail: "MISSING — not covered by update-test annotation"},
+	{Status: fieldTargetUnknownStatus, Icon: "✗", Detail: "INVALID — field: does not resolve to a declared field on this type"},
 	{Status: clearTargetUnknownStatus, Icon: "✗", Detail: "INVALID — named in a clear: list but not a declared field on this type"},
 	{Status: withValuesTargetUnknownStatus, Icon: "✗", Detail: "INVALID — named in a withValues: map but not a declared field on this type"},
 }

@@ -359,6 +359,12 @@ overrides discovery.
   clearable, never proved it settable, so it is credited under its own status
   and never folded into `tested`. A `skip:` entry's `clear:` list grants no
   credit, and a field with its own direct entry keeps that entry's status.
+- `field-target-unknown` — a `field:` (checked on its first dot-separated
+  segment, so a legitimate nested path such as `useTls.useMtlsObj` is judged on
+  `useTls`) does not resolve to a declared field on this type — a typo, or a
+  stale reference to a field renamed or removed since the entry was written.
+  Checked for both a tested and a `skip:` entry alike: skipping a nonexistent
+  field is still a false claim about a real one. The command exits non-zero.
 - `clear-target-unknown` — a `clear:` list names something that is not a
   declared field on this type (a typo, or a field renamed or removed since the
   entry was written). The command exits non-zero.

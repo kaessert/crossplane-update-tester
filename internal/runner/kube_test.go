@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -1622,5 +1623,293 @@ func TestManifestResourceIdentifier(t *testing.T) {
 				t.Errorf("%s: manifestResourceIdentifier() = %q, want %q", tc.reason, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestDeploymentNameFromRolloutTarget covers every rollout TYPE/NAME
+// spelling kubectl itself accepts for a Deployment, plus the rejection
+// cases: an empty name, an unrecognised resource type, and an empty target.
+func TestDeploymentNameFromRolloutTarget(t *testing.T) {
+	cases := map[string]struct {
+		reason  string
+		target  string
+		want    string
+		wantErr bool
+	}{
+		"deploy/ prefix": {
+			reason: "restartControllerDeployment always builds this exact spelling",
+			target: "deploy/release-name",
+			want:   "release-name",
+		},
+		"deployment/ prefix": {
+			reason: "kubectl also accepts the singular spelling",
+			target: "deployment/release-name",
+			want:   "release-name",
+		},
+		"deployments/ prefix": {
+			reason: "kubectl also accepts the plural resource-name spelling",
+			target: "deployments/release-name",
+			want:   "release-name",
+		},
+		"empty name after deploy/ is rejected": {
+			reason:  `a bare "deploy/" names no Deployment to act on`,
+			target:  "deploy/",
+			wantErr: true,
+		},
+		"unrecognised type segment is rejected": {
+			reason:  "a target for any other resource type is not this method's concern",
+			target:  "statefulset/release-name",
+			wantErr: true,
+		},
+		"empty target is rejected": {
+			reason:  "no prefix at all carries nothing to parse",
+			target:  "",
+			wantErr: true,
+		},
+	}
+
+	for tn, tc := range cases {
+		t.Run(tn, func(t *testing.T) {
+			got, err := deploymentNameFromRolloutTarget(tc.target)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("%s: expected an error, got name=%q", tc.reason, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("%s: unexpected error: %v", tc.reason, err)
+			}
+			if got != tc.want {
+				t.Errorf("%s: deploymentNameFromRolloutTarget(%q) = %q, want %q", tc.reason, tc.target, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDeploymentRolloutComplete pins deploymentRolloutComplete's four
+// component checks individually — each case fails exactly one of them,
+// except the last, which proves a nil Spec.Replicas defaults to 1 rather
+// than 0 (which would make every rollout appear instantly complete).
+func TestDeploymentRolloutComplete(t *testing.T) {
+	replicas := int32(3)
+	cases := map[string]struct {
+		reason string
+		dep    *appsv1.Deployment
+		want   bool
+	}{
+		"fully rolled out": {
+			reason: "every check passes: generation observed, all replicas updated, no stale replica, all available",
+			dep: &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 2},
+				Spec:       appsv1.DeploymentSpec{Replicas: &replicas},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration: 2, UpdatedReplicas: 3, Replicas: 3, AvailableReplicas: 3,
+				},
+			},
+			want: true,
+		},
+		"generation not yet observed": {
+			reason: "the controller has not even seen the latest spec yet",
+			dep: &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 2},
+				Spec:       appsv1.DeploymentSpec{Replicas: &replicas},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration: 1, UpdatedReplicas: 3, Replicas: 3, AvailableReplicas: 3,
+				},
+			},
+			want: false,
+		},
+		"updated replicas short of desired": {
+			reason: "the rollout has started but not every replica carries the new template yet",
+			dep: &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 1},
+				Spec:       appsv1.DeploymentSpec{Replicas: &replicas},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration: 1, UpdatedReplicas: 2, Replicas: 3, AvailableReplicas: 2,
+				},
+			},
+			want: false,
+		},
+		"stale replica still draining": {
+			reason: "an old-template replica has not finished terminating",
+			dep: &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 1},
+				Spec:       appsv1.DeploymentSpec{Replicas: &replicas},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration: 1, UpdatedReplicas: 3, Replicas: 4, AvailableReplicas: 3,
+				},
+			},
+			want: false,
+		},
+		"updated replicas not yet available": {
+			reason: "the new replicas exist but have not yet passed their readiness gate",
+			dep: &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 1},
+				Spec:       appsv1.DeploymentSpec{Replicas: &replicas},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration: 1, UpdatedReplicas: 3, Replicas: 3, AvailableReplicas: 2,
+				},
+			},
+			want: false,
+		},
+		"nil Spec.Replicas defaults to 1": {
+			reason: "an unset replica count is the API server's own default of 1, not 0",
+			dep: &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 1},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration: 1, UpdatedReplicas: 1, Replicas: 1, AvailableReplicas: 1,
+				},
+			},
+			want: true,
+		},
+	}
+
+	for tn, tc := range cases {
+		t.Run(tn, func(t *testing.T) {
+			if got := deploymentRolloutComplete(tc.dep); got != tc.want {
+				t.Errorf("%s: deploymentRolloutComplete() = %v, want %v", tc.reason, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestClientGoRolloutRestartPatchesAnnotation proves the DEFAULT (client-go)
+// backend routing serves RolloutRestart entirely through a fake client-go
+// Clientset — no execFunc is reached — and that the patch it issues lands
+// exactly where restartControllerDeployment relies on it: the Deployment's
+// Pod-template restart annotation.
+func TestClientGoRolloutRestartPatchesAnnotation(t *testing.T) {
+	const ns = providerDeploymentNamespace
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: testProviderDeployment, Namespace: ns},
+	}
+	cs := fake.NewSimpleClientset(dep)
+	execCalled := false
+	r := &Runner{
+		execFunc: func(args []string) (string, error) {
+			execCalled = true
+			return "", fmt.Errorf("exec must not be reached: %v", args)
+		},
+		kubeClientsetFunc: func() (kubernetes.Interface, error) { return cs, nil },
+	}
+
+	if _, err := r.kube().RolloutRestart(ns, "deploy/"+testProviderDeployment); err != nil {
+		t.Fatalf("RolloutRestart: unexpected error: %v", err)
+	}
+	if execCalled {
+		t.Fatal("execFunc was invoked; RolloutRestart did not default to the client-go backend")
+	}
+
+	got, err := cs.AppsV1().Deployments(ns).Get(context.Background(), testProviderDeployment, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("reading back the patched deployment: %v", err)
+	}
+	if got.Spec.Template.Annotations[restartedAtAnnotation] == "" {
+		t.Errorf("Spec.Template.Annotations[%q] is empty; RolloutRestart did not set the restart annotation", restartedAtAnnotation)
+	}
+}
+
+// TestRunnerKubeBackendEnvVarForcesExecForRollout mirrors
+// TestRunnerKubeBackendEnvVarForcesExec for the rollout pair specifically:
+// the escape hatch must still win for RolloutRestart/RolloutStatus even
+// though they now have a working client-go override, exactly like every
+// other migrated operation.
+func TestRunnerKubeBackendEnvVarForcesExecForRollout(t *testing.T) {
+	t.Setenv(kubeBackendEnvVar, "exec")
+
+	execCalled := false
+	clientsetCalled := false
+	r := &Runner{
+		execFunc: func(args []string) (string, error) {
+			execCalled = true
+			return "", nil
+		},
+		kubeClientsetFunc: func() (kubernetes.Interface, error) {
+			clientsetCalled = true
+			return fake.NewSimpleClientset(), nil
+		},
+	}
+
+	if _, err := r.kube().RolloutRestart(providerDeploymentNamespace, "deploy/"+testProviderDeployment); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !execCalled {
+		t.Error("execFunc was not invoked; UPDATE_TESTER_KUBE_BACKEND=exec did not force the exec backend for RolloutRestart")
+	}
+	if clientsetCalled {
+		t.Error("kubeClientsetFunc was invoked; UPDATE_TESTER_KUBE_BACKEND=exec must bypass the client-go backend entirely")
+	}
+}
+
+// TestClientGoRolloutStatusWaitsForNotReadyThenReady proves RolloutStatus's
+// client-go backend actually POLLS rather than deciding on a single read: the
+// Deployment starts short of its desired generation/replica state, a
+// background goroutine advances it to complete partway through the call's
+// timeout window, and RolloutStatus must observe that later, successful
+// state rather than returning (or erroring) on its first, not-yet-complete
+// read.
+func TestClientGoRolloutStatusWaitsForNotReadyThenReady(t *testing.T) {
+	const ns = providerDeploymentNamespace
+	replicas := int32(1)
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: testProviderDeployment, Namespace: ns, Generation: 2},
+		Spec:       appsv1.DeploymentSpec{Replicas: &replicas},
+		Status: appsv1.DeploymentStatus{
+			ObservedGeneration: 1, // stale: has not yet observed generation 2
+			UpdatedReplicas:    0,
+			Replicas:           1,
+			AvailableReplicas:  1,
+		},
+	}
+	cs := fake.NewSimpleClientset(dep)
+	r := &Runner{
+		kubeClientsetFunc:         func() (kubernetes.Interface, error) { return cs, nil },
+		rolloutStatusPollInterval: time.Millisecond,
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		time.Sleep(20 * time.Millisecond)
+		cur, err := cs.AppsV1().Deployments(ns).Get(context.Background(), testProviderDeployment, metav1.GetOptions{})
+		if err != nil {
+			t.Errorf("reading deployment mid-poll: %v", err)
+			return
+		}
+		cur.Status.ObservedGeneration = 2
+		cur.Status.UpdatedReplicas = 1
+		if _, err := cs.AppsV1().Deployments(ns).UpdateStatus(context.Background(), cur, metav1.UpdateOptions{}); err != nil {
+			t.Errorf("updating deployment status mid-poll: %v", err)
+		}
+	}()
+
+	if _, err := r.kube().RolloutStatus(ns, "deploy/"+testProviderDeployment, "2s"); err != nil {
+		t.Fatalf("RolloutStatus: unexpected error: %v", err)
+	}
+	<-done
+}
+
+// TestClientGoRolloutStatusTimesOutWhenNeverComplete proves a rollout that
+// never reaches deploymentRolloutComplete surfaces as a timeout error naming
+// the timeout, rather than blocking forever or returning success.
+func TestClientGoRolloutStatusTimesOutWhenNeverComplete(t *testing.T) {
+	const ns = providerDeploymentNamespace
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: testProviderDeployment, Namespace: ns, Generation: 2},
+		Status:     appsv1.DeploymentStatus{ObservedGeneration: 1},
+	}
+	cs := fake.NewSimpleClientset(dep)
+	r := &Runner{
+		kubeClientsetFunc:         func() (kubernetes.Interface, error) { return cs, nil },
+		rolloutStatusPollInterval: time.Millisecond,
+	}
+
+	_, err := r.kube().RolloutStatus(ns, "deploy/"+testProviderDeployment, "20ms")
+	if err == nil {
+		t.Fatal("expected a timeout error, got nil")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Errorf("error = %q, want it to mention a timeout", err)
 	}
 }

@@ -2,6 +2,7 @@ package runner
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -2928,6 +2930,75 @@ func TestRestartControllerDeploymentPodResolutionFailure(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "resolving provider deployment") {
 		t.Errorf("error %q does not indicate deployment resolution failed", err.Error())
+	}
+}
+
+// TestResetEventBurstDefaultsToClientGoThroughFullCallGraph exercises the
+// full production call graph resetEventBurst -> restartControllerDeployment
+// -> KubeClient.RolloutRestart/RolloutStatus with NO kubeBackendEnvVar
+// override and NO restartFunc/execFunc shortcut standing in for any part of
+// it — proving that, by default, none of that chain reaches Runner.exec.
+// The target Deployment starts short of its desired rollout state and a
+// background goroutine advances it to complete partway through
+// RolloutStatus's poll, covering the rollout-not-yet-complete -> complete
+// transition through this call graph, not only at the KubeClient level.
+func TestResetEventBurstDefaultsToClientGoThroughFullCallGraph(t *testing.T) {
+	t.Setenv(providerDeploymentEnvVar, testProviderDeployment)
+
+	replicas := int32(1)
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: testProviderDeployment, Namespace: providerDeploymentNamespace, Generation: 2},
+		Spec:       appsv1.DeploymentSpec{Replicas: &replicas},
+		Status: appsv1.DeploymentStatus{
+			ObservedGeneration: 1, // stale: has not yet observed generation 2
+			UpdatedReplicas:    0,
+			Replicas:           1,
+			AvailableReplicas:  1,
+		},
+	}
+	cs := fake.NewSimpleClientset(dep)
+
+	execCalled := false
+	r := &Runner{
+		execFunc: func(args []string) (string, error) {
+			execCalled = true
+			return "", fmt.Errorf("exec must not be reached: %v", args)
+		},
+		kubeClientsetFunc:         func() (kubernetes.Interface, error) { return cs, nil },
+		rolloutStatusPollInterval: time.Millisecond,
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		time.Sleep(20 * time.Millisecond)
+		cur, err := cs.AppsV1().Deployments(providerDeploymentNamespace).Get(context.Background(), testProviderDeployment, metav1.GetOptions{})
+		if err != nil {
+			t.Errorf("reading deployment mid-poll: %v", err)
+			return
+		}
+		cur.Status.ObservedGeneration = 2
+		cur.Status.UpdatedReplicas = 1
+		if _, err := cs.AppsV1().Deployments(providerDeploymentNamespace).UpdateStatus(context.Background(), cur, metav1.UpdateOptions{}); err != nil {
+			t.Errorf("updating deployment status mid-poll: %v", err)
+		}
+	}()
+
+	if err := r.resetEventBurst(); err != nil {
+		t.Fatalf("resetEventBurst: unexpected error: %v", err)
+	}
+	<-done
+
+	if execCalled {
+		t.Error("execFunc was invoked; resetEventBurst -> restartControllerDeployment did not stay on the client-go backend")
+	}
+
+	got, err := cs.AppsV1().Deployments(providerDeploymentNamespace).Get(context.Background(), testProviderDeployment, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("reading back the patched deployment: %v", err)
+	}
+	if got.Spec.Template.Annotations[restartedAtAnnotation] == "" {
+		t.Errorf("Spec.Template.Annotations[%q] is empty; RolloutRestart did not reach the client-go Deployment", restartedAtAnnotation)
 	}
 }
 

@@ -159,6 +159,15 @@ type Runner struct {
 	// distinct per-pod content or a mid-stream failure. Production code
 	// leaves it nil and podLogStream opens a real client-go log stream.
 	podLogStreamFunc func(namespace, podName, container string, sinceSeconds int64) (io.ReadCloser, error)
+
+	// rolloutStatusPollInterval, when > 0, overrides
+	// defaultRolloutStatusPollInterval — the cadence RolloutStatus's
+	// client-go backend re-Gets the target Deployment while waiting for
+	// its rollout to finish. Tests set a near-instant value here so a
+	// not-ready-then-ready transition resolves without spending the real
+	// default interval; production code leaves it zero and RolloutStatus
+	// falls back to defaultRolloutStatusPollInterval.
+	rolloutStatusPollInterval time.Duration
 }
 
 // sleep waits d, calling sleepFunc instead of time.Sleep when a test has

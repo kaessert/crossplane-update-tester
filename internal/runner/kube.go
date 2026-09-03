@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -111,16 +112,18 @@ type KubeClient interface {
 
 	// RolloutRestart and RolloutStatus back restartControllerDeployment,
 	// the mechanism resetEventBurst uses to discard a provider
-	// controller's in-process event-spam-filter state. Every provider's
-	// own event-burst-size flip has now landed fleet-wide, so production
-	// code no longer reaches either method — but they are kept here,
-	// deliberately unported, because the smoke-test harness asserts on
-	// the exact kubectl argv they issue and drives the compiled binary as
-	// a subprocess with no seam to substitute a fake backend in their
-	// place. They are retained solely as that harness's subject — no
-	// longer a production rollback hatch — and go away only once that
-	// harness itself is rewritten to stop depending on an exec-forced
-	// kubectl transcript (a fake API server or equivalent).
+	// controller's in-process event-spam-filter state (see
+	// eventBurstCeiling). resetEventBurst calls restartControllerDeployment
+	// unconditionally whenever the observed event count catches up to the
+	// ceiling, so this remains a live, if rarely triggered, production
+	// path — not merely a rollback hatch. Both methods are implemented on
+	// the client-go backend (clientGoKubeClient.RolloutRestart/
+	// RolloutStatus below), which is what a default (non-forced-exec)
+	// Runner reaches. The exec implementation on execKubeClient is left
+	// unchanged alongside it: a smoke-test harness that forces the exec
+	// backend still asserts on the exact kubectl argv these two issue,
+	// and that assertion remains valid coverage of the exec code path for
+	// as long as it exists.
 	RolloutRestart(namespace, target string) (string, error)
 	RolloutStatus(namespace, target, timeout string) (string, error)
 }
@@ -265,14 +268,15 @@ func eventFieldSelector(kind, name, namespace string) string {
 // on the next slice of the migration and has already done so once.
 const kubeBackendEnvVar = "UPDATE_TESTER_KUBE_BACKEND"
 
-// clientGoKubeClient overrides event listing, resource reads, manifest-name
-// resolution, the two merge-patch operations, the Ready wait, the
-// controller-log read, and the controller-pod list that backs
-// deployment-name resolution and pod-identity reads, with direct client-go
-// calls. Only RolloutRestart and RolloutStatus are still promoted from the
-// embedded exec backend unchanged — this type exists to migrate one
-// operation at a time, not to grow into a second full backend. A shared
-// informer or watch cache is deliberately
+// clientGoKubeClient overrides every KubeClient operation — event listing,
+// resource reads, manifest-name resolution, the two merge-patch operations,
+// the Ready wait, the controller-log read, the controller-pod list that
+// backs deployment-name resolution and pod-identity reads, and the rollout
+// restart/status pair that backs the event-burst reset — with direct
+// client-go calls. *execKubeClient is still embedded, but only for the
+// Runner access its own methods read through (c.r); none of its methods are
+// reached by promotion any more, since every one of them now has a same-named
+// override on this type. A shared informer or watch cache is deliberately
 // NOT used for the event listing, resource read or manifest-name
 // resolution overrides: the evidence check those feed is a before/after
 // delta on the same object, and a lagging cache would return a stale
@@ -288,8 +292,10 @@ const kubeBackendEnvVar = "UPDATE_TESTER_KUBE_BACKEND"
 // that watch from ever becoming a second, cached source for the direct-read
 // overrides above. ProviderLogs opens a fresh log stream per pod on every
 // call, exactly like the event/resource-read overrides — nothing here is
-// cached either. clientset is a func rather than a stored value so it can
-// be resolved lazily (a Runner is often built before a kubeconfig is
+// cached either. RolloutStatus polls with a direct Get on every iteration
+// for the same reason: a cached read could report "complete" off a
+// pre-rollout snapshot. clientset is a func rather than a stored value so
+// it can be resolved lazily (a Runner is often built before a kubeconfig is
 // needed) and overridden by tests.
 type clientGoKubeClient struct {
 	*execKubeClient
@@ -1026,6 +1032,152 @@ func (c *clientGoKubeClient) ControllerPodIdentities(namespace, selector string)
 	return identities, nil
 }
 
+// deploymentRolloutTargetPrefixes lists every resource-type spelling kubectl
+// itself accepts ahead of a Deployment's name in a rollout TYPE/NAME target
+// ("deploy", "deployment", "deployments" — kubectl treats all three as the
+// same resource). restartControllerDeployment always builds "deploy/<name>"
+// (see its own doc comment), but deploymentNameFromRolloutTarget parses
+// every spelling kubectl would, rather than hard-coding the one spelling
+// this project's own call site happens to use today.
+var deploymentRolloutTargetPrefixes = []string{"deployments/", "deployment/", "deploy/"}
+
+// deploymentNameFromRolloutTarget extracts the Deployment name from a
+// kubectl rollout TYPE/NAME target such as "deploy/example". An empty name
+// (a bare "deploy/") is rejected the same as a target carrying none of the
+// accepted prefixes at all — neither names an actual Deployment to act on.
+func deploymentNameFromRolloutTarget(target string) (string, error) {
+	for _, prefix := range deploymentRolloutTargetPrefixes {
+		if name, ok := strings.CutPrefix(target, prefix); ok && name != "" {
+			return name, nil
+		}
+	}
+	return "", fmt.Errorf(
+		"parsing rollout target %q: expected deploy/, deployment/ or deployments/ followed by a Deployment name", target)
+}
+
+// restartedAtAnnotation is the Pod-template annotation a Deployment rollout
+// restart bumps — the same key `kubectl rollout restart` itself sets. A
+// Deployment's rolling-update controller treats any Pod template change as
+// a reason to roll every replica, and a fresh timestamp here is a change
+// with no other side effect, exactly matching what the exec backend's
+// `kubectl rollout restart` invocation achieves.
+const restartedAtAnnotation = "kubectl.kubernetes.io/restartedAt"
+
+// RolloutRestart is restartControllerDeployment's client-go implementation:
+// a merge patch that bumps restartedAtAnnotation on the Deployment's Pod
+// template to the current time, the same mechanism `kubectl rollout
+// restart` uses under the hood.
+func (c *clientGoKubeClient) RolloutRestart(namespace, target string) (string, error) {
+	name, err := deploymentNameFromRolloutTarget(target)
+	if err != nil {
+		return "", err
+	}
+	cs, err := c.clientset()
+	if err != nil {
+		return "", fmt.Errorf("resolving client-go client: %w", err)
+	}
+	patch := fmt.Sprintf(`{"spec":{"template":{"metadata":{"annotations":{%q:%q}}}}}`,
+		restartedAtAnnotation, time.Now().Format(time.RFC3339))
+	dep, err := cs.AppsV1().Deployments(namespace).Patch(context.Background(), name,
+		types.MergePatchType, []byte(patch), metav1.PatchOptions{})
+	if err != nil {
+		return "", fmt.Errorf("restarting deployment %s/%s via client-go: %w", namespace, name, err)
+	}
+	data, err := json.Marshal(dep)
+	if err != nil {
+		return "", fmt.Errorf("marshalling client-go rollout-restart result: %w", err)
+	}
+	return string(data), nil
+}
+
+// defaultRolloutStatusPollInterval is how often RolloutStatus's client-go
+// backend re-Gets the target Deployment while waiting for its rollout to
+// finish — the poll equivalent of `kubectl rollout status`'s own watch.
+// RolloutStatus's own timeout argument is the bound a caller actually
+// relies on; this constant only paces how promptly a completed rollout is
+// noticed within that bound. Runner.rolloutStatusPollInterval, when set,
+// overrides it — tests use a near-instant value so a not-ready-then-ready
+// transition resolves without spending this constant's real duration.
+const defaultRolloutStatusPollInterval = 2 * time.Second
+
+// deploymentRolloutComplete reports whether dep's rollout has finished,
+// mirroring the same checks `kubectl rollout status` itself performs
+// against a Deployment's status: the controller has observed the
+// Deployment's latest spec generation, every desired replica has been
+// updated to that spec, no stale replica from before the update is still
+// around, and every updated replica has become Available. A nil
+// Spec.Replicas defaults to 1, matching the API server's own defaulting for
+// an unset replica count.
+func deploymentRolloutComplete(dep *appsv1.Deployment) bool {
+	if dep.Generation > dep.Status.ObservedGeneration {
+		return false
+	}
+	desired := int32(1)
+	if dep.Spec.Replicas != nil {
+		desired = *dep.Spec.Replicas
+	}
+	if dep.Status.UpdatedReplicas < desired {
+		return false
+	}
+	if dep.Status.Replicas > dep.Status.UpdatedReplicas {
+		return false
+	}
+	if dep.Status.AvailableReplicas < dep.Status.UpdatedReplicas {
+		return false
+	}
+	return true
+}
+
+// RolloutStatus is restartControllerDeployment's client-go implementation:
+// it polls the target Deployment via direct Get calls until
+// deploymentRolloutComplete reports the rollout finished or timeout
+// elapses, rather than parsing `kubectl rollout status`'s text output — the
+// two observe the identical underlying condition, just read directly off
+// the typed status here instead of a formatted line.
+func (c *clientGoKubeClient) RolloutStatus(namespace, target, timeout string) (string, error) {
+	name, err := deploymentNameFromRolloutTarget(target)
+	if err != nil {
+		return "", err
+	}
+	dur, err := time.ParseDuration(timeout)
+	if err != nil {
+		return "", fmt.Errorf("parsing rollout status timeout %q: %w", timeout, err)
+	}
+	cs, err := c.clientset()
+	if err != nil {
+		return "", fmt.Errorf("resolving client-go client: %w", err)
+	}
+
+	interval := defaultRolloutStatusPollInterval
+	if c.r.rolloutStatusPollInterval > 0 {
+		interval = c.r.rolloutStatusPollInterval
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dur)
+	defer cancel()
+
+	var last *appsv1.Deployment
+	pollErr := wait.PollUntilContextCancel(ctx, interval, true, func(ctx context.Context) (bool, error) {
+		dep, getErr := cs.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+		if getErr != nil {
+			return false, fmt.Errorf("getting deployment %s/%s via client-go: %w", namespace, name, getErr)
+		}
+		last = dep
+		return deploymentRolloutComplete(dep), nil
+	})
+	if pollErr != nil {
+		if wait.Interrupted(pollErr) {
+			return "", fmt.Errorf("timed out after %s waiting for rollout of deployment %s/%s: %w", timeout, namespace, name, pollErr)
+		}
+		return "", pollErr
+	}
+	data, err := json.Marshal(last)
+	if err != nil {
+		return "", fmt.Errorf("marshalling client-go rollout-status result: %w", err)
+	}
+	return string(data), nil
+}
+
 // kube returns the KubeClient backend for this Runner. It is a method
 // rather than a field populated at construction so a Runner built as a bare
 // struct literal resolves to a working backend with no separate wiring
@@ -1035,16 +1187,14 @@ func (c *clientGoKubeClient) ControllerPodIdentities(namespace, selector string)
 //     operation — the differential diagnostic that separates "the tool
 //     changed" from "the provider changed" on a run whose client-go path
 //     misbehaves in a way this migration's own runs did not cover.
-//  2. Otherwise: the client-go backend for event listing, resource reads,
-//     manifest-name resolution, the two merge-patch operations, the Ready
-//     wait, the controller-log read, and the controller-pod list that
-//     backs deployment-name resolution and pod-identity reads (the
-//     default, production behaviour), built from
-//     kubeClientsetFunc/kubeDynamicFunc/restMapperFunc when a test has set
-//     them, or from the ambient kubeconfig otherwise. Only
-//     RolloutRestart/RolloutStatus still delegate to the embedded exec
-//     backend unconditionally — see their own doc comment on the
-//     KubeClient interface for why they are not part of this default.
+//  2. Otherwise: the client-go backend for every operation — event
+//     listing, resource reads, manifest-name resolution, the two
+//     merge-patch operations, the Ready wait, the controller-log read,
+//     the controller-pod list that backs deployment-name resolution and
+//     pod-identity reads, and the rollout restart/status pair that backs
+//     the event-burst reset (the default, production behaviour), built
+//     from kubeClientsetFunc/kubeDynamicFunc/restMapperFunc when a test
+//     has set them, or from the ambient kubeconfig otherwise.
 //
 // A test Runner built as a bare struct literal takes exactly this same
 // path: there is no longer a separate branch for "a test harness with no
@@ -1079,5 +1229,5 @@ func kubeBackendSelectionLine(forcedExec bool) string {
 	if forcedExec {
 		return fmt.Sprintf("kube backend: exec (all operations — forced by %s=exec)", kubeBackendEnvVar)
 	}
-	return "kube backend: client-go (event list, resource read, manifest resolve, patch, wait, log, controller pod list), exec (rollout restart/status only)"
+	return "kube backend: client-go (all operations: event list, resource read, manifest resolve, patch, wait, log, controller pod list, rollout restart/status)"
 }

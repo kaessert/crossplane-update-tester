@@ -116,64 +116,10 @@ type KubeClient interface {
 	// eventBurstCeiling). resetEventBurst calls restartControllerDeployment
 	// unconditionally whenever the observed event count catches up to the
 	// ceiling, so this remains a live, if rarely triggered, production
-	// path — not merely a rollback hatch. Both methods are implemented on
-	// the client-go backend (clientGoKubeClient.RolloutRestart/
-	// RolloutStatus below), which is what a default (non-forced-exec)
-	// Runner reaches. The exec implementation on execKubeClient is left
-	// unchanged alongside it as the rollback path kubeBackendEnvVar
-	// exists to offer; the exact kubectl argv these two issue is asserted
-	// by internal/runner's own exec-backend unit tests, not by any
-	// harness under hack/.
+	// path. Both methods are implemented directly against client-go (see
+	// clientGoKubeClient.RolloutRestart/RolloutStatus below).
 	RolloutRestart(namespace, target string) (string, error)
 	RolloutStatus(namespace, target, timeout string) (string, error)
-}
-
-// execKubeClient is the KubeClient backend that shells out to kubectl. Every
-// method builds exactly the argv the pre-seam code built inline at its call
-// site and hands it to Runner.exec, which is what actually invokes kubectl
-// (or, in tests, the injected execFunc) — so this backend is byte-for-byte
-// behaviour-identical to the code it replaces, by construction rather than
-// by convention. It is the only KubeClient implementation today.
-type execKubeClient struct {
-	r *Runner
-}
-
-// scoped appends "-n <namespace>" when namespace is non-empty, mirroring
-// the namespace-scoping the pre-seam Runner.run helper used to apply.
-func (c *execKubeClient) scoped(namespace string, args []string) (string, error) {
-	if namespace != "" {
-		args = append(args, "-n", namespace)
-	}
-	return c.r.exec(args...)
-}
-
-func (c *execKubeClient) GetObjectJSON(namespace, name string) (string, error) {
-	return c.scoped(namespace, []string{"get", name, "-o", "json"})
-}
-
-func (c *execKubeClient) ResolveManifestName(namespace, manifestPath string) (string, error) {
-	return c.scoped(namespace, []string{"get", "-f", manifestPath, "-o", "name"})
-}
-
-func (c *execKubeClient) PatchMerge(namespace, name, patchJSON string) (string, error) {
-	return c.scoped(namespace, []string{"patch", name, "--type=merge", "-p", patchJSON})
-}
-
-func (c *execKubeClient) PatchMergeStatus(namespace, name, patchJSON string) (string, error) {
-	return c.scoped(namespace, []string{"patch", name, "--subresource=status", "--type=merge", "-p", patchJSON})
-}
-
-func (c *execKubeClient) WaitForCondition(namespace, name, condition, timeout string) (string, error) {
-	return c.scoped(namespace, []string{"wait", name, "--for=" + condition, "--timeout=" + timeout})
-}
-
-func (c *execKubeClient) ListEventsForObject(kind, name, namespace string) (string, error) {
-	return c.r.exec("get", "events", "--all-namespaces", "-o", "json",
-		"--field-selector", eventFieldSelector(kind, name, namespace))
-}
-
-func (c *execKubeClient) ProviderLogs(namespace, selector, since string) (string, error) {
-	return c.r.exec("logs", "-n", namespace, "-l", selector, "--tail=-1", "--since="+since)
 }
 
 // parseSinceSeconds converts ProviderLogs' since argument — kubectl --since
@@ -190,57 +136,8 @@ func parseSinceSeconds(since string) (int64, error) {
 	return int64(dur.Seconds()), nil
 }
 
-func (c *execKubeClient) RolloutRestart(namespace, target string) (string, error) {
-	return c.r.exec("rollout", "restart", target, "-n", namespace)
-}
-
-func (c *execKubeClient) RolloutStatus(namespace, target, timeout string) (string, error) {
-	return c.r.exec("rollout", "status", target, "-n", namespace, "--timeout="+timeout)
-}
-
-// getPodsJSONPath issues `kubectl get pods -n <namespace> -l <selector> -o
-// <jsonPath>` — the exec backend's shared argv-building block for
-// ControllerRevisionLabels and ControllerPodIdentities below. It is
-// deliberately NOT part of the KubeClient interface: the client-go
-// backend needs no JSONPath template at all, so promoting this to a full
-// interface method (as the pre-port GetPodsJSONPath was) would expose a
-// shape only one backend can honour. It survives, unexported, purely as
-// this backend's own building block, and is what keeps both methods'
-// kubectl argv byte-identical to what this project issued before the
-// pod-identity lookup moved off it.
-func (c *execKubeClient) getPodsJSONPath(namespace, selector, jsonPath string) (string, error) {
-	return c.r.exec("get", "pods", "-n", namespace, "-l", selector, "-o", jsonPath)
-}
-
-// ControllerRevisionLabels backs resolveControllerDeploymentName on the
-// exec backend: the exact `kubectl get pods -l <selector> -o jsonpath=...`
-// invocation this project has always issued for it, reduced client-side by
-// uniqueNonEmptyLines to the deduplicated, non-empty label values.
-func (c *execKubeClient) ControllerRevisionLabels(namespace, selector string) ([]string, error) {
-	out, err := c.getPodsJSONPath(namespace, selector,
-		`jsonpath={range .items[*]}{.metadata.labels.pkg\.crossplane\.io/revision}{"\n"}{end}`)
-	if err != nil {
-		return nil, err
-	}
-	return uniqueNonEmptyLines(out), nil
-}
-
-// ControllerPodIdentities backs resolveControllerPodIdentityLive on the
-// exec backend: the exact `kubectl get pods -l <selector> -o jsonpath=...`
-// invocation this project has always issued for it, parsed client-side by
-// parseControllerPodIdentities into name/creation-time pairs.
-func (c *execKubeClient) ControllerPodIdentities(namespace, selector string) ([]controllerPodIdentity, error) {
-	out, err := c.getPodsJSONPath(namespace, selector,
-		`jsonpath={range .items[*]}{.metadata.name}{"\t"}{.metadata.creationTimestamp}{"\n"}{end}`)
-	if err != nil {
-		return nil, err
-	}
-	return parseControllerPodIdentities(out), nil
-}
-
-// eventFieldSelector builds the involvedObject field selector every
-// KubeClient backend uses to narrow an events List server-side, shared so
-// the exec and client-go backends build byte-identical selector strings.
+// eventFieldSelector builds the involvedObject field selector the client-go
+// KubeClient backend uses to narrow an events List server-side.
 // namespace is included unconditionally, even when empty, so a
 // cluster-scoped resource's selector explicitly requires an empty
 // involvedObject.namespace rather than omitting the term and matching any
@@ -256,34 +153,21 @@ func eventFieldSelector(kind, name, namespace string) string {
 	}.String()
 }
 
-// kubeBackendEnvVar selects which backend serves the operations that have
-// been migrated to client-go so far. "exec" forces every KubeClient
-// operation, migrated ones included, onto the exec backend — the rollback
-// path if the client-go path misbehaves on a provider this migration's own
-// live run did not cover. Any other value, including unset, routes the
-// migrated operations through the client-go backend and leaves every other
-// operation on the exec backend. kubeBackendSelectionLine below is the
-// single authoritative statement of which operations that is; this comment
-// deliberately does not repeat the list, because a second copy goes stale
-// on the next slice of the migration and has already done so once.
-const kubeBackendEnvVar = "UPDATE_TESTER_KUBE_BACKEND"
-
-// clientGoKubeClient overrides every KubeClient operation — event listing,
+// clientGoKubeClient implements every KubeClient operation — event listing,
 // resource reads, manifest-name resolution, the two merge-patch operations,
 // the Ready wait, the controller-log read, the controller-pod list that
 // backs deployment-name resolution and pod-identity reads, and the rollout
 // restart/status pair that backs the event-burst reset — with direct
-// client-go calls. *execKubeClient is still embedded, but only for the
-// Runner access its own methods read through (c.r); none of its methods are
-// reached by promotion any more, since every one of them now has a same-named
-// override on this type. A shared informer or watch cache is deliberately
-// NOT used for the event listing, resource read or manifest-name
-// resolution overrides: the evidence check those feed is a before/after
-// delta on the same object, and a lagging cache would return a stale
-// second read and manufacture a false negative — and a manifest resolution
-// that consulted a cache could resolve an object as present after its
-// deletion had already reached the API server, which is exactly the
-// distinction ResolveManifestName exists to get right. The two patch
+// client-go calls. It is the only KubeClient implementation. r gives its
+// methods the Runner access they read through (r.restMapper,
+// r.goDynamicClient, and so on). A shared informer or watch cache is
+// deliberately NOT used for the event listing, resource read or
+// manifest-name resolution overrides: the evidence check those feed is a
+// before/after delta on the same object, and a lagging cache would return a
+// stale second read and manufacture a false negative — and a manifest
+// resolution that consulted a cache could resolve an object as present
+// after its deletion had already reached the API server, which is exactly
+// the distinction ResolveManifestName exists to get right. The two patch
 // overrides write rather than read, so a cache cannot go stale under them,
 // but they are still direct dynamic calls for the same reason.
 // WaitForCondition is the one exception to "no watch cache reached for
@@ -298,7 +182,7 @@ const kubeBackendEnvVar = "UPDATE_TESTER_KUBE_BACKEND"
 // it can be resolved lazily (a Runner is often built before a kubeconfig is
 // needed) and overridden by tests.
 type clientGoKubeClient struct {
-	*execKubeClient
+	r         *Runner
 	clientset func() (kubernetes.Interface, error)
 }
 
@@ -315,10 +199,8 @@ func (c *clientGoKubeClient) ListEventsForObject(kind, name, namespace string) (
 	}
 	// corev1.EventList's JSON tags (items[].reason, items[].count,
 	// items[].involvedObject.{kind,name,namespace,apiVersion}) already
-	// match eventList/eventItem's — marshalling straight back to JSON
-	// keeps every downstream parser and the exec backend's return shape
-	// identical, so sumEventOccurrencesByReason needs no backend-specific
-	// branch.
+	// match eventList/eventItem's, so marshalling straight back to JSON
+	// keeps sumEventOccurrencesByReason's parsing unchanged.
 	data, err := json.Marshal(list)
 	if err != nil {
 		return "", fmt.Errorf("marshalling client-go event list: %w", err)
@@ -377,8 +259,7 @@ func kubeRESTConfig() (*rest.Config, error) {
 // backend uses, built once from the ambient kubeconfig (the KUBECONFIG env
 // var, falling back to ~/.kube/config — the same resolution kubectl itself
 // applies) and cached for the lifetime of this Runner. kubeClientsetFunc,
-// when set, overrides this for tests, exactly like execFunc overrides
-// exec().
+// when set, overrides this for tests.
 func (r *Runner) goClientset() (kubernetes.Interface, error) {
 	if r.kubeClientsetFunc != nil {
 		return r.kubeClientsetFunc()
@@ -576,8 +457,7 @@ func manifestResourceIdentifier(gvr schema.GroupVersionResource, name string) st
 // a special case to hide in.
 func (c *clientGoKubeClient) ResolveManifestName(namespace, manifestPath string) (string, error) {
 	// #nosec G304 -- manifestPath is an operator-supplied example manifest
-	// path, not attacker-controlled input; the exec backend reads the same
-	// path via kubectl.
+	// path, not attacker-controlled input.
 	data, err := os.ReadFile(manifestPath)
 	if err != nil {
 		return "", fmt.Errorf("reading manifest %s: %w", manifestPath, err)
@@ -625,13 +505,12 @@ func (c *clientGoKubeClient) ResolveManifestName(namespace, manifestPath string)
 // dynamic Get — never an informer, a watch cache, or any other client that
 // could serve a stale read — and marshals the result straight back to
 // JSON. unstructured.Unstructured's JSON encoding is exactly the object's
-// own apiVersion/kind/metadata/spec/status shape, the same shape
-// GetObject's json.Unmarshal already expects from the exec backend, so no
-// caller-visible contract changes. A not-found read or any other API error
-// is returned as a non-nil error, unwrapped into no special case: that is
-// exactly how a kubectl non-zero exit reaches this method's caller today,
-// and every existing caller (GetObject, and everything built on it) already
-// treats a non-nil error as failure without inspecting its text.
+// own apiVersion/kind/metadata/spec/status shape, so callers decode it
+// exactly like a `kubectl get -o json` response. A not-found read or any
+// other API error is returned as a non-nil error, unwrapped into no
+// special case, and every existing caller (GetObject, and everything built
+// on it) already treats a non-nil error as failure without inspecting its
+// text.
 func (c *clientGoKubeClient) GetObjectJSON(namespace, name string) (string, error) {
 	gvr, err := c.resourceGVR(name)
 	if err != nil {
@@ -884,7 +763,7 @@ func (c *clientGoKubeClient) WaitForCondition(namespace, name, condition, timeou
 // of three, silently and with a zero exit. Leaving TailLines nil is what
 // "--tail=-1" means, and is the one thing this method must never change.
 //
-// Container selection mirrors the exec backend's own invocation (a bare
+// Container selection mirrors kubectl's own default invocation (a bare
 // `kubectl logs -l <selector>`, no `--container` flag): the pod's FIRST
 // container is read, matching kubectl's own default-container behaviour —
 // kubectl warns to stderr and proceeds for a multi-container pod rather
@@ -893,15 +772,11 @@ func (c *clientGoKubeClient) WaitForCondition(namespace, name, condition, timeou
 //
 // A pod whose log stream cannot be opened or fully read is recorded and
 // skipped rather than aborting the whole call, so one unreadable pod never
-// costs the others their lines: kubectl's own sequential log consumption
-// already streams each matched pod's content to stdout as it goes, and it
-// is only the exec backend's os/exec wrapper — which discards a command's
-// entire stdout the moment its exit code is non-zero — that turns one
-// failing pod into zero bytes of evidence for every pod. This backend reads
-// each pod's stream directly and has no reason to inherit that limitation.
+// costs the others their lines: this backend reads each pod's stream
+// directly and attributes whatever it manages to read from every OTHER
+// pod, rather than discarding the whole call's output over one failure.
 // Only when EVERY matched pod failed is the call itself reported as an
-// error, matching the one outcome the exec backend can still produce today:
-// nothing observed, nothing to attribute a call count to.
+// error: nothing observed, nothing to attribute a call count to.
 func (c *clientGoKubeClient) ProviderLogs(namespace, selector, since string) (string, error) {
 	sinceSeconds, err := parseSinceSeconds(since)
 	if err != nil {
@@ -977,10 +852,10 @@ func (r *Runner) podLogStream(cs kubernetes.Interface, namespace, podName, conta
 
 // listControllerPods lists Pods matching selector in namespace via a
 // direct client-go call — the shared building block behind
-// ControllerRevisionLabels and ControllerPodIdentities on this backend.
-// Unlike the exec backend's getPodsJSONPath, no JSONPath template is
-// built or parsed on this side at all: each override below reads the
-// field(s) it needs directly off the typed corev1.Pod list this returns.
+// ControllerRevisionLabels and ControllerPodIdentities on this backend. No
+// JSONPath template is built or parsed anywhere here: each override below
+// reads the field(s) it needs directly off the typed corev1.Pod list this
+// returns.
 func (c *clientGoKubeClient) listControllerPods(namespace, selector string) ([]corev1.Pod, error) {
 	cs, err := c.clientset()
 	if err != nil {
@@ -995,9 +870,8 @@ func (c *clientGoKubeClient) listControllerPods(namespace, selector string) ([]c
 
 // ControllerRevisionLabels is listControllerPods narrowed to the field
 // resolveControllerDeploymentName needs: the unique, non-empty
-// providerDeploymentSelector label values, in first-seen order — the same
-// reduction the exec backend's jsonpath template performs, done here as a
-// plain Go map read instead.
+// providerDeploymentSelector label values, in first-seen order, read here
+// as a plain Go map reduction.
 func (c *clientGoKubeClient) ControllerRevisionLabels(namespace, selector string) ([]string, error) {
 	pods, err := c.listControllerPods(namespace, selector)
 	if err != nil {
@@ -1059,8 +933,8 @@ func deploymentNameFromRolloutTarget(target string) (string, error) {
 // restart bumps — the same key `kubectl rollout restart` itself sets. A
 // Deployment's rolling-update controller treats any Pod template change as
 // a reason to roll every replica, and a fresh timestamp here is a change
-// with no other side effect, exactly matching what the exec backend's
-// `kubectl rollout restart` invocation achieves.
+// with no other side effect, exactly matching what `kubectl rollout
+// restart` itself achieves.
 const restartedAtAnnotation = "kubectl.kubernetes.io/restartedAt"
 
 // RolloutRestart is restartControllerDeployment's client-go implementation:
@@ -1181,53 +1055,13 @@ func (c *clientGoKubeClient) RolloutStatus(namespace, target, timeout string) (s
 // kube returns the KubeClient backend for this Runner. It is a method
 // rather than a field populated at construction so a Runner built as a bare
 // struct literal resolves to a working backend with no separate wiring
-// step. Selection order:
-//
-//  1. kubeBackendEnvVar set to "exec" forces the exec backend for every
-//     operation — the differential diagnostic that separates "the tool
-//     changed" from "the provider changed" on a run whose client-go path
-//     misbehaves in a way this migration's own runs did not cover.
-//  2. Otherwise: the client-go backend for every operation — event
-//     listing, resource reads, manifest-name resolution, the two
-//     merge-patch operations, the Ready wait, the controller-log read,
-//     the controller-pod list that backs deployment-name resolution and
-//     pod-identity reads, and the rollout restart/status pair that backs
-//     the event-burst reset (the default, production behaviour), built
-//     from kubeClientsetFunc/kubeDynamicFunc/restMapperFunc when a test
-//     has set them, or from the ambient kubeconfig otherwise.
-//
-// A test Runner built as a bare struct literal takes exactly this same
-// path: there is no longer a separate branch for "a test harness with no
-// client-go override", so every test either wires kubeClientsetFunc/
-// kubeDynamicFunc/restMapperFunc/podLogStreamFunc — even if only to a fake
-// client-go client that itself delegates to a hand-rolled simulation — or
-// forces kubeBackendEnvVar to exercise the exec backend deliberately.
-//
-// Whichever branch is taken, the choice is recorded to stderr exactly once
-// per Runner (see kubeBackendLogOnce) — a parity run comparing the exec and
-// client-go backends is otherwise unverifiable from its own output: a run
-// where the env var never reached the process produces artifacts
-// indistinguishable from one where it did.
+// step. Every operation — event listing, resource reads, manifest-name
+// resolution, the two merge-patch operations, the Ready wait, the
+// controller-log read, the controller-pod list that backs deployment-name
+// resolution and pod-identity reads, and the rollout restart/status pair
+// that backs the event-burst reset — is served by the client-go backend,
+// built from kubeClientsetFunc/kubeDynamicFunc/restMapperFunc when a test
+// has set them, or from the ambient kubeconfig otherwise.
 func (r *Runner) kube() KubeClient {
-	exec := &execKubeClient{r: r}
-	forcedExec := os.Getenv(kubeBackendEnvVar) == "exec"
-	r.kubeBackendLogOnce.Do(func() {
-		fmt.Fprintln(os.Stderr, "    "+kubeBackendSelectionLine(forcedExec))
-	})
-	if forcedExec {
-		return exec
-	}
-	return &clientGoKubeClient{execKubeClient: exec, clientset: r.goClientset}
-}
-
-// kubeBackendSelectionLine formats the one-line record kube() emits, naming
-// which operation(s) each backend serves and whether kubeBackendEnvVar
-// forced the choice. It is a standalone function, rather than inlined into
-// kube(), so a unit test can assert on its output directly instead of
-// parsing captured stderr text out of a live Runner.
-func kubeBackendSelectionLine(forcedExec bool) string {
-	if forcedExec {
-		return fmt.Sprintf("kube backend: exec (all operations — forced by %s=exec)", kubeBackendEnvVar)
-	}
-	return "kube backend: client-go (all operations: event list, resource read, manifest resolve, patch, wait, log, controller pod list, rollout restart/status)"
+	return &clientGoKubeClient{r: r, clientset: r.goClientset}
 }

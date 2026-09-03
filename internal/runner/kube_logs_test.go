@@ -88,8 +88,7 @@ func (r erroringReader) Close() error {
 
 // newTestLogsRunner builds a Runner wired for the ProviderLogs tests below:
 // kubeClientsetFunc resolves cs (a fake Clientset seeded with whatever pods
-// the caller wants List to return), and no execFunc, so kube() defaults to
-// the client-go backend.
+// the caller wants List to return).
 func newTestLogsRunner(cs kubernetes.Interface) *Runner {
 	return &Runner{kubeClientsetFunc: func() (kubernetes.Interface, error) { return cs, nil }}
 }
@@ -294,13 +293,9 @@ func TestClientGoKubeClientProviderLogsConcatenatesMultiplePods(t *testing.T) {
 // TestClientGoKubeClientProviderLogsOnePodFailureDoesNotLoseOthers is the
 // AC's load-bearing proof for partial failure: when one matched pod's log
 // stream cannot be opened, the OTHER pod's lines must still be returned and
-// the call must not itself report an error. This is deliberately NOT what
-// the exec backend's Runner.exec wrapper produces today (a non-zero
-// `kubectl logs -l` exit discards its entire stdout via os/exec.Output,
-// losing every pod's content, not just the failing one's) — that is a
-// limitation of shelling out through os/exec, not of kubectl's own
-// sequential per-pod log consumption, which this backend has no reason to
-// inherit now that it reads each pod's stream directly.
+// the call must not itself report an error. This backend reads each pod's
+// stream directly, so one pod's failure never costs the others their
+// content.
 func TestClientGoKubeClientProviderLogsOnePodFailureDoesNotLoseOthers(t *testing.T) {
 	podOK := newTestPod(testNamespaceExample, "controller-ok", "controller")
 	podBad := newTestPod(testNamespaceExample, "controller-bad", "controller")
@@ -358,9 +353,7 @@ func TestClientGoKubeClientProviderLogsMidStreamReadFailureDoesNotLoseOthers(t *
 
 // TestClientGoKubeClientProviderLogsAllPodsFailingReturnsError proves the
 // one case that DOES surface as an error: every matched pod failed, leaving
-// nothing observed — the same "nothing to attribute a call count to"
-// outcome the exec backend already produces when its single kubectl
-// invocation fails outright.
+// nothing observed and nothing to attribute a call count to.
 func TestClientGoKubeClientProviderLogsAllPodsFailingReturnsError(t *testing.T) {
 	podA := newTestPod(testNamespaceExample, "controller-a", "controller")
 	podB := newTestPod(testNamespaceExample, "controller-b", "controller")
@@ -434,91 +427,36 @@ func TestClientGoKubeClientProviderLogsClosesEveryStream(t *testing.T) {
 	}
 }
 
-// TestClientGoKubeClientProviderLogsAndExecAgreeOnAttributedCount is the
-// AC's load-bearing parity proof: for the SAME logical log content, the
-// exec backend (canned kubectl output) and the client-go backend (canned
-// stream content via podLogStreamFunc) must feed countUpdateLogLinesIn to
-// the identical (calls, lines) pair. countUpdateLogLinesIn attributes lines
-// by content, so this also proves concatenation order is not load-bearing:
-// the exec fixture and the client-go fixture are byte-identical here, but
-// nothing about this test (or the production code) requires that in
-// general — only the resulting SET of matched lines must agree.
-func TestClientGoKubeClientProviderLogsAndExecAgreeOnAttributedCount(t *testing.T) {
+// TestClientGoKubeClientProviderLogsAttributedCount is the AC's
+// load-bearing proof: canned stream content served through podLogStreamFunc
+// must feed countUpdateLogLinesIn to the expected (calls, lines) pair.
+// countUpdateLogLinesIn attributes lines by content, so this also proves
+// concatenation order is not load-bearing — only the resulting SET of
+// matched lines must agree.
+func TestClientGoKubeClientProviderLogsAttributedCount(t *testing.T) {
 	const logContent = `{"level":"debug","msg":"Successfully requested update of external resource","request":{"name":"example-resource","namespace":""}}
 {"level":"debug","msg":"unrelated line"}
 `
-	// Exec path: canned kubectl output, forced onto the exec backend via
-	// the escape hatch so this Runner's default routing cannot mask the
-	// comparison.
-	t.Setenv(kubeBackendEnvVar, "exec")
-	execRunner := &Runner{execFunc: func(args []string) (string, error) { return logContent, nil }}
-	execOut, err := execRunner.kube().ProviderLogs(providerDeploymentNamespace, "pkg.crossplane.io/revision", "30s")
-	if err != nil {
-		t.Fatalf("exec path: unexpected error: %v", err)
-	}
-	execCalls, execLines := countUpdateLogLinesIn(execOut, "example-resource", "", time.Time{})
-
-	// client-go path: the same logical content, served through
-	// podLogStreamFunc — no env var, proving the DEFAULT routing serves
-	// this.
-	t.Setenv(kubeBackendEnvVar, "")
 	pod := newTestPod(providerDeploymentNamespace, "controller-abc", "controller")
-	goRunner := &Runner{
+	r := &Runner{
 		kubeClientsetFunc: func() (kubernetes.Interface, error) { return fake.NewSimpleClientset(pod), nil },
 		podLogStreamFunc: func(namespace, podName, container string, sinceSeconds int64) (io.ReadCloser, error) {
 			return newTestStream(logContent, nil), nil
 		},
 	}
-	goOut, err := goRunner.kube().ProviderLogs(providerDeploymentNamespace, "pkg.crossplane.io/revision", "30s")
+	out, err := r.kube().ProviderLogs(providerDeploymentNamespace, "pkg.crossplane.io/revision", "30s")
 	if err != nil {
-		t.Fatalf("client-go path: unexpected error: %v", err)
-	}
-	goCalls, goLines := countUpdateLogLinesIn(goOut, "example-resource", "", time.Time{})
-
-	if execCalls != goCalls || execLines != goLines {
-		t.Errorf("exec and client-go paths disagree for identical log content: exec=(calls=%d,lines=%d), client-go=(calls=%d,lines=%d)",
-			execCalls, execLines, goCalls, goLines)
-	}
-	if goCalls != 1 || goLines != 2 {
-		t.Fatalf("client-go path: countUpdateLogLinesIn() = (calls=%d, lines=%d), want (calls=1, lines=2) — the fixture is not exercising what this test claims to", goCalls, goLines)
-	}
-}
-
-// TestRunnerKubeBackendEnvVarForcesExecForProviderLogsSpecifically proves
-// UPDATE_TESTER_KUBE_BACKEND=exec forces ProviderLogs specifically back
-// onto the exec backend, mirroring the same escape-hatch proof already in
-// place for every other migrated operation.
-func TestRunnerKubeBackendEnvVarForcesExecForProviderLogsSpecifically(t *testing.T) {
-	t.Setenv(kubeBackendEnvVar, "exec")
-
-	execCalled := false
-	clientsetCalled := false
-	r := &Runner{
-		execFunc: func(args []string) (string, error) {
-			execCalled = true
-			return "", nil
-		},
-		kubeClientsetFunc: func() (kubernetes.Interface, error) {
-			clientsetCalled = true
-			return fake.NewSimpleClientset(), nil
-		},
-	}
-
-	if _, err := r.kube().ProviderLogs(providerDeploymentNamespace, "pkg.crossplane.io/revision", "30s"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !execCalled {
-		t.Error("execFunc was not invoked; UPDATE_TESTER_KUBE_BACKEND=exec did not force the exec backend for ProviderLogs")
-	}
-	if clientsetCalled {
-		t.Error("kubeClientsetFunc was invoked; UPDATE_TESTER_KUBE_BACKEND=exec must bypass the client-go backend entirely")
+	gotCalls, gotLines := countUpdateLogLinesIn(out, "example-resource", "", time.Time{})
+
+	if gotCalls != 1 || gotLines != 2 {
+		t.Fatalf("countUpdateLogLinesIn() = (calls=%d, lines=%d), want (calls=1, lines=2)", gotCalls, gotLines)
 	}
 }
 
-// TestRunnerKubeDefaultsToClientGoForProviderLogs proves the DEFAULT
-// routing (no env var, no execFunc) serves ProviderLogs through the
-// client-go backend, mirroring TestRunnerKubeDefaultsToClientGoForEvents
-// but for the operation this ticket migrates.
+// TestRunnerKubeDefaultsToClientGoForProviderLogs proves ProviderLogs is
+// served through the client-go backend.
 func TestRunnerKubeDefaultsToClientGoForProviderLogs(t *testing.T) {
 	clientsetCalled := false
 	r := &Runner{

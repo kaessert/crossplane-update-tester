@@ -1,18 +1,14 @@
 // Package runner drives the update tester's live-cluster checks through
-// kubectl: per-field update tests (RunTests), the post-create convergence
+// client-go: per-field update tests (RunTests), the post-create convergence
 // check (RunConverge), and the ref-less identity-resolve recovery check
 // (RunResolveRecover).
 package runner
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"reflect"
 	"strconv"
 	"strings"
@@ -27,9 +23,8 @@ import (
 	"github.com/kaessert/crossplane-update-tester/internal/manifest"
 )
 
-// Runner executes update tests against a live cluster using kubectl.
+// Runner executes update tests against a live cluster via client-go.
 type Runner struct {
-	kubectl      string
 	manifestPath string
 	// resourceName is the cached `kubectl get -o name` identifier of the
 	// object under test, e.g.
@@ -44,9 +39,13 @@ type Runner struct {
 	// defaultPollInterval.
 	pollInterval time.Duration
 
-	// execFunc, when set, overrides the kubectl invocation used by exec().
-	// Tests inject a fake here to simulate kubectl output without a live
-	// cluster; production code leaves it nil and exec() shells out for real.
+	// execFunc is a test-only dispatch seam: no Runner method reads it
+	// directly. This package's client-go test fakes (see
+	// newFakeClientGoClientset, newFakeClientGoDynamicClient and
+	// newFakePodLogStreamFunc in runner_test.go) call it themselves so
+	// every KubeClient operation's fake can share one hand-rolled
+	// kubectl-argv simulation (fakeCluster.exec) instead of each
+	// reimplementing it. Production code leaves it nil.
 	execFunc func(args []string) (string, error)
 
 	// restartFunc, when set, overrides restartControllerDeployment as the
@@ -60,7 +59,7 @@ type Runner struct {
 	// the mechanism convergeArm/convergeAssert use to read the running
 	// provider controller Pod's identity (see controllerPodIdentity). Tests
 	// inject a fake sequence here; production code leaves it nil and
-	// resolveControllerPodIdentity shells out to kubectl for real.
+	// resolveControllerPodIdentity reads the live Pod for real.
 	podIdentityFunc func() (controllerPodIdentity, error)
 
 	// sleepFunc, when set, overrides the wait between iterations of a
@@ -146,12 +145,6 @@ type Runner struct {
 	// rather than as a bypass — see restMapper's doc comment for why.
 	restMapperFunc func() (meta.RESTMapper, error)
 
-	// kubeBackendLogOnce guards the one-line record of which KubeClient
-	// backend this Runner resolved to (see kube()) so a full catalog run
-	// — which calls kube() on the order of a thousand times for event
-	// reads alone — emits that record exactly once, not once per call.
-	kubeBackendLogOnce sync.Once
-
 	// podLogStreamFunc, when set, overrides podLogStream as the mechanism
 	// the client-go KubeClient backend uses to open one pod/container's
 	// log stream for ProviderLogs. Tests inject a fake here: the built-in
@@ -185,10 +178,6 @@ func (r *Runner) sleep(d time.Duration) {
 
 // NewRunner creates a Runner for the given manifest file.
 func NewRunner(manifestPath string, timeout int) *Runner {
-	kubectl := os.Getenv("KUBECTL")
-	if kubectl == "" {
-		kubectl = "kubectl"
-	}
 	// A parse failure here is deliberately NOT an error: this knob is read
 	// deep inside a hook subprocess tree, and failing an E2E run over a
 	// typo in an env var costs more than silently running at the
@@ -202,7 +191,6 @@ func NewRunner(manifestPath string, timeout int) *Runner {
 		}
 	}
 	return &Runner{
-		kubectl:      kubectl,
 		manifestPath: manifestPath,
 		timeout:      fmt.Sprintf("%ds", timeout),
 		burstCeiling: burstCeiling,
@@ -224,20 +212,20 @@ func (r *Runner) WithPollInterval(d time.Duration) *Runner {
 	return r
 }
 
-// ResolveResource uses kubectl to resolve the full resource name from the
-// manifest file.
+// ResolveResource resolves the full resource name from the manifest file,
+// via the KubeClient backend's ResolveManifestName.
 //
-// `kubectl get -f <manifest> -o name` prints one line PER DOCUMENT in the
-// manifest, and a Crossplane example manifest routinely ships a companion
-// object (a Secret, a ProviderConfig) alongside the managed resource under
-// test. Treating the whole trimmed output as the resource name therefore
-// yields a multi-line string as soon as the manifest holds more than one
-// document, and every subsequent kubectl call is issued against that
-// garbage. The manifest parser selects the annotated document, so this must
-// match it: the line whose object name — and, when several documents share
-// a name, whose type — corresponds to the parsed Kind/Name is selected, and
-// an output that cannot be resolved unambiguously is an error rather than a
-// guess.
+// Resolution yields one name PER DOCUMENT in the manifest, matching what
+// `kubectl get -f <manifest> -o name` would print — and a Crossplane
+// example manifest routinely ships a companion object (a Secret, a
+// ProviderConfig) alongside the managed resource under test. Treating the
+// whole trimmed output as the resource name therefore yields a multi-line
+// string as soon as the manifest holds more than one document, and every
+// subsequent call would be issued against that garbage. The manifest
+// parser selects the annotated document, so this must match it: the line
+// whose object name — and, when several documents share a name, whose
+// type — corresponds to the parsed Kind/Name is selected, and an output
+// that cannot be resolved unambiguously is an error rather than a guess.
 func (r *Runner) ResolveResource(m *manifest.Manifest) error {
 	out, err := r.kube().ResolveManifestName(r.namespace, r.manifestPath)
 	if err != nil {
@@ -1231,25 +1219,6 @@ func (r *Runner) resolveControllerDeploymentName() (string, error) {
 	}
 }
 
-// uniqueNonEmptyLines splits kubectl output into trimmed, non-empty lines,
-// preserving order and dropping duplicates. Deduplication matters because
-// one Deployment can have several Pods (a scaled-out or mid-rollout
-// controller), and every one of them carries the same revision label —
-// which is one deployment, not an ambiguity.
-func uniqueNonEmptyLines(out string) []string {
-	seen := make(map[string]bool)
-	var lines []string
-	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || seen[line] {
-			continue
-		}
-		seen[line] = true
-		lines = append(lines, line)
-	}
-	return lines
-}
-
 // controllerPodIdentity captures the observable identity of the provider
 // controller Pod actually running at the instant it was read: its own
 // Pod name (NOT the Deployment name resolveControllerDeploymentName
@@ -1677,36 +1646,6 @@ func (r *Runner) pollField(field string, expectedVal interface{}, start time.Tim
 			field, actual, formatExpected(expectedVal), readRetryInterval)
 		time.Sleep(readRetryInterval)
 	}
-}
-
-// exec runs the configured kubectl binary with args and returns stdout. If
-// execFunc is set (tests only), it is used instead of shelling out.
-//
-// Stderr is captured into a buffer rather than handed to cmd.Stderr =
-// os.Stderr directly: os/exec's ExitError only populates its own Stderr
-// field when the caller has left cmd.Stderr nil, so claiming the stream for
-// live display silently zeroes out the text a failing invocation's wrapped
-// error would otherwise carry. Teeing to os.Stderr preserves the live
-// display and keeps the captured copy for the returned error.
-func (r *Runner) exec(args ...string) (string, error) {
-	if r.execFunc != nil {
-		return r.execFunc(args)
-	}
-	// #nosec G204 -- r.kubectl is a controlled config value (default
-	// "kubectl", overridable only via the KUBECTL env var), not
-	// attacker-controlled input.
-	cmd := exec.CommandContext(context.Background(), r.kubectl, args...)
-	var stderr bytes.Buffer
-	cmd.Stderr = io.MultiWriter(os.Stderr, &stderr)
-	out, err := cmd.Output()
-	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			return "", fmt.Errorf("%w: %s", err, stderr.String())
-		}
-		return "", err
-	}
-	return string(out), nil
 }
 
 // CheckExternalNamePrefix classifies a live external-name annotation value

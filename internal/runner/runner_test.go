@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -858,13 +857,12 @@ func runnerTestManifestPath() string {
 
 // newFakeClientGoDynamicClient builds the dynamic.Interface newFakeRunner
 // wires as kubeDynamicFunc. Get and Patch are reactored straight into
-// r.execFunc, reconstructing the SAME argv execKubeClient used to build
-// for each operation, so GetObjectJSON/PatchMerge/PatchMergeStatus
+// r.execFunc, reconstructing the argv the pre-client-go implementation
+// built for each operation, so GetObjectJSON/PatchMerge/PatchMergeStatus
 // exercise the real client-go KubeClient methods (RESTMapper resolution,
 // RFC 7386 merge-patch semantics, JSON marshalling) while fakeCluster
 // itself remains the one place every test's simulated cluster state
-// (call counts, drift, silent wipes, event generations...) lives —
-// unchanged by which KubeClient backend kube() routes a Runner through.
+// (call counts, drift, silent wipes, event generations...) lives.
 // Routing through r.execFunc rather than closing over fakeCluster.exec
 // directly matters: several tests (e.g. TestSnapshotReadsTheWholeObject)
 // REPLACE r.execFunc after construction to capture the argv a call issues,
@@ -874,10 +872,10 @@ func runnerTestManifestPath() string {
 //
 // List is left on the fake dynamic client's own tracker, seeded with one
 // object that is already Ready — WaitForCondition was a total no-op
-// success under the old exec fallback (`kubectl wait` was never issued a
-// real query in these tests), and no test in this package ever needed
+// success under the old kubectl-argv simulation (no real query was ever
+// issued in these tests), and no test in this package ever needed
 // WaitReady itself to fail, so an always-satisfied wait preserves that
-// exactly. The reactor still round-trips through the exec backend's own
+// exactly. The reactor still round-trips through fakeCluster.exec's own
 // "wait" case, purely so f.waitCalls keeps counting invocations the same
 // way every other migrated operation's fake does.
 func newFakeClientGoDynamicClient(r *Runner) dynamic.Interface {
@@ -972,19 +970,19 @@ func newFakeClientGoDynamicClient(r *Runner) dynamic.Interface {
 // of the same name: one Pod per entry, each carrying that entry as its
 // providerDeploymentSelector label — so ControllerRevisionLabels'
 // ambiguous-lookup detection and ControllerPodIdentities' pod-count
-// handling see the SAME fixture shape via the client-go default routing
-// that fakeCluster's own "get pods" handler gives the exec backend. nil
-// (the default every caller but the ambiguous-deployment test passes)
-// falls back to a single testProviderDeployment-labelled Pod, matching
-// every other test's expectation. ProviderLogs' client-go pod listing
-// finds the SAME Pod(s) `kubectl logs -l <selector>` would have found via
-// exec. Events are reactored into r.execFunc exactly like the dynamic
-// client's get/patch reactors above (see that constructor's doc comment
-// for why r.execFunc, not fakeCluster.exec directly), so event-count
-// simulation (generations, siblings, budgets, restarts) is untouched by
-// the flip.
+// handling see the SAME fixture shape callers configure. nil (the default
+// every caller but the ambiguous/empty-deployment tests pass) falls back
+// to a single testProviderDeployment-labelled Pod, matching every other
+// test's expectation. A non-nil EMPTY slice ([]string{}), by contrast,
+// means the caller deliberately wants zero Pods — the only way to express
+// "no provider controller installed" through this constructor. Events are
+// reactored into r.execFunc exactly like the dynamic client's get/patch
+// reactors above (see that constructor's doc comment for why r.execFunc,
+// not fakeCluster.exec directly), so event-count simulation (generations,
+// siblings, budgets, restarts) is untouched by which Pod fixture is in
+// play.
 func newFakeClientGoClientset(r *Runner, providerPods []string) kubernetes.Interface {
-	if len(providerPods) == 0 {
+	if providerPods == nil {
 		providerPods = []string{testProviderDeployment}
 	}
 	objs := make([]runtime.Object, 0, len(providerPods))
@@ -1057,9 +1055,10 @@ func newFakeRunner(f *fakeCluster) *Runner {
 	// constructors above. Assigned after r exists, rather than as struct
 	// literal fields, because each closure reads r.execFunc at CALL time —
 	// see newFakeClientGoDynamicClient's doc comment for why that matters.
-	// RolloutRestart and RolloutStatus remain on execFunc unconditionally:
-	// they are the only two operations still promoted from the embedded
-	// exec backend unchanged by kube().
+	// RolloutRestart/RolloutStatus are not wired here at all: restartFunc
+	// above short-circuits resetEventBurst before it ever reaches
+	// restartControllerDeployment, so no test built through newFakeRunner
+	// exercises either method.
 	r.restMapperFunc = func() (meta.RESTMapper, error) { return runnerTestRESTMapper{}, nil }
 	r.kubeDynamicFunc = func() (dynamic.Interface, error) { return newFakeClientGoDynamicClient(r), nil }
 	r.kubeClientsetFunc = func() (kubernetes.Interface, error) { return newFakeClientGoClientset(r, f.providerPods), nil }
@@ -2939,111 +2938,58 @@ func TestRunTestsAmbiguousProviderDeploymentDegradesToUntrusted(t *testing.T) {
 }
 
 // TestRestartControllerDeploymentResolvesViaPodLabel exercises
-// restartControllerDeployment's actual kubectl argv through execFunc,
-// simulating a fake kubectl that mirrors a live Crossplane v2.2.1 cluster:
-// `kubectl get deploy -l pkg.crossplane.io/revision` never matches anything
-// (the label is absent from the Deployment's own metadata.labels), while
-// `kubectl get pods -l pkg.crossplane.io/revision` resolves the controller
-// Pod and its pkg.crossplane.io/revision label carries the exact Deployment
-// name. This is the regression test for the bug the restartFunc-injected
-// tests could never catch, because they bypass restartControllerDeployment
-// entirely.
+// restartControllerDeployment's full, real call path with NO
+// providerDeploymentEnvVar override: the Deployment name must be resolved
+// via the controller Pod's own revision label (see providerDeploymentSelector's
+// own doc comment for why the Deployment object itself cannot be selected
+// directly), and the resolved name must then reach RolloutRestart. This is
+// the regression test for a bug the restartFunc-injected tests could never
+// catch, because they bypass restartControllerDeployment entirely.
 func TestRestartControllerDeploymentResolvesViaPodLabel(t *testing.T) {
 	t.Setenv(providerDeploymentEnvVar, "")
-	// Force exec: this bare-struct Runner only wires execFunc, and the
-	// point of the test is the exec backend's own argv (see doc comment
-	// above). No kubeClientsetFunc is set, so the default client-go
-	// routing would try a real kubeconfig and fail before ever reaching
-	// this test's assertions.
-	t.Setenv(kubeBackendEnvVar, "exec")
 
-	var gotArgs [][]string
-	r := &Runner{
-		execFunc: func(args []string) (string, error) {
-			gotArgs = append(gotArgs, append([]string(nil), args...))
-			switch {
-			case len(args) >= 2 && args[0] == kubectlGetSubcommand && args[1] == "deploy":
-				// A selector against the Deployment's own metadata.labels
-				// never matches on a live cluster — mirror kubectl's
-				// real "index out of bounds" failure for an empty list
-				// rather than returning an empty string, so a caller that
-				// mistakenly still queries "get deploy -l ..." is caught
-				// by an error, not a silently-empty name.
-				return "", fmt.Errorf("array index out of bounds: index 0, length 0")
-			case len(args) >= 2 && args[0] == kubectlGetSubcommand && args[1] == "pods":
-				return testProviderDeployment + "\n", nil
-			case args[0] == "rollout" && args[1] == "restart":
-				return "", nil
-			case args[0] == "rollout" && args[1] == "status":
-				return "", nil
-			default:
-				return "", fmt.Errorf("unexpected kubectl invocation: %v", args)
-			}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "provider-example-pod-0",
+			Namespace: providerDeploymentNamespace,
+			Labels:    map[string]string{providerDeploymentSelector: testProviderDeployment},
 		},
 	}
+	replicas := int32(1)
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: testProviderDeployment, Namespace: providerDeploymentNamespace, Generation: 1},
+		Spec:       appsv1.DeploymentSpec{Replicas: &replicas},
+		Status: appsv1.DeploymentStatus{
+			ObservedGeneration: 1,
+			UpdatedReplicas:    1,
+			Replicas:           1,
+			AvailableReplicas:  1,
+		},
+	}
+	cs := fake.NewSimpleClientset(pod, dep)
+	r := &Runner{kubeClientsetFunc: func() (kubernetes.Interface, error) { return cs, nil }}
 
 	if err := r.restartControllerDeployment(); err != nil {
 		t.Fatalf("restartControllerDeployment: unexpected error: %v", err)
 	}
 
-	var sawPodSelector, sawDeploymentLabelSelector, sawRolloutRestart, sawRolloutStatus bool
-	for _, args := range gotArgs {
-		if len(args) < 2 {
-			continue
-		}
-		switch {
-		case args[0] == kubectlGetSubcommand && args[1] == "pods":
-			sawPodSelector = true
-			if !containsArg(args, providerDeploymentSelector) {
-				t.Errorf("get pods argv missing selector %q: %v", providerDeploymentSelector, args)
-			}
-		case args[0] == kubectlGetSubcommand && args[1] == "deploy":
-			sawDeploymentLabelSelector = true
-		case args[0] == "rollout" && args[1] == "restart":
-			sawRolloutRestart = true
-			if !containsArg(args, "deploy/"+testProviderDeployment) {
-				t.Errorf("rollout restart argv missing target %q: %v", "deploy/"+testProviderDeployment, args)
-			}
-		case args[0] == "rollout" && args[1] == "status":
-			sawRolloutStatus = true
-			if !containsArg(args, "deploy/"+testProviderDeployment) {
-				t.Errorf("rollout status argv missing target %q: %v", "deploy/"+testProviderDeployment, args)
-			}
-		}
+	got, err := cs.AppsV1().Deployments(providerDeploymentNamespace).Get(context.Background(), testProviderDeployment, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("reading back the patched deployment: %v", err)
 	}
-	if !sawPodSelector {
-		t.Error("expected restartControllerDeployment to resolve the Deployment name via `kubectl get pods -l ...`")
-	}
-	if sawDeploymentLabelSelector {
-		t.Error("restartControllerDeployment must not query `kubectl get deploy -l ...` — that selector never matches on a live cluster (see providerDeploymentSelector)")
-	}
-	if !sawRolloutRestart {
-		t.Error("expected a `kubectl rollout restart deploy/<name>` call")
-	}
-	if !sawRolloutStatus {
-		t.Error("expected a `kubectl rollout status deploy/<name>` call")
+	if got.Spec.Template.Annotations[restartedAtAnnotation] == "" {
+		t.Errorf("Spec.Template.Annotations[%q] is empty; restartControllerDeployment did not reach RolloutRestart with the pod-label-resolved name", restartedAtAnnotation)
 	}
 }
 
 // TestRestartControllerDeploymentPodResolutionFailure asserts that a
-// resolution failure (no matching Pod — the exact live symptom the
-// underlying bug produced) is surfaced as an error rather than silently
-// treated as a no-op restart.
+// resolution failure (no matching Pod) is surfaced as an error rather than
+// silently treated as a no-op restart.
 func TestRestartControllerDeploymentPodResolutionFailure(t *testing.T) {
 	t.Setenv(providerDeploymentEnvVar, "")
-	// Force exec: bare-struct Runner, execFunc-only — see
-	// TestRestartControllerDeploymentResolvesViaPodLabel's doc comment for
-	// why the default client-go routing cannot be used here.
-	t.Setenv(kubeBackendEnvVar, "exec")
 
-	r := &Runner{
-		execFunc: func(args []string) (string, error) {
-			if len(args) >= 2 && args[0] == kubectlGetSubcommand && args[1] == "pods" {
-				return "", fmt.Errorf("array index out of bounds: index 0, length 0")
-			}
-			return "", fmt.Errorf("unexpected kubectl invocation: %v", args)
-		},
-	}
+	cs := fake.NewSimpleClientset()
+	r := &Runner{kubeClientsetFunc: func() (kubernetes.Interface, error) { return cs, nil }}
 
 	err := r.restartControllerDeployment()
 	if err == nil {
@@ -3056,10 +3002,9 @@ func TestRestartControllerDeploymentPodResolutionFailure(t *testing.T) {
 
 // TestResetEventBurstDefaultsToClientGoThroughFullCallGraph exercises the
 // full production call graph resetEventBurst -> restartControllerDeployment
-// -> KubeClient.RolloutRestart/RolloutStatus with NO kubeBackendEnvVar
-// override and NO restartFunc/execFunc shortcut standing in for any part of
-// it — proving that, by default, none of that chain reaches Runner.exec.
-// The target Deployment starts short of its desired rollout state and a
+// -> KubeClient.RolloutRestart/RolloutStatus with NO restartFunc shortcut
+// standing in for any part of it. The target Deployment starts short of
+// its desired rollout state and a
 // background goroutine advances it to complete partway through
 // RolloutStatus's poll, covering the rollout-not-yet-complete -> complete
 // transition through this call graph, not only at the KubeClient level.
@@ -3186,23 +3131,19 @@ func TestResolveControllerDeploymentName(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv(providerDeploymentEnvVar, tc.override)
-			// Force exec: this table drives its pod fixtures (tc.pods)
-			// through fakeCluster's own "get pods" handler, which the
-			// exec backend reaches via the wrapped execFunc below. The
-			// default client-go routing would instead hit newFakeRunner's
-			// fixed single-Pod fixture and could not express an ambiguous
-			// or empty pod set.
-			t.Setenv(kubeBackendEnvVar, "exec")
 
-			f := &fakeCluster{providerPods: tc.pods}
-			r := newFakeRunner(f)
-			var sawPodCall bool
-			r.execFunc = func(args []string) (string, error) {
-				if len(args) >= 2 && args[0] == kubectlGetSubcommand && args[1] == "pods" {
-					sawPodCall = true
-				}
-				return f.exec(args)
+			objs := make([]runtime.Object, 0, len(tc.pods))
+			for i, revision := range tc.pods {
+				objs = append(objs, &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      fmt.Sprintf("provider-example-pod-%d", i),
+						Namespace: providerDeploymentNamespace,
+						Labels:    map[string]string{providerDeploymentSelector: revision},
+					},
+				})
 			}
+			cs := fake.NewSimpleClientset(objs...)
+			r := &Runner{kubeClientsetFunc: func() (kubernetes.Interface, error) { return cs, nil }}
 
 			got, err := r.resolveControllerDeploymentName()
 			if tc.wantErr {
@@ -3220,6 +3161,12 @@ func TestResolveControllerDeploymentName(t *testing.T) {
 				}
 				if got != tc.want {
 					t.Errorf("%s: resolveControllerDeploymentName() = %q, want %q", tc.reason, got, tc.want)
+				}
+			}
+			var sawPodCall bool
+			for _, action := range cs.Actions() {
+				if action.GetVerb() == "list" && action.GetResource().Resource == "pods" {
+					sawPodCall = true
 				}
 			}
 			if sawPodCall != tc.wantPodCall {
@@ -3347,53 +3294,39 @@ func TestLatestControllerPodIdentity(t *testing.T) {
 	}
 }
 
-// TestResolveControllerPodIdentityLive exercises the real kubectl argv
-// resolveControllerPodIdentityLive issues: it must resolve the Deployment
-// name first (exactly as restartControllerDeployment does), then scope its
-// Pod lookup to THAT Deployment's revision label value specifically —
-// never the bare selector every installed provider's Pods also match — and
-// parse the newest entry out of the result.
+// TestResolveControllerPodIdentityLive proves resolveControllerPodIdentityLive
+// scopes its Pod lookup to the RESOLVED Deployment's own revision label
+// value — never the bare selector every installed provider's Pods also
+// match — and reduces multiple matching Pods to the newest one.
 func TestResolveControllerPodIdentityLive(t *testing.T) {
-	t.Setenv(providerDeploymentEnvVar, "")
-	// Force exec: bare-struct Runner, execFunc-only — see
-	// TestRestartControllerDeploymentResolvesViaPodLabel's doc comment for
-	// why the default client-go routing cannot be used here. The client-go
-	// path itself is proven separately by
-	// TestClientGoControllerRevisionLabelsAndPodIdentities.
-	t.Setenv(kubeBackendEnvVar, "exec")
+	t.Setenv(providerDeploymentEnvVar, testProviderDeployment)
 
-	var gotPodArgs []string
-	r := &Runner{
-		execFunc: func(args []string) (string, error) {
-			switch {
-			case len(args) >= 2 && args[0] == kubectlGetSubcommand && args[1] == "deploy":
-				return "", fmt.Errorf("array index out of bounds: index 0, length 0")
-			case len(args) >= 2 && args[0] == kubectlGetSubcommand && args[1] == "pods" && containsArg(args, "-o") && strings.Contains(args[len(args)-1], "labels"):
-				// resolveControllerDeploymentName's own lookup.
-				return testProviderDeployment + "\n", nil
-			case len(args) >= 2 && args[0] == kubectlGetSubcommand && args[1] == "pods":
-				gotPodArgs = args
-				return "provider-example-7c9d4f6b7-abcde\t2026-01-02T03:04:05Z\nprovider-example-7c9d4f6b7-fghij\t2026-01-02T03:05:00Z\n", nil
-			default:
-				return "", fmt.Errorf("unexpected kubectl invocation: %v", args)
-			}
-		},
+	older := metav1.NewTime(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC))
+	newer := metav1.NewTime(time.Date(2026, 1, 2, 3, 5, 0, 0, time.UTC))
+	makePod := func(name, revision string, created metav1.Time) *corev1.Pod {
+		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name:              name,
+			Namespace:         providerDeploymentNamespace,
+			Labels:            map[string]string{providerDeploymentSelector: revision},
+			CreationTimestamp: created,
+		}}
 	}
+	cs := fake.NewSimpleClientset(
+		makePod("provider-example-7c9d4f6b7-abcde", testProviderDeployment, older),
+		makePod("provider-example-7c9d4f6b7-fghij", testProviderDeployment, newer),
+		// A sibling installed provider's Pod, carrying a DIFFERENT revision
+		// value — must be excluded by the scoped selector.
+		makePod("provider-other-pod", testOtherProviderDeployment, newer),
+	)
+	r := &Runner{kubeClientsetFunc: func() (kubernetes.Interface, error) { return cs, nil }}
 
 	got, err := r.resolveControllerPodIdentityLive()
 	if err != nil {
 		t.Fatalf("resolveControllerPodIdentityLive: unexpected error: %v", err)
 	}
-	want := controllerPodIdentity{Name: "provider-example-7c9d4f6b7-fghij", CreatedAt: time.Date(2026, 1, 2, 3, 5, 0, 0, time.UTC)}
+	want := controllerPodIdentity{Name: "provider-example-7c9d4f6b7-fghij", CreatedAt: newer.Time}
 	if got != want {
-		t.Errorf("resolveControllerPodIdentityLive() = %+v, want %+v (the newer of the two Pods)", got, want)
-	}
-	if gotPodArgs == nil {
-		t.Fatal("expected an identity-lookup `kubectl get pods` call")
-	}
-	if !containsArg(gotPodArgs, providerDeploymentSelector+"="+testProviderDeployment) {
-		t.Errorf("identity lookup argv missing selector scoped to the resolved Deployment (%s=%s): %v",
-			providerDeploymentSelector, testProviderDeployment, gotPodArgs)
+		t.Errorf("resolveControllerPodIdentityLive() = %+v, want %+v (the newer of the two matching Pods, excluding the sibling provider's)", got, want)
 	}
 }
 
@@ -3403,19 +3336,9 @@ func TestResolveControllerPodIdentityLive(t *testing.T) {
 // zero-value identity.
 func TestResolveControllerPodIdentityLivePropagatesDeploymentResolutionFailure(t *testing.T) {
 	t.Setenv(providerDeploymentEnvVar, "")
-	// Force exec: bare-struct Runner, execFunc-only — see
-	// TestRestartControllerDeploymentResolvesViaPodLabel's doc comment for
-	// why the default client-go routing cannot be used here.
-	t.Setenv(kubeBackendEnvVar, "exec")
 
-	r := &Runner{
-		execFunc: func(args []string) (string, error) {
-			if len(args) >= 2 && args[0] == kubectlGetSubcommand && args[1] == "pods" {
-				return "", fmt.Errorf("array index out of bounds: index 0, length 0")
-			}
-			return "", fmt.Errorf("unexpected kubectl invocation: %v", args)
-		},
-	}
+	cs := fake.NewSimpleClientset()
+	r := &Runner{kubeClientsetFunc: func() (kubernetes.Interface, error) { return cs, nil }}
 
 	_, err := r.resolveControllerPodIdentityLive()
 	if err == nil {
@@ -3846,16 +3769,6 @@ func TestBuildMergePatchRejectsUnsupportedWithValuesShapes(t *testing.T) {
 	}
 }
 
-// containsArg reports whether want appears anywhere in args.
-func containsArg(args []string, want string) bool {
-	for _, a := range args {
-		if a == want {
-			return true
-		}
-	}
-	return false
-}
-
 // TestCompareFieldValue covers compareFieldValue directly: with both
 // ignoreMapKeys and ignoreListElementKeys empty it must behave exactly like
 // jsonEqual (every existing caller's contract); a non-empty ignoreMapKeys
@@ -4278,74 +4191,4 @@ func outputSpecOf(args []string) string {
 		}
 	}
 	return ""
-}
-
-// TestExecCapturesKubectlStderr exercises the REAL exec() path — r.kubectl
-// pointed at a fake script on disk — rather than the execFunc test seam
-// every other test in this file uses. execFunc short-circuits ahead of the
-// exec.Command construction this bug lives in (Go's os/exec only populates
-// ExitError.Stderr when the caller leaves cmd.Stderr nil), so it is the one
-// test that can prove or disprove the fix.
-//
-// It asserts two things a fix must hold simultaneously: the failing
-// command's stderr text reaches the returned error, AND it still reaches
-// os.Stderr live (the tee, not a switch from one destination to the other).
-func TestExecCapturesKubectlStderr(t *testing.T) {
-	const sentinel = "timed out waiting for the condition"
-
-	script := writeFakeKubectlStderrScript(t, sentinel)
-	r := &Runner{kubectl: script}
-
-	streamed := captureOSStderr(t, func() {
-		_, err := r.exec("get", "widget")
-		if err == nil {
-			t.Fatal("exec() returned a nil error for a non-zero exit")
-		}
-		if !strings.Contains(err.Error(), sentinel) {
-			t.Errorf("exec() error = %q, want it to contain %q", err.Error(), sentinel)
-		}
-	})
-
-	if !strings.Contains(streamed, sentinel) {
-		t.Errorf("live-streamed stderr = %q, want it to contain %q", streamed, sentinel)
-	}
-}
-
-// writeFakeKubectlStderrScript writes an executable shell script to a
-// t.TempDir() that writes sentinel to stderr and exits 1, standing in for a
-// failing kubectl invocation. It returns the script's path.
-func writeFakeKubectlStderrScript(t *testing.T, sentinel string) string {
-	t.Helper()
-
-	dir := t.TempDir()
-	path := filepath.Join(dir, "fake-kubectl")
-	body := fmt.Sprintf("#!/bin/sh\necho %q 1>&2\nexit 1\n", sentinel)
-	if err := os.WriteFile(path, []byte(body), 0o755); err != nil { //nolint:gosec // test fixture, needs to be executable
-		t.Fatalf("write fake kubectl script: %v", err)
-	}
-	return path
-}
-
-// captureOSStderr redirects os.Stderr to an in-memory pipe for the duration
-// of fn, restores it afterward, and returns everything written during fn.
-func captureOSStderr(t *testing.T, fn func()) string {
-	t.Helper()
-
-	orig := os.Stderr
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("os.Pipe: %v", err)
-	}
-	os.Stderr = w
-
-	fn()
-
-	w.Close()
-	os.Stderr = orig
-
-	out, err := io.ReadAll(r)
-	if err != nil {
-		t.Fatalf("read captured stderr: %v", err)
-	}
-	return string(out)
 }

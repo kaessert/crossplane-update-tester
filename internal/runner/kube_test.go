@@ -31,197 +31,10 @@ import (
 	ktesting "k8s.io/client-go/testing"
 )
 
-// TestKubeClientArgvEquivalence captures the exact kubectl argv the
-// exec-backed KubeClient produces for every operation the seam covers, and
-// asserts it against the literal argv the pre-seam code built inline at
-// each of the 15 call sites it replaced (runner.go's ResolveResource,
-// ClearConditions, NudgeReconcile, Patch, WaitReady, GetObject,
-// restartControllerDeployment, resolveControllerDeploymentName,
-// resolveControllerPodIdentityLive; converge.go's countUpdateLogCalls and
-// countEventsByReason; resolve.go's pause, stripExternalName and unpause).
-// This is the mechanical proof that the seam is behaviour-identical, not an
-// assertion in prose. kubeBackendEnvVar is forced to "exec" for the whole
-// table: kube() no longer has a separate branch for "a test harness with no
-// client-go override", so this is the one deliberate, explicit route to the
-// exec backend every operation in this proof needs.
-func TestKubeClientArgvEquivalence(t *testing.T) {
-	t.Setenv(kubeBackendEnvVar, "exec")
-	const (
-		ns        = "test-namespace"
-		name      = "exampleresource.example.crossplane.io/example-resource"
-		manifest  = "/tmp/example-resource.yaml"
-		patchJSON = `{"spec":{"forProvider":{"field":"value"}}}`
-		condition = "condition=Ready"
-		timeout   = "300s"
-		selector  = "pkg.crossplane.io/revision"
-		target    = "deploy/release-name"
-		since     = "30s"
-	)
-
-	tests := map[string]struct {
-		reason   string
-		call     func(c KubeClient) (string, error)
-		wantArgs []string
-	}{
-		"GetObjectJSON no namespace": {
-			reason:   "GetObject called `kubectl get <name> -o json` with no -n flag for a cluster-scoped resource",
-			call:     func(c KubeClient) (string, error) { return c.GetObjectJSON("", name) },
-			wantArgs: []string{"get", name, "-o", "json"},
-		},
-		"GetObjectJSON namespaced": {
-			reason:   "GetObject appended -n <namespace> AFTER the rest of the argv for a namespaced resource",
-			call:     func(c KubeClient) (string, error) { return c.GetObjectJSON(ns, name) },
-			wantArgs: []string{"get", name, "-o", "json", "-n", ns},
-		},
-		"ResolveManifestName no namespace": {
-			reason:   "ResolveResource called `kubectl get -f <manifest> -o name`, always before r.namespace is set",
-			call:     func(c KubeClient) (string, error) { return c.ResolveManifestName("", manifest) },
-			wantArgs: []string{"get", "-f", manifest, "-o", "name"},
-		},
-		"ResolveManifestName namespaced": {
-			reason:   "the manifest-name lookup scopes to -n exactly like every other namespace-aware operation",
-			call:     func(c KubeClient) (string, error) { return c.ResolveManifestName(ns, manifest) },
-			wantArgs: []string{"get", "-f", manifest, "-o", "name", "-n", ns},
-		},
-		"PatchMerge": {
-			reason:   "NudgeReconcile, Patch, pause, stripExternalName and unpause all built this exact shape, differing only in the patch body",
-			call:     func(c KubeClient) (string, error) { return c.PatchMerge(ns, name, patchJSON) },
-			wantArgs: []string{"patch", name, "--type=merge", "-p", patchJSON, "-n", ns},
-		},
-		"PatchMergeStatus": {
-			reason: "ClearConditions patched the status subresource with --subresource=status ahead of --type=merge",
-			call: func(c KubeClient) (string, error) {
-				return c.PatchMergeStatus(ns, name, `{"status":{"conditions":[]}}`)
-			},
-			wantArgs: []string{"patch", name, "--subresource=status", "--type=merge", "-p", `{"status":{"conditions":[]}}`, "-n", ns},
-		},
-		"WaitForCondition": {
-			reason:   "WaitReady always waited on condition=Ready with a --timeout flag",
-			call:     func(c KubeClient) (string, error) { return c.WaitForCondition(ns, name, condition, timeout) },
-			wantArgs: []string{"wait", name, "--for=condition=Ready", "--timeout=300s", "-n", ns},
-		},
-		"ListEventsForObject namespaced": {
-			reason: "countEventsByReason's exec backend lists events across every namespace, narrowed by a field selector on involvedObject, and never carries a -n flag",
-			call:   func(c KubeClient) (string, error) { return c.ListEventsForObject(testKindExample, name, ns) },
-			wantArgs: []string{"get", "events", "--all-namespaces", "-o", "json", "--field-selector",
-				"involvedObject.kind=" + testKindExample + ",involvedObject.name=" + name + ",involvedObject.namespace=" + ns},
-		},
-		"ListEventsForObject cluster-scoped": {
-			reason: "a cluster-scoped resource's field selector carries an explicit EMPTY involvedObject.namespace term, never an omitted one — omitting it would match ANY namespace, including a namespaced sibling's",
-			call:   func(c KubeClient) (string, error) { return c.ListEventsForObject(testKindExample, name, "") },
-			wantArgs: []string{"get", "events", "--all-namespaces", "-o", "json", "--field-selector",
-				"involvedObject.kind=" + testKindExample + ",involvedObject.name=" + name + ",involvedObject.namespace="},
-		},
-		"ProviderLogs": {
-			reason: "countUpdateLogCalls always sent --tail=-1 ahead of --since, scoped to the PROVIDER namespace by an explicit -n rather than the resource's own namespace",
-			call: func(c KubeClient) (string, error) {
-				return c.ProviderLogs(providerDeploymentNamespace, selector, since)
-			},
-			wantArgs: []string{"logs", "-n", providerDeploymentNamespace, "-l", selector, "--tail=-1", "--since=30s"},
-		},
-		"RolloutRestart": {
-			reason:   "restartControllerDeployment issued rollout restart with the target BEFORE -n, never after",
-			call:     func(c KubeClient) (string, error) { return c.RolloutRestart(providerDeploymentNamespace, target) },
-			wantArgs: []string{"rollout", "restart", target, "-n", providerDeploymentNamespace},
-		},
-		"RolloutStatus": {
-			reason: "restartControllerDeployment's rollout status wait carried --timeout AFTER -n",
-			call: func(c KubeClient) (string, error) {
-				return c.RolloutStatus(providerDeploymentNamespace, target, timeout)
-			},
-			wantArgs: []string{"rollout", "status", target, "-n", providerDeploymentNamespace, "--timeout=300s"},
-		},
-	}
-
-	for tn, tc := range tests {
-		t.Run(tn, func(t *testing.T) {
-			var gotArgs []string
-			r := &Runner{execFunc: func(args []string) (string, error) {
-				gotArgs = args
-				return "", nil
-			}}
-			if _, err := tc.call(r.kube()); err != nil {
-				t.Fatalf("%s: unexpected error: %v", tc.reason, err)
-			}
-			if !reflect.DeepEqual(gotArgs, tc.wantArgs) {
-				t.Errorf("%s:\n got  %#v\n want %#v", tc.reason, gotArgs, tc.wantArgs)
-			}
-		})
-	}
-}
-
-// TestExecControllerRevisionLabelsArgvAndParsing pins the exec backend's
-// ControllerRevisionLabels to the exact `kubectl get pods ... -o
-// jsonpath=...` argv resolveControllerDeploymentName has always issued
-// (unchanged by the pod-identity port — see hack/smoke-test.sh section 6,
-// which asserts on this exact line), and proves the raw jsonpath output is
-// reduced to deduplicated, non-empty label values.
-func TestExecControllerRevisionLabelsArgvAndParsing(t *testing.T) {
-	t.Setenv(kubeBackendEnvVar, "exec")
-
-	var gotArgs []string
-	r := &Runner{execFunc: func(args []string) (string, error) {
-		gotArgs = args
-		return "release-a\nrelease-a\nrelease-b\n", nil
-	}}
-
-	got, err := r.kube().ControllerRevisionLabels(providerDeploymentNamespace, providerDeploymentSelector)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	wantArgs := []string{"get", "pods", "-n", providerDeploymentNamespace, "-l", providerDeploymentSelector, "-o",
-		`jsonpath={range .items[*]}{.metadata.labels.pkg\.crossplane\.io/revision}{"\n"}{end}`}
-	if !reflect.DeepEqual(gotArgs, wantArgs) {
-		t.Errorf("argv:\n got  %#v\n want %#v", gotArgs, wantArgs)
-	}
-
-	want := []string{"release-a", "release-b"}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("ControllerRevisionLabels() = %v, want %v (deduplicated, order-preserved)", got, want)
-	}
-}
-
-// TestExecControllerPodIdentitiesArgvAndParsing pins the exec backend's
-// ControllerPodIdentities to the exact `kubectl get pods ... -o
-// jsonpath=...` argv resolveControllerPodIdentityLive has always issued,
-// and proves the raw "<name>\t<creationTimestamp>" output is parsed into
-// typed identities exactly as parseControllerPodIdentities always did.
-func TestExecControllerPodIdentitiesArgvAndParsing(t *testing.T) {
-	t.Setenv(kubeBackendEnvVar, "exec")
-
-	var gotArgs []string
-	r := &Runner{execFunc: func(args []string) (string, error) {
-		gotArgs = args
-		return "pod-a\t2026-01-02T03:04:05Z\n", nil
-	}}
-
-	podSel := providerDeploymentSelector + "=release-name"
-	got, err := r.kube().ControllerPodIdentities(providerDeploymentNamespace, podSel)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	wantArgs := []string{"get", "pods", "-n", providerDeploymentNamespace, "-l", podSel, "-o",
-		`jsonpath={range .items[*]}{.metadata.name}{"\t"}{.metadata.creationTimestamp}{"\n"}{end}`}
-	if !reflect.DeepEqual(gotArgs, wantArgs) {
-		t.Errorf("argv:\n got  %#v\n want %#v", gotArgs, wantArgs)
-	}
-
-	want := []controllerPodIdentity{{Name: "pod-a", CreatedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("ControllerPodIdentities() = %+v, want %+v", got, want)
-	}
-}
-
-// TestClientGoControllerRevisionLabelsAndPodIdentities proves the DEFAULT
-// (client-go) backend routing serves ControllerRevisionLabels and
-// ControllerPodIdentities entirely through a fake client-go Clientset — no
-// execFunc is set here at all, so a regression that silently fell back to
-// the promoted exec backend would try to invoke a real "kubectl" binary
-// and fail loudly rather than passing quietly. This is what proves the
-// pod-identity port actually reaches client-go by default, not merely that
-// the exec backend still behaves as before.
+// TestClientGoControllerRevisionLabelsAndPodIdentities proves
+// ControllerRevisionLabels and ControllerPodIdentities are served entirely
+// through a fake client-go Clientset — a regression that tried to reach a
+// real cluster would fail loudly rather than passing quietly.
 func TestClientGoControllerRevisionLabelsAndPodIdentities(t *testing.T) {
 	pod := func(name, revision string, created time.Time) *corev1.Pod {
 		return &corev1.Pod{
@@ -291,51 +104,8 @@ func TestClientGoControllerRevisionLabelsAndPodIdentities(t *testing.T) {
 	}
 }
 
-// TestRunnerKubeUsesExecFunc was removed when the exec-fallback branch it
-// existed to pin ("execFunc set with no kubeClientsetFunc override stays on
-// the exec backend") was deleted from kube() — see kube()'s own doc
-// comment. Its coverage is superseded by
-// TestRunnerKubeBackendEnvVarForcesExec (the deliberate, explicit route to
-// the exec backend that replaced it) and
-// TestRunnerKubeDefaultsToClientGoForEvents (the default routing a bare
-// struct literal now takes).
-
-// TestRunnerKubeBackendEnvVarForcesExec proves UPDATE_TESTER_KUBE_BACKEND=exec
-// overrides EVEN a Runner that HAS a working client-go override — the escape
-// hatch must win over the default routing rule, not merely apply when no
-// client-go client is available.
-func TestRunnerKubeBackendEnvVarForcesExec(t *testing.T) {
-	t.Setenv(kubeBackendEnvVar, "exec")
-
-	execCalled := false
-	clientsetCalled := false
-	r := &Runner{
-		execFunc: func(args []string) (string, error) {
-			execCalled = true
-			return `{"items":[]}`, nil
-		},
-		kubeClientsetFunc: func() (kubernetes.Interface, error) {
-			clientsetCalled = true
-			return fake.NewSimpleClientset(), nil
-		},
-	}
-
-	if _, err := r.kube().ListEventsForObject(testKindExample, testNameExample, ""); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !execCalled {
-		t.Error("execFunc was not invoked; UPDATE_TESTER_KUBE_BACKEND=exec did not force the exec backend")
-	}
-	if clientsetCalled {
-		t.Error("kubeClientsetFunc was invoked; UPDATE_TESTER_KUBE_BACKEND=exec must bypass the client-go backend entirely")
-	}
-}
-
-// TestRunnerKubeDefaultsToClientGoForEvents proves the DEFAULT routing (no
-// env var, no execFunc) serves ListEventsForObject through the client-go
-// backend — "this operation defaults to the Go backend once parity is
-// proven" is the routing rule under test, not merely something the escape
-// hatch can opt into.
+// TestRunnerKubeDefaultsToClientGoForEvents proves ListEventsForObject is
+// served through the client-go backend.
 func TestRunnerKubeDefaultsToClientGoForEvents(t *testing.T) {
 	clientsetCalled := false
 	r := &Runner{
@@ -390,9 +160,8 @@ func newTestClientGoEvent(name, namespace, reason string, count int32, kind, inv
 }
 
 // TestClientGoKubeClientListEventsForObjectSendsFieldSelector proves the
-// client-go backend actually issues the SAME field selector the exec
-// backend builds (see TestKubeClientArgvEquivalence's ListEventsForObject
-// cases), by capturing the fake clientset's recorded List action rather
+// client-go backend actually issues the selector eventFieldSelector
+// builds, by capturing the fake clientset's recorded List action rather
 // than trusting the return value alone — the fake ignores FieldSelector
 // when deciding what to return, so only inspecting the action proves the
 // selector was actually sent.
@@ -423,56 +192,25 @@ func TestClientGoKubeClientListEventsForObjectSendsFieldSelector(t *testing.T) {
 	}
 }
 
-// TestCountEventsByReasonExecAndClientGoAgreeOnAggregatedCount is the AC's
-// load-bearing parity proof: for the SAME cluster state — one aggregated
-// Event whose .count is 7, i.e. greater than 1 — the exec backend (parsing
-// kubectl's JSON) and the client-go backend (parsing a corev1.EventList
-// marshalled back to the same JSON shape) must report the identical
-// occurrence count. A backend that counted Items instead of summing .count
-// would silently report 1 instead of 7 on whichever path had the bug.
-func TestCountEventsByReasonExecAndClientGoAgreeOnAggregatedCount(t *testing.T) {
+// TestCountEventsByReasonAggregatesEventCount is the AC's load-bearing
+// proof: for one aggregated Event whose .count is 7, i.e. greater than 1,
+// countEventsByReason must report that occurrence count. A backend that
+// counted Items instead of summing .count would silently report 1 instead
+// of 7.
+func TestCountEventsByReasonAggregatesEventCount(t *testing.T) {
 	const wantCount = 7
 
-	// Exec path: canned kubectl JSON, forced onto the exec backend via the
-	// escape hatch so this Runner's default routing cannot mask the
-	// comparison.
-	t.Setenv(kubeBackendEnvVar, "exec")
-	execRunner := &Runner{execFunc: func(args []string) (string, error) {
-		list := eventList{Items: []eventItem{
-			newTestEventItem(eventReasonUpdated, wantCount, testKindExample, testNameExample),
-		}}
-		b, err := json.Marshal(list)
-		if err != nil {
-			return "", err
-		}
-		return string(b), nil
-	}}
-	gotExec, err := execRunner.countEventsByReason(testKindExample, testNameExample, "", "", eventReasonUpdated)
-	if err != nil {
-		t.Fatalf("exec path: countEventsByReason() error = %v", err)
-	}
-
-	// client-go path: the same logical event, seeded as a native
-	// corev1.Event into a fake clientset — no env var, proving the
-	// DEFAULT routing serves this.
-	t.Setenv(kubeBackendEnvVar, "")
 	cs := fake.NewSimpleClientset(
 		newTestClientGoEvent("evt-1", "", eventReasonUpdated, wantCount, testKindExample, testNameExample, "", ""),
 	)
-	goRunner := &Runner{kubeClientsetFunc: func() (kubernetes.Interface, error) { return cs, nil }}
-	gotGo, err := goRunner.countEventsByReason(testKindExample, testNameExample, "", "", eventReasonUpdated)
+	r := &Runner{kubeClientsetFunc: func() (kubernetes.Interface, error) { return cs, nil }}
+	got, err := r.countEventsByReason(testKindExample, testNameExample, "", "", eventReasonUpdated)
 	if err != nil {
-		t.Fatalf("client-go path: countEventsByReason() error = %v", err)
+		t.Fatalf("countEventsByReason() error = %v", err)
 	}
 
-	if gotExec != wantCount {
-		t.Errorf("exec path: countEventsByReason() = %d, want %d", gotExec, wantCount)
-	}
-	if gotGo != wantCount {
-		t.Errorf("client-go path: countEventsByReason() = %d, want %d", gotGo, wantCount)
-	}
-	if gotExec != gotGo {
-		t.Errorf("exec and client-go paths disagree for identical cluster state: exec=%d, client-go=%d", gotExec, gotGo)
+	if got != wantCount {
+		t.Errorf("countEventsByReason() = %d, want %d", got, wantCount)
 	}
 }
 
@@ -516,78 +254,9 @@ func TestCountEventsByReasonClientGoDoesNotCrossMatchNamespacedSibling(t *testin
 	}
 }
 
-// TestKubeBackendSelectionLineDiffersBetweenForcedAndDefault is the parity
-// proof's own precondition: a forced-exec Runner's recorded backend line
-// must be distinguishable from a default Runner's, or the record cannot
-// answer the question it exists for — which backend actually served a
-// given run.
-func TestKubeBackendSelectionLineDiffersBetweenForcedAndDefault(t *testing.T) {
-	forced := kubeBackendSelectionLine(true)
-	deflt := kubeBackendSelectionLine(false)
-
-	if forced == deflt {
-		t.Fatalf("forced-exec and default lines are identical: %q", forced)
-	}
-	if !strings.Contains(forced, kubeBackendEnvVar) {
-		t.Errorf("forced-exec line = %q, want it to name %s", forced, kubeBackendEnvVar)
-	}
-}
-
-// TestKubeLogsBackendSelectionOncePerRunner proves kube() records its
-// backend choice to stderr exactly once per Runner, no matter how many
-// times kube() is subsequently called — a full catalog run calls it on the
-// order of a thousand times for event reads alone (see
-// kubeBackendLogOnce), and the review that motivated this record needs the
-// line to be a single reliable marker, not one buried in a thousand
-// duplicates.
-func TestKubeLogsBackendSelectionOncePerRunner(t *testing.T) {
-	t.Setenv(kubeBackendEnvVar, "exec")
-	r := &Runner{execFunc: func(args []string) (string, error) { return "", nil }}
-
-	out := captureOSStderr(t, func() {
-		for i := 0; i < 5; i++ {
-			if _, err := r.kube().ListEventsForObject(testKindExample, testNameExample, ""); err != nil {
-				t.Fatalf("call %d: unexpected error: %v", i, err)
-			}
-		}
-	})
-
-	if got := strings.Count(out, "kube backend:"); got != 1 {
-		t.Fatalf("kube backend line appeared %d time(s) across 5 kube() calls on one Runner, want exactly 1:\n%s", got, out)
-	}
-	if !strings.Contains(out, "forced by "+kubeBackendEnvVar+"=exec") {
-		t.Errorf("logged line = %q, want it to say the choice was forced by %s", out, kubeBackendEnvVar)
-	}
-}
-
-// TestKubeLogsClientGoBackendByDefault proves the default (unforced,
-// non-test-fallback) Runner's recorded line names the client-go backend,
-// mirroring TestRunnerKubeDefaultsToClientGoForEvents but asserting on the
-// record rather than on which func got called.
-func TestKubeLogsClientGoBackendByDefault(t *testing.T) {
-	r := &Runner{
-		kubeClientsetFunc: func() (kubernetes.Interface, error) { return fake.NewSimpleClientset(), nil },
-	}
-
-	out := captureOSStderr(t, func() {
-		if _, err := r.kube().ListEventsForObject(testKindExample, testNameExample, ""); err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-	})
-
-	if !strings.Contains(out, "client-go") {
-		t.Errorf("logged line = %q, want it to name the client-go backend", out)
-	}
-	if strings.Contains(out, "forced by") {
-		t.Errorf("logged line = %q, an unforced default Runner must not claim to be forced", out)
-	}
-}
-
 // testGVRGroup, testGVRVersion and testGVRResource are the group, version
 // and properly pluralized resource name GetObjectJSON's client-go backend
-// resolves testKindExample's kubectl `-o name` type segment to — distinct
-// from the generic "name" fixture the argv-equivalence tests above use,
-// which is never resolved against a real RESTMapper.
+// resolves testKindExample's kubectl `-o name` type segment to.
 const (
 	testGVRGroup    = "example.crossplane.io"
 	testGVRVersion  = "v1alpha1"
@@ -670,13 +339,12 @@ func (m *fakeRESTMapper) ResourceSingularizer(string) (string, error) {
 	panic("ResourceSingularizer: not used by the GetObjectJSON migration")
 }
 
-// TestGetObjectJSONResolvesGVRAndReadsViaDynamicClient proves the DEFAULT
-// routing (no env var, no execFunc) serves GetObjectJSON through the
-// client-go backend: the kubectl `-o name` identifier is resolved to a GVR
-// via the RESTMapper, and the dynamic Get is issued against the BARE object
-// name (never the "type/name" string, which is not a valid API object
-// name) scoped to the caller's namespace exactly — empty for cluster-scoped,
-// never a guessed default.
+// TestGetObjectJSONResolvesGVRAndReadsViaDynamicClient proves GetObjectJSON
+// is served through the client-go backend: the kubectl `-o name` identifier
+// is resolved to a GVR via the RESTMapper, and the dynamic Get is issued
+// against the BARE object name (never the "type/name" string, which is not
+// a valid API object name) scoped to the caller's namespace exactly —
+// empty for cluster-scoped, never a guessed default.
 func TestGetObjectJSONResolvesGVRAndReadsViaDynamicClient(t *testing.T) {
 	cases := map[string]struct {
 		reason    string
@@ -739,51 +407,44 @@ func TestGetObjectJSONResolvesGVRAndReadsViaDynamicClient(t *testing.T) {
 	}
 }
 
-// TestGetObjectJSONExecAndClientGoAgreeOnDecodedMap is the AC's load-bearing
-// parity proof: for the SAME logical object, the exec backend (parsing
-// canned kubectl JSON) and the client-go backend (parsing a dynamic Get's
-// unstructured result, marshalled back to JSON) must decode to the
-// IDENTICAL map[string]interface{} — never compared as bytes, since
-// Runner.GetObject unmarshals immediately and field ordering carries no
-// meaning to any caller.
-func TestGetObjectJSONExecAndClientGoAgreeOnDecodedMap(t *testing.T) {
-	const execJSON = `{"apiVersion":"example.crossplane.io/v1alpha1","kind":"ExampleResource","metadata":{"name":"example-resource","namespace":"default"},"status":{"atProvider":{"field":"parity-value","tags":["tag-a","tag-b"],"nested":{"inner":"inner-value"},"nullable":null}}}`
-
-	// Exec path: canned kubectl JSON, forced onto the exec backend via the
-	// escape hatch so this Runner's default routing cannot mask the
-	// comparison.
-	t.Setenv(kubeBackendEnvVar, "exec")
-	execRunner := &Runner{execFunc: func(args []string) (string, error) { return execJSON, nil }}
-	execOut, err := execRunner.kube().GetObjectJSON(testNamespaceExample, testGetObjectName)
-	if err != nil {
-		t.Fatalf("exec path: unexpected error: %v", err)
-	}
-	var execDecoded map[string]interface{}
-	if err := json.Unmarshal([]byte(execOut), &execDecoded); err != nil {
-		t.Fatalf("exec path: decoding: %v", err)
-	}
-
-	// client-go path: the same logical object, seeded into a fake dynamic
-	// client — no env var, proving the DEFAULT routing serves this.
-	t.Setenv(kubeBackendEnvVar, "")
+// TestGetObjectJSONDecodesNestedShapeFaithfully is the AC's load-bearing
+// decode proof: a dynamic Get's unstructured result, marshalled back to
+// JSON, must decode to a map[string]interface{} that faithfully preserves
+// a nested object, a list and a null-valued key alongside a top-level
+// scalar — never compared as bytes, since Runner.GetObject unmarshals
+// immediately and field ordering carries no meaning to any caller.
+func TestGetObjectJSONDecodesNestedShapeFaithfully(t *testing.T) {
 	obj := newTestUnstructuredExample(testNamespaceExample, testNameExample, "parity-value")
-	goRunner := &Runner{
+	r := &Runner{
 		restMapperFunc: func() (meta.RESTMapper, error) { return &fakeRESTMapper{gvr: testGVR}, nil },
 		kubeDynamicFunc: func() (dynamic.Interface, error) {
 			return dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), obj), nil
 		},
 	}
-	goOut, err := goRunner.kube().GetObjectJSON(testNamespaceExample, testGetObjectName)
+	out, err := r.kube().GetObjectJSON(testNamespaceExample, testGetObjectName)
 	if err != nil {
-		t.Fatalf("client-go path: unexpected error: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	var goDecoded map[string]interface{}
-	if err := json.Unmarshal([]byte(goOut), &goDecoded); err != nil {
-		t.Fatalf("client-go path: decoding: %v", err)
+	var decoded map[string]interface{}
+	if err := json.Unmarshal([]byte(out), &decoded); err != nil {
+		t.Fatalf("decoding: %v", err)
 	}
 
-	if !reflect.DeepEqual(execDecoded, goDecoded) {
-		t.Errorf("exec and client-go paths disagree for the same logical object:\n exec     = %#v\n client-go = %#v", execDecoded, goDecoded)
+	want := map[string]interface{}{
+		"apiVersion": testGVRGroup + "/" + testGVRVersion,
+		"kind":       testKindExample,
+		"metadata":   map[string]interface{}{"name": testNameExample, "namespace": testNamespaceExample},
+		"status": map[string]interface{}{
+			"atProvider": map[string]interface{}{
+				"field":    "parity-value",
+				"tags":     []interface{}{"tag-a", "tag-b"},
+				"nested":   map[string]interface{}{"inner": "inner-value"},
+				"nullable": nil,
+			},
+		},
+	}
+	if !reflect.DeepEqual(decoded, want) {
+		t.Errorf("decoded = %#v, want %#v", decoded, want)
 	}
 }
 
@@ -806,43 +467,6 @@ func TestGetObjectJSONSurfacesNotFoundAsError(t *testing.T) {
 
 	if _, err := r.kube().GetObjectJSON(testNamespaceExample, testGetObjectName); err == nil {
 		t.Fatal("GetObjectJSON() error = nil for a not-found read, want a non-nil error")
-	}
-}
-
-// TestRunnerKubeBackendEnvVarForcesExecForGetObjectJSONSpecifically proves
-// UPDATE_TESTER_KUBE_BACKEND=exec forces GetObjectJSON specifically back
-// onto the exec backend, mirroring
-// TestRunnerKubeBackendEnvVarForcesExec but for the operation this ticket
-// migrates rather than event listing.
-func TestRunnerKubeBackendEnvVarForcesExecForGetObjectJSONSpecifically(t *testing.T) {
-	t.Setenv(kubeBackendEnvVar, "exec")
-
-	execCalled := false
-	mapperCalled := false
-	dynamicCalled := false
-	r := &Runner{
-		execFunc: func(args []string) (string, error) {
-			execCalled = true
-			return `{"status":{}}`, nil
-		},
-		restMapperFunc: func() (meta.RESTMapper, error) {
-			mapperCalled = true
-			return &fakeRESTMapper{gvr: testGVR}, nil
-		},
-		kubeDynamicFunc: func() (dynamic.Interface, error) {
-			dynamicCalled = true
-			return dynamicfake.NewSimpleDynamicClient(runtime.NewScheme()), nil
-		},
-	}
-
-	if _, err := r.kube().GetObjectJSON(testNamespaceExample, testGetObjectName); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !execCalled {
-		t.Error("execFunc was not invoked; UPDATE_TESTER_KUBE_BACKEND=exec did not force the exec backend for GetObjectJSON")
-	}
-	if mapperCalled || dynamicCalled {
-		t.Error("restMapperFunc/kubeDynamicFunc were invoked; UPDATE_TESTER_KUBE_BACKEND=exec must bypass the client-go backend entirely")
 	}
 }
 
@@ -912,7 +536,7 @@ func TestRESTMapperResolvedAtMostOncePerRunner(t *testing.T) {
 // "type/name" structure — a defensive check against a future call site that
 // does not go through Runner.resourceName's kubectl `-o name` convention.
 func TestResourceGVRRejectsNameWithNoTypeSegment(t *testing.T) {
-	c := &clientGoKubeClient{execKubeClient: &execKubeClient{r: &Runner{}}}
+	c := &clientGoKubeClient{r: &Runner{}}
 	if _, err := c.resourceGVR(testNameExample); err == nil {
 		t.Fatal("resourceGVR() error = nil for a name with no type segment, want a non-nil error")
 	}
@@ -921,8 +545,7 @@ func TestResourceGVRRejectsNameWithNoTypeSegment(t *testing.T) {
 // newTestPatchRunner builds a Runner wired for the client-go patch tests
 // below: a memoized fakeRESTMapper resolving testGetObjectName to testGVR,
 // and dynClient as the dynamic client the client-go backend patches
-// against. No execFunc is set, so kube() defaults to the client-go backend
-// for every test in this section unless a case explicitly forces exec.
+// against.
 func newTestPatchRunner(dynClient dynamic.Interface) *Runner {
 	return &Runner{
 		restMapperFunc:  func() (meta.RESTMapper, error) { return &fakeRESTMapper{gvr: testGVR}, nil },
@@ -1092,63 +715,6 @@ func TestClientGoKubeClientPatchBytesReachAPIServerUnmodified(t *testing.T) {
 	}
 }
 
-// TestRunnerKubeBackendEnvVarForcesExecForPatchOperations proves
-// UPDATE_TESTER_KUBE_BACKEND=exec forces BOTH PatchMerge and
-// PatchMergeStatus back onto the exec backend, mirroring
-// TestRunnerKubeBackendEnvVarForcesExecForGetObjectJSONSpecifically for the
-// two operations this ticket migrates.
-func TestRunnerKubeBackendEnvVarForcesExecForPatchOperations(t *testing.T) {
-	t.Setenv(kubeBackendEnvVar, "exec")
-
-	cases := map[string]struct {
-		reason string
-		call   func(c KubeClient) (string, error)
-	}{
-		"PatchMerge": {
-			reason: "the main-body patch must honour the escape hatch",
-			call:   func(c KubeClient) (string, error) { return c.PatchMerge(testNamespaceExample, testGetObjectName, `{}`) },
-		},
-		"PatchMergeStatus": {
-			reason: "the status patch must ALSO honour the escape hatch",
-			call: func(c KubeClient) (string, error) {
-				return c.PatchMergeStatus(testNamespaceExample, testGetObjectName, `{}`)
-			},
-		},
-	}
-
-	for tn, tc := range cases {
-		t.Run(tn, func(t *testing.T) {
-			execCalled := false
-			mapperCalled := false
-			dynamicCalled := false
-			r := &Runner{
-				execFunc: func(args []string) (string, error) {
-					execCalled = true
-					return "{}", nil
-				},
-				restMapperFunc: func() (meta.RESTMapper, error) {
-					mapperCalled = true
-					return &fakeRESTMapper{gvr: testGVR}, nil
-				},
-				kubeDynamicFunc: func() (dynamic.Interface, error) {
-					dynamicCalled = true
-					return dynamicfake.NewSimpleDynamicClient(runtime.NewScheme()), nil
-				},
-			}
-
-			if _, err := tc.call(r.kube()); err != nil {
-				t.Fatalf("%s: unexpected error: %v", tc.reason, err)
-			}
-			if !execCalled {
-				t.Errorf("%s: execFunc was not invoked; UPDATE_TESTER_KUBE_BACKEND=exec did not force the exec backend", tc.reason)
-			}
-			if mapperCalled || dynamicCalled {
-				t.Errorf("%s: restMapperFunc/kubeDynamicFunc were invoked; UPDATE_TESTER_KUBE_BACKEND=exec must bypass the client-go backend entirely", tc.reason)
-			}
-		})
-	}
-}
-
 // newRejectingPatchRunner builds a Runner whose client-go patch path always
 // fails with an HTTP 400 — the measured rejected-patch failure mode
 // (3800e8a7's union-arm-swap mode) — wired with the resourceName/namespace
@@ -1305,9 +871,8 @@ var (
 
 // writeManifestFile joins docs with a YAML document separator and writes
 // them to a temp file, returning its path — ResolveManifestName reads a
-// real path via os.ReadFile, exactly like the exec backend reads one via
-// kubectl, so a test proving its behaviour needs a real file rather than an
-// in-memory reader.
+// real path via os.ReadFile, so a test proving its behaviour needs a real
+// file rather than an in-memory reader.
 func writeManifestFile(t *testing.T, docs ...string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "manifest.yaml")
@@ -1502,42 +1067,6 @@ func TestResolveManifestNameReusesSharedRESTMapper(t *testing.T) {
 
 	if got := atomic.LoadInt32(&restMapperBuilds); got != 1 {
 		t.Errorf("restMapperFunc invoked %d time(s) across a ResolveManifestName call and a GetObjectJSON call on the same Runner, want exactly 1 — a higher count means ResolveManifestName built its own RESTMapper instead of reusing the shared one", got)
-	}
-}
-
-// TestRunnerKubeBackendEnvVarForcesExecForResolveManifestNameSpecifically
-// mirrors TestRunnerKubeBackendEnvVarForcesExecForGetObjectJSONSpecifically:
-// UPDATE_TESTER_KUBE_BACKEND=exec must force ResolveManifestName
-// specifically back onto the exec backend, this operation included.
-func TestRunnerKubeBackendEnvVarForcesExecForResolveManifestNameSpecifically(t *testing.T) {
-	t.Setenv(kubeBackendEnvVar, "exec")
-
-	execCalled := false
-	mapperCalled := false
-	dynamicCalled := false
-	r := &Runner{
-		execFunc: func(args []string) (string, error) {
-			execCalled = true
-			return testGVRResource + "." + testGVRGroup + "/" + testNameExample + "\n", nil
-		},
-		restMapperFunc: func() (meta.RESTMapper, error) {
-			mapperCalled = true
-			return &fakeManifestRESTMapper{}, nil
-		},
-		kubeDynamicFunc: func() (dynamic.Interface, error) {
-			dynamicCalled = true
-			return dynamicfake.NewSimpleDynamicClient(runtime.NewScheme()), nil
-		},
-	}
-
-	if _, err := r.kube().ResolveManifestName("", "/tmp/does-not-matter.yaml"); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !execCalled {
-		t.Error("execFunc was not invoked; UPDATE_TESTER_KUBE_BACKEND=exec did not force the exec backend for ResolveManifestName")
-	}
-	if mapperCalled || dynamicCalled {
-		t.Error("restMapperFunc/kubeDynamicFunc were invoked; UPDATE_TESTER_KUBE_BACKEND=exec must bypass the client-go backend entirely")
 	}
 }
 
@@ -1774,31 +1303,22 @@ func TestDeploymentRolloutComplete(t *testing.T) {
 	}
 }
 
-// TestClientGoRolloutRestartPatchesAnnotation proves the DEFAULT (client-go)
-// backend routing serves RolloutRestart entirely through a fake client-go
-// Clientset — no execFunc is reached — and that the patch it issues lands
-// exactly where restartControllerDeployment relies on it: the Deployment's
-// Pod-template restart annotation.
+// TestClientGoRolloutRestartPatchesAnnotation proves RolloutRestart is
+// served entirely through a fake client-go Clientset, and that the patch
+// it issues lands exactly where restartControllerDeployment relies on it:
+// the Deployment's Pod-template restart annotation.
 func TestClientGoRolloutRestartPatchesAnnotation(t *testing.T) {
 	const ns = providerDeploymentNamespace
 	dep := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{Name: testProviderDeployment, Namespace: ns},
 	}
 	cs := fake.NewSimpleClientset(dep)
-	execCalled := false
 	r := &Runner{
-		execFunc: func(args []string) (string, error) {
-			execCalled = true
-			return "", fmt.Errorf("exec must not be reached: %v", args)
-		},
 		kubeClientsetFunc: func() (kubernetes.Interface, error) { return cs, nil },
 	}
 
 	if _, err := r.kube().RolloutRestart(ns, "deploy/"+testProviderDeployment); err != nil {
 		t.Fatalf("RolloutRestart: unexpected error: %v", err)
-	}
-	if execCalled {
-		t.Fatal("execFunc was invoked; RolloutRestart did not default to the client-go backend")
 	}
 
 	got, err := cs.AppsV1().Deployments(ns).Get(context.Background(), testProviderDeployment, metav1.GetOptions{})
@@ -1807,38 +1327,6 @@ func TestClientGoRolloutRestartPatchesAnnotation(t *testing.T) {
 	}
 	if got.Spec.Template.Annotations[restartedAtAnnotation] == "" {
 		t.Errorf("Spec.Template.Annotations[%q] is empty; RolloutRestart did not set the restart annotation", restartedAtAnnotation)
-	}
-}
-
-// TestRunnerKubeBackendEnvVarForcesExecForRollout mirrors
-// TestRunnerKubeBackendEnvVarForcesExec for the rollout pair specifically:
-// the escape hatch must still win for RolloutRestart/RolloutStatus even
-// though they now have a working client-go override, exactly like every
-// other migrated operation.
-func TestRunnerKubeBackendEnvVarForcesExecForRollout(t *testing.T) {
-	t.Setenv(kubeBackendEnvVar, "exec")
-
-	execCalled := false
-	clientsetCalled := false
-	r := &Runner{
-		execFunc: func(args []string) (string, error) {
-			execCalled = true
-			return "", nil
-		},
-		kubeClientsetFunc: func() (kubernetes.Interface, error) {
-			clientsetCalled = true
-			return fake.NewSimpleClientset(), nil
-		},
-	}
-
-	if _, err := r.kube().RolloutRestart(providerDeploymentNamespace, "deploy/"+testProviderDeployment); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !execCalled {
-		t.Error("execFunc was not invoked; UPDATE_TESTER_KUBE_BACKEND=exec did not force the exec backend for RolloutRestart")
-	}
-	if clientsetCalled {
-		t.Error("kubeClientsetFunc was invoked; UPDATE_TESTER_KUBE_BACKEND=exec must bypass the client-go backend entirely")
 	}
 }
 

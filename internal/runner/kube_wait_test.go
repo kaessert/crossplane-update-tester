@@ -56,9 +56,8 @@ func waitCondition(conditionType, status string) map[string]interface{} {
 // newWaitTestRunner builds a Runner wired for the WaitForCondition tests
 // below: a memoized fakeRESTMapper resolving testGetObjectName to testGVR,
 // and dynClient as the dynamic client the client-go backend reads and
-// watches against. No execFunc is set, so kube() defaults to the
-// client-go backend for every test in this file unless a case explicitly
-// forces exec — mirroring newTestPatchRunner's role for the patch tests.
+// watches against — mirroring newTestPatchRunner's role for the patch
+// tests.
 func newWaitTestRunner(dynClient dynamic.Interface) *Runner {
 	return &Runner{
 		restMapperFunc:  func() (meta.RESTMapper, error) { return &fakeRESTMapper{gvr: testGVR}, nil },
@@ -354,46 +353,8 @@ func TestClientGoWaitForConditionTracksNamedConditionNotJustReady(t *testing.T) 
 	}
 }
 
-// TestRunnerKubeBackendEnvVarForcesExecForWaitForConditionSpecifically
-// proves UPDATE_TESTER_KUBE_BACKEND=exec forces WaitForCondition
-// specifically back onto the exec backend, mirroring the same escape-hatch
-// proof already in place for GetObjectJSON and the two patch operations.
-func TestRunnerKubeBackendEnvVarForcesExecForWaitForConditionSpecifically(t *testing.T) {
-	t.Setenv(kubeBackendEnvVar, "exec")
-
-	execCalled := false
-	mapperCalled := false
-	dynamicCalled := false
-	r := &Runner{
-		execFunc: func(args []string) (string, error) {
-			execCalled = true
-			return "example.crossplane.io/example condition met", nil
-		},
-		restMapperFunc: func() (meta.RESTMapper, error) {
-			mapperCalled = true
-			return &fakeRESTMapper{gvr: testGVR}, nil
-		},
-		kubeDynamicFunc: func() (dynamic.Interface, error) {
-			dynamicCalled = true
-			return dynamicfake.NewSimpleDynamicClient(runtimeScheme()), nil
-		},
-	}
-
-	if _, err := r.kube().WaitForCondition(testNamespaceExample, testGetObjectName, "condition=Ready", "300s"); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !execCalled {
-		t.Error("execFunc was not invoked; UPDATE_TESTER_KUBE_BACKEND=exec did not force the exec backend for WaitForCondition")
-	}
-	if mapperCalled || dynamicCalled {
-		t.Error("restMapperFunc/kubeDynamicFunc were invoked; UPDATE_TESTER_KUBE_BACKEND=exec must bypass the client-go backend entirely")
-	}
-}
-
-// TestRunnerKubeDefaultsToClientGoForWaitForCondition proves the DEFAULT
-// routing (no env var, no execFunc) serves WaitForCondition through the
-// client-go backend, mirroring TestRunnerKubeDefaultsToClientGoForEvents
-// but for the operation this ticket migrates.
+// TestRunnerKubeDefaultsToClientGoForWaitForCondition proves
+// WaitForCondition is served through the client-go backend.
 func TestRunnerKubeDefaultsToClientGoForWaitForCondition(t *testing.T) {
 	obj := newTestUnstructuredExampleWithConditions(testNamespaceExample, testNameExample, waitCondition("Ready", "True"))
 	dynClient := dynamicfake.NewSimpleDynamicClient(runtimeScheme(), obj)

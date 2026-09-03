@@ -1894,29 +1894,23 @@ func TestRunFieldTestNoOpUsesExpectOverride(t *testing.T) {
 	}
 }
 
-// TestPollFieldNeverConvergesInAtProviderFailsAfterReachingThePatch drives
-// a field whose patch is accepted (spec.forProvider updates, an update
-// event fires) but never lands in status.atProvider — re-homing
-// hack/smoke-test.sh's "7b. failure injection: update never lands in
-// status.atProvider" scenario as a Go-value assertion. It calls Patch and
-// pollField directly rather than the full runFieldTest/reconcileOnce chain:
-// reconcileOnce's WaitReady/waitSynced gate is orthogonal to the property
-// under test here (a patched value that never converges) and — unlike
-// pollField's own deadline — is not routed through r.sleep, so driving it
-// through a deliberately tiny r.timeout would race the fake informer's own
-// async cache sync rather than exercise pollField's timeout branch.
+// TestRunTestsStuckFieldFailsAfterReachingThePatch drives a field whose
+// patch is accepted (spec.forProvider updates, an update event fires) but
+// never lands in status.atProvider — re-homing hack/smoke-test.sh's "7b.
+// failure injection: update never lands in status.atProvider" scenario as a
+// Go-value assertion. Unlike a version of this test that calls Patch and
+// pollField directly, this one drives the scenario through RunTests — the
+// same entry point the harness exercised (`run`) — so the assertion covers
+// runFieldTest's result.Passed assignment, the evidence check and RunTests'
+// aggregation, not just the polling helper in isolation.
 //
-// r.timeout is set to a single nanosecond so pollField's deadline has
-// already elapsed by its first read, which takes the exact same "actual
-// never reached expected" branch a real unbounded timeout would, without
-// this test spending pollField's real 5-second poll-retry sleep to get
-// there.
-//
-// The harness's remaining check for this scenario — the hook aborting
-// inside "run" rather than continuing to the post-update converge — is a
-// consequence of this result's Passed=false that belongs to the caller
-// sequencing the 5 steps, not to the field test itself.
-func TestPollFieldNeverConvergesInAtProviderFailsAfterReachingThePatch(t *testing.T) {
+// No reduced timeout is needed: at newFakeRunner's default 5s r.timeout,
+// pollField's single retry sleep (a real, unstubbed time.Sleep — see its
+// doc comment for why it is not routed through r.sleepFunc) is enough to
+// reach and cross the deadline once, so the poll loop still returns the
+// unconverged value on its second read. The cost is one real ~5s sleep in
+// this test, same order as the package's other longest cases.
+func TestRunTestsStuckFieldFailsAfterReachingThePatch(t *testing.T) {
 	f := &fakeCluster{
 		forProvider:             map[string]interface{}{testFieldNotifyDelay: float64(0)},
 		atProvider:              map[string]interface{}{testFieldNotifyDelay: float64(0)},
@@ -1927,21 +1921,23 @@ func TestPollFieldNeverConvergesInAtProviderFailsAfterReachingThePatch(t *testin
 		freezeAtProviderOnPatch: true,
 	}
 	r := newFakeRunner(f)
-	r.timeout = "1ns"
 
-	if err := r.Patch(testFieldNotifyDelay, float64(1), nil, nil); err != nil {
-		t.Fatalf("Patch: unexpected error: %v", err)
+	m := &manifest.Manifest{Kind: testKindExample, Name: testNameExample}
+	m.Tests = append(m.Tests, manifest.UpdateTest{Field: testFieldNotifyDelay, Value: float64(1)})
+
+	results, _, err := r.RunTests(m)
+	if err != nil {
+		t.Fatalf("RunTests: unexpected error: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("got %d results, want 1", len(results))
+	}
+
+	if results[0].Passed {
+		t.Fatalf("results[0].Passed = true, want false — notifyDelay was patched but must never reach status.atProvider in this scenario")
 	}
 	if f.patchCalls != 1 {
-		t.Fatalf("patchCalls = %d, want 1 — the failing step must reach the patch (it fails on the assertion, not before it)", f.patchCalls)
-	}
-
-	actual, err := r.pollField(testFieldNotifyDelay, float64(1), time.Now(), nil, nil)
-	if err != nil {
-		t.Fatalf("pollField: unexpected error: %v", err)
-	}
-	if compareFieldValue(float64(1), actual, nil, nil) {
-		t.Fatalf("pollField reported %q as matching the expected value 1 — notifyDelay was patched but must never reach status.atProvider in this scenario", actual)
+		t.Fatalf("patchCalls = %d, want 1 — the failing step must reach the patch (it fails on the post-patch assertion, not before it)", f.patchCalls)
 	}
 }
 

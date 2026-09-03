@@ -853,15 +853,16 @@ func (r *Runner) countUpdateLogCalls(m *manifest.Manifest, window time.Duration,
 	if since < 1 {
 		since = 1
 	}
-	// --tail=-1 is NOT redundant. kubectl defaults --tail to 10 whenever a
-	// SELECTOR is used, and to -1 only for a single named pod — so the
-	// obvious `logs -l ... --since=Ns` returns the last ten lines of the
-	// controller's output rather than the window, silently and with a
-	// zero exit. Measured against a live looping resource, that default
-	// alone turned detection in every window into detection in two
-	// windows out of three, because the ten most recent lines are mostly
-	// other resources' reconcile chatter. ProviderLogs always sends
-	// --tail=-1 for exactly this reason.
+	// An unlimited tail is NOT redundant. kubectl defaults --tail to 10
+	// whenever a SELECTOR is used, and to -1 only for a single named pod
+	// — so the obvious `logs -l ... --since=Ns` returns the last ten
+	// lines of the controller's output rather than the window, silently
+	// and with a zero exit. Measured against a live looping resource,
+	// that default alone turned detection in every window into detection
+	// in two windows out of three, because the ten most recent lines are
+	// mostly other resources' reconcile chatter. ProviderLogs leaves
+	// PodLogOptions.TailLines nil for exactly this reason — the client-go
+	// equivalent of `--tail=-1`, see its own doc comment.
 	out, err := r.kube().ProviderLogs(providerDeploymentNamespace, providerDeploymentSelector,
 		fmt.Sprintf("%ds", since))
 	if err != nil {

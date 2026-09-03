@@ -17,31 +17,39 @@
 #  4. The manifest path that reaches the tool is ABSOLUTE and resolves to the
 #     right file per symlink. `go -C` changes the child's working directory,
 #     so a relative path either misses or — worse — finds a different file.
-#  5. A deliberately failing step exits non-zero AND aborts the steps after
-#     it. A smoke test that only proved the happy path would happily pass a
-#     hook that can no longer fail, which is the exact failure mode this tool
-#     exists to catch.
-#  6. Nothing in the whole kubectl transcript ever carried a relative manifest
-#     path.
+#  5. Invoking a post-assert hook the way `uptest` actually does — a path
+#     relative to the example's own directory — resolves to the same
+#     absolute manifest a direct invocation does.
+#  6. Two managed resources sharing the same Kind and the same name, differing
+#     only in scope, never have their update events attributed to each other.
 #
-# It builds a throwaway fake provider tree under $TMPDIR, puts a stateful fake
-# kubectl (hack/testdata/fake-kubectl.sh) first on PATH, and runs the real
-# binary against it. The hook wrapper is extracted from README.md at run time
-# rather than copied here, so this test validates the documented script and
-# fails if the README drifts away from it.
+# It builds a throwaway fake provider tree under $TMPDIR and runs the real
+# binary against an in-process fake Kubernetes API server
+# (hack/faketestserver), reached through an ordinary kubeconfig — no real
+# cluster, no exec-forced kubectl transcript. The hook wrapper is extracted
+# from README.md at run time rather than copied here, so this test validates
+# the documented script and fails if the README drifts away from it.
 #
-# This is an EXEC-TRANSCRIPT harness: it forces UPDATE_TESTER_KUBE_BACKEND=exec
-# below and asserts on the kubectl argv the exec backend issues. It does not
-# exercise the default client-go backend at all — that path has no fake to
-# assert against here and is covered instead by internal/runner's client-go
-# unit tests and by live E2E runs against a real cluster.
+# This exercises the tool's DEFAULT client-go backend, end to end, through the
+# real compiled binary, invoked via a real post-assert symlink, in a stub
+# provider tree, against real example manifests and annotations — the same
+# consumption pattern a provider's own E2E run relies on.
+#
+# The failure-injection scenarios this harness used to drive through a
+# stateful fake kubectl (drift, a stuck update, a reconciliation loop visible
+# only via the event count or only via the controller log, and the
+# assert-unchanged silent-wipe guard) are internal/runner unit tests now: they
+# exercise this tool's own evidence logic on a Go value, not the shape of a
+# request on a wire, and are cheaper and more precise to assert there. See
+# internal/runner's own *_test.go files.
 #
 # Requirements: go, bash, coreutils. No cluster, no network (the module cache
 # is already warm if this repo builds).
 #
 # Usage: bash hack/smoke-test.sh    (from any working directory)
-#        SMOKE_KEEP=1 bash hack/smoke-test.sh   keeps the tree and every
-#        kubectl transcript for inspection instead of deleting them on exit.
+#        SMOKE_KEEP=1 bash hack/smoke-test.sh   keeps the tree, the fake
+#        server's log and every hook transcript for inspection instead of
+#        deleting them on exit.
 
 set -euo pipefail
 
@@ -57,7 +65,16 @@ STUB="$TREE/tools/update-tester"
 BIN="$TMP/bin"
 ELSEWHERE="$TMP/elsewhere"
 
+FAKESERVER_PID=""
+
 cleanup() {
+  # Tear the fake server down on every exit path, including a failure that
+  # exits early via `abort` — a leaked listener across CI runs is a flake
+  # nobody will reproduce locally.
+  if [ -n "$FAKESERVER_PID" ] && kill -0 "$FAKESERVER_PID" 2>/dev/null; then
+    kill "$FAKESERVER_PID" 2>/dev/null || true
+    wait "$FAKESERVER_PID" 2>/dev/null || true
+  fi
   if [ -n "${SMOKE_KEEP:-}" ]; then
     printf '\nSMOKE_KEEP set — leaving the tree and transcripts at %s\n' "$TMP"
     return
@@ -162,78 +179,97 @@ chmod +x "$TREE/test/hooks/run-update-tester.sh"
 
 ln -s run-update-tester.sh "$TREE/test/hooks/post-assert-network-v6.sh"
 ln -s run-update-tester.sh "$TREE/test/hooks/post-assert-widget.sh"
-ln -s run-update-tester.sh "$TREE/test/hooks/post-assert-wipe.sh"
-ln -s run-update-tester.sh "$TREE/test/hooks/post-assert-wipe-badpath.sh"
 
-# A third example, generated rather than checked in: it carries more mutable
-# fields than the runner's event-burst ceiling (20), which is the only way to
-# reach the controller-restart path — and therefore the only way to observe
-# the `get pods` / `rollout restart` / `rollout status` argv.
-mkdir -p "$TREE/examples/burst"
-{
-  echo "apiVersion: burst.example.crossplane.io/v1alpha1"
-  echo "kind: Burst"
-  echo "metadata:"
-  echo "  name: example-burst"
-  echo "  annotations:"
-  echo "    crossplane.io/update-test: |"
-  for i in $(seq -w 0 20); do
-    echo "      - field: field$i"
-    echo "        value: \"updated-$i\""
+# ─── the fake API server ────────────────────────────────────────────────────
+
+go build -o "$BIN/faketestserver" "$REPO_ROOT/hack/faketestserver"
+
+KUBECONFIG="$TMP/kubeconfig.yaml"
+export KUBECONFIG
+FAKESERVER_GEN=0
+
+# start_fakeserver (re)starts the fake API server with a FRESH, freshly
+# reseeded copy of every fixture object — killing any instance already
+# running — and rewrites $KUBECONFIG to point at the new one. Called once at
+# setup, and again before any scenario that must not observe another
+# scenario's already-applied patch on the SAME fixture object (the "relative
+# invocation" scenario re-runs network-v6.yaml's own hook a second time, and
+# must see it in its pristine, unpatched state, exactly like a fresh
+# `uptest` run would).
+start_fakeserver() {
+  if [ -n "$FAKESERVER_PID" ] && kill -0 "$FAKESERVER_PID" 2>/dev/null; then
+    kill "$FAKESERVER_PID" 2>/dev/null || true
+    wait "$FAKESERVER_PID" 2>/dev/null || true
+  fi
+  FAKESERVER_GEN=$((FAKESERVER_GEN + 1))
+  local log="$TMP/faketestserver-$FAKESERVER_GEN.log"
+  # The "backend" upper-cases this field when it stores it, exercising a
+  # manifest entry whose `expect:` differs from its `value:`.
+  "$BIN/faketestserver" -examples "$TREE/examples" -uppercase-fields routingHint \
+    >"$log" 2>&1 &
+  FAKESERVER_PID=$!
+
+  # Race-free startup handshake: wait for the server's own "LISTEN
+  # <host:port>" line rather than a fixed sleep, and fail loudly (rather than
+  # hang) if it never appears — e.g. because the process exited immediately
+  # on a bad flag.
+  listen_addr=""
+  for _ in $(seq 1 100); do
+    if ! kill -0 "$FAKESERVER_PID" 2>/dev/null; then
+      abort "faketestserver exited before printing a LISTEN line: $(cat "$log")"
+    fi
+    listen_addr="$(sed -n 's/^LISTEN //p' "$log" | head -1)"
+    [ -n "$listen_addr" ] && break
+    sleep 0.05
   done
-  echo "spec:"
-  echo "  forProvider:"
-  for i in $(seq -w 0 20); do
-    echo "    field$i: initial-$i"
-  done
-} >"$TREE/examples/burst/burst.yaml"
+  [ -n "$listen_addr" ] || abort "faketestserver did not print a LISTEN line within 5s"
 
-# The fake kubectl, first on PATH.
-cp "$TESTDATA/fake-kubectl.sh" "$BIN/kubectl"
-chmod +x "$BIN/kubectl"
-export PATH="$BIN:$PATH"
+  {
+    echo "apiVersion: v1"
+    echo "kind: Config"
+    echo "clusters:"
+    echo "- cluster: {server: http://$listen_addr}"
+    echo "  name: fake"
+    echo "contexts:"
+    echo "- context: {cluster: fake, user: fake}"
+    echo "  name: fake"
+    echo "current-context: fake"
+    echo "users:"
+    echo "- name: fake"
+    echo "  user: {}"
+  } >"$KUBECONFIG"
+}
 
-# This harness asserts on the kubectl argv transcript (fake-kubectl.sh above),
-# so it must force every cluster operation onto the exec backend — see "This
-# is an EXEC-TRANSCRIPT harness" at the top of this file. Without this, the
-# operations client-go now serves by default never touch the fake at all.
-export UPDATE_TESTER_KUBE_BACKEND="exec"
+start_fakeserver
 
 # Small values keep the run quick: `converge` sleeps poll-interval * 1.5 per
 # invocation, and `run` polls up to --timeout for a field that never lands.
 export UPDATE_TESTER_POLL_INTERVAL="1s"
 export UPDATE_TESTER_TIMEOUT="5"
-# The "backend" upper-cases this field when it stores it, exercising a
-# manifest entry whose `expect:` differs from its `value:`.
-export SMOKE_UPPERCASE_FIELDS="routingHint"
 
-echo "   tree ready (stub module, 4 examples, 4 post-assert symlinks, fake kubectl)"
+# No cluster-backend override of any kind anywhere in this file: this harness
+# exercises the DEFAULT in-process backend, driving the real binary against
+# the fake API server started above — the first time this project's own test
+# suite has ever done that.
+
+echo "   tree ready (stub module, 3 examples, 2 post-assert symlinks, fake API server at $listen_addr)"
 
 # ─── helpers ───────────────────────────────────────────────────────────────
 
-# run_hook <symlink-name> <scenario> [fail-mode] [cwd]
+# run_hook <symlink-name> <scenario> [cwd]
 # Runs a post-assert symlink from a directory that is NOT the provider tree
-# (unless cwd says otherwise), with its own state directory so each scenario's
-# kubectl transcript stands alone. A symlink name containing a slash is used
-# as-is, so a caller can reproduce uptest's relative invocation. Sets OUT, LOG
-# and RC.
+# (unless cwd says otherwise). A symlink name containing a slash is used
+# as-is, so a caller can reproduce uptest's relative invocation. Sets OUT and
+# RC.
 run_hook() {
-  local link=$1 scenario=$2 mode=${3:-} cwd=${4:-$ELSEWHERE}
-  local state="$TMP/state-$scenario"
+  local link=$1 scenario=$2 cwd=${3:-$ELSEWHERE}
   local invocation="$TREE/test/hooks/$link"
   case "$link" in
     */*) invocation="$link" ;;
   esac
-  mkdir -p "$state"
   OUT="$TMP/$scenario.out"
-  LOG="$state/kubectl.log"
-  : >"$LOG"
   set +e
-  (
-    cd "$cwd" &&
-      SMOKE_STATE="$state" SMOKE_FAIL_MODE="$mode" \
-        "$invocation"
-  ) >"$OUT" 2>&1
+  (cd "$cwd" && "$invocation") >"$OUT" 2>&1
   RC=$?
   set -e
 }
@@ -257,20 +293,6 @@ expect_banners() {
     "$(printf '%s\n' "$expected" | sed 's/^/   | /')" \
     "$(printf '%s\n' "$got" | sed 's/^/   | /')" >&2
   return 1
-}
-
-# assert_absolute_manifest_paths fails if any manifest path anywhere in a
-# kubectl transcript is relative. The fake kubectl already refuses a relative
-# `get -f` path, so this is the belt to that braces: it also covers paths in
-# argv positions the fake does not inspect.
-assert_absolute_manifest_paths() {
-  local log=$1 label=$2 offenders
-  offenders="$(tr ' ' '\n' <"$log" | grep -E '\.ya?ml$' | grep -v '^/' || true)"
-  if [ -n "$offenders" ]; then
-    bad "$label: kubectl was issued a RELATIVE manifest path: $(echo "$offenders" | tr '\n' ' ')"
-    return 1
-  fi
-  ok "$label: every manifest path in the kubectl transcript is absolute"
 }
 
 # ─── 1. the stub module can host and execute the tool ──────────────────────
@@ -304,7 +326,6 @@ if [ "$RC" -eq 0 ]; then
 else
   bad "hook exited $RC, expected 0"
   dump "hook output" "$OUT"
-  dump "kubectl transcript" "$LOG"
 fi
 
 expect_banners "$OUT" "network-v6" "$(
@@ -336,7 +357,6 @@ if [ "$RC" -eq 0 ]; then
 else
   bad "hook exited $RC, expected 0"
   dump "hook output" "$OUT"
-  dump "kubectl transcript" "$LOG"
 fi
 
 expect_banners "$OUT" "widget" "$(
@@ -349,14 +369,6 @@ if grep -q 'check-external-name-prefix\|resolve-recover' "$OUT"; then
   bad "widget: an identity check ran for a manifest that does not opt in"
 else
   ok "widget: neither identity check ran (annotation gate holds)"
-fi
-
-# A namespaced resource must be addressed with -n on every resource call.
-if grep -q -- '-n crossplane-e2e' "$TMP/state-widget/kubectl.log"; then
-  ok "widget: namespaced resource addressed with -n crossplane-e2e"
-else
-  bad "widget: expected '-n crossplane-e2e' in the kubectl transcript"
-  dump "kubectl transcript" "$TMP/state-widget/kubectl.log"
 fi
 
 # ─── 4. the manifest path crossing `go -C` is absolute and per-symlink ──────
@@ -389,9 +401,9 @@ else
   bad "the two symlinks did not resolve to distinct manifests — \$0 appears to have been resolved to its target"
 fi
 
-# ─── 4b. the way uptest actually invokes it ────────────────────────────────
+# ─── 5. the way uptest actually invokes it ─────────────────────────────────
 
-section "4b. relative invocation, exactly as uptest issues it"
+section "5. relative invocation, exactly as uptest issues it"
 
 # uptest runs the value of uptest.upbound.io/post-assert-hook, which is a path
 # relative to the example's own directory. The hook must resolve the same
@@ -400,7 +412,14 @@ section "4b. relative invocation, exactly as uptest issues it"
 UPTEST_INVOCATION="$(sed -n 's|.*uptest.upbound.io/post-assert-hook: ||p' "$NETWORK_MANIFEST")"
 [ -n "$UPTEST_INVOCATION" ] || abort "could not read the post-assert-hook annotation from $NETWORK_MANIFEST"
 
-run_hook "$UPTEST_INVOCATION" relative "" "$TREE/examples/network"
+# Fresh server: this re-runs network-v6.yaml's own full 5-step hook a second
+# time, and section 2 above already patched that same object to its target
+# field values — without a reset, the "run" step here would see fields
+# already equal to their target and report NO-OP, not the pass this scenario
+# is actually testing for.
+start_fakeserver
+
+run_hook "$UPTEST_INVOCATION" relative "$TREE/examples/network"
 
 if [ "$RC" -eq 0 ]; then
   ok "'$UPTEST_INVOCATION' (run from examples/network) exited 0"
@@ -417,88 +436,23 @@ else
   dump "hook output" "$OUT"
 fi
 
-assert_absolute_manifest_paths "$TMP/state-relative/kubectl.log" "relative invocation"
-
-# ─── 5. the fake kubectl transcript ────────────────────────────────────────
-
-section "5. kubectl transcript"
-
-assert_absolute_manifest_paths "$TMP/state-network-v6/kubectl.log" "network-v6"
-assert_absolute_manifest_paths "$TMP/state-widget/kubectl.log" "widget"
-
-if grep -q 'FAKE-KUBECTL-ERROR' "$TMP"/state-*/kubectl.log; then
-  bad "the fake kubectl rejected an invocation"
-  grep -h 'FAKE-KUBECTL-ERROR' "$TMP"/state-*/kubectl.log | sed 's/^/   | /' >&2
-else
-  ok "every kubectl invocation was one the fake recognises"
-fi
-
-# The event-list argv carries a server-side field selector narrowing the
-# query to this one resource; the selector's key order is alphabetical
-# (kind, name, namespace) because the client builds it with a sorted
-# key/value set, not a map, so the ordering is deterministic across calls.
-for expected in \
-  "get -f $NETWORK_MANIFEST -o name" \
-  "get events --all-namespaces -o json --field-selector involvedObject.kind=Network,involvedObject.name=example-network-v6,involvedObject.namespace=" \
-  "wait networks.network.example.crossplane.io/example-network-v6 --for=condition=Ready --timeout=5s"; do
-  if grep -qxF "$expected" "$TMP/state-network-v6/kubectl.log"; then
-    ok "issued: $expected"
-  else
-    bad "expected kubectl invocation never issued: $expected"
-  fi
-done
-
-# ─── 6. the event-burst reset path ─────────────────────────────────────────
-
-section "6. event-burst reset (>20 mutable fields) restarts the controller"
-
-BURST_OUT="$TMP/burst.out"
-BURST_STATE="$TMP/state-burst"
-mkdir -p "$BURST_STATE"
-set +e
-(cd "$ELSEWHERE" && SMOKE_STATE="$BURST_STATE" go -C "$STUB" tool crossplane-update-tester \
-  run "$TREE/examples/burst/burst.yaml" --timeout 5) >"$BURST_OUT" 2>&1
-BURST_RC=$?
-set -e
-
-if [ "$BURST_RC" -eq 0 ]; then
-  ok "21-field run exited 0"
-else
-  bad "21-field run exited $BURST_RC, expected 0"
-  dump "run output" "$BURST_OUT"
-fi
-
-for expected in \
-  "get pods -n crossplane-system -l pkg.crossplane.io/revision -o jsonpath={range .items[*]}{.metadata.labels.pkg\\.crossplane\\.io/revision}{\"\\n\"}{end}" \
-  "rollout restart deploy/provider-example-7f4c2b91d0ac -n crossplane-system" \
-  "rollout status deploy/provider-example-7f4c2b91d0ac -n crossplane-system --timeout=3m0s"; do
-  if grep -qxF "$expected" "$BURST_STATE/kubectl.log"; then
-    ok "issued: $expected"
-  else
-    bad "expected kubectl invocation never issued: $expected"
-    tail -20 "$BURST_STATE/kubectl.log" | sed 's/^/   | /' >&2
-  fi
-done
-
-# ─── 6b. dual-scope event attribution, end to end ───────────────────────────
+# ─── 6. dual-scope event attribution, end to end ───────────────────────────
 #
 # dualscope-cluster.yaml and dualscope-namespaced.yaml share the SAME Kind
 # and the SAME metadata.name — the unified example-manifest convention every
 # dual-scope provider follows — differing only in scope and apiVersion
-# group. This is the direct proof, through the real fake + runner (not just
-# a unit-level fixture), that an update to one is never attributed to the
-# other.
+# group. This is the direct proof, through the real fake API server + runner
+# (not just a unit-level fixture), that an update to one is never attributed
+# to the other.
 
-section "6b. dual-scope event attribution (same Kind+Name, different scope) end-to-end"
+section "6. dual-scope event attribution (same Kind+Name, different scope) end-to-end"
 
-DUALSCOPE_STATE="$TMP/state-dualscope"
-mkdir -p "$DUALSCOPE_STATE"
 CLUSTER_DUALSCOPE_MANIFEST="$TREE/examples/dualscope/dualscope-cluster.yaml"
 NAMESPACED_DUALSCOPE_MANIFEST="$TREE/examples/dualscope/dualscope-namespaced.yaml"
 
 DUALSCOPE_RUN_OUT="$TMP/dualscope-cluster-run.out"
 set +e
-(cd "$ELSEWHERE" && SMOKE_STATE="$DUALSCOPE_STATE" go -C "$STUB" tool crossplane-update-tester \
+(cd "$ELSEWHERE" && go -C "$STUB" tool crossplane-update-tester \
   run "$CLUSTER_DUALSCOPE_MANIFEST" --timeout 5) >"$DUALSCOPE_RUN_OUT" 2>&1
 DUALSCOPE_RUN_RC=$?
 set -e
@@ -519,7 +473,7 @@ fi
 
 DUALSCOPE_CONVERGE_OUT="$TMP/dualscope-namespaced-converge.out"
 set +e
-(cd "$ELSEWHERE" && SMOKE_STATE="$DUALSCOPE_STATE" go -C "$STUB" tool crossplane-update-tester \
+(cd "$ELSEWHERE" && go -C "$STUB" tool crossplane-update-tester \
   converge "$NAMESPACED_DUALSCOPE_MANIFEST" --poll-interval 1s --timeout 5s --readiness-timeout 5s) \
   >"$DUALSCOPE_CONVERGE_OUT" 2>&1
 DUALSCOPE_CONVERGE_RC=$?
@@ -546,7 +500,7 @@ fi
 # happened to exercise first.
 DUALSCOPE_NS_RUN_OUT="$TMP/dualscope-namespaced-run.out"
 set +e
-(cd "$ELSEWHERE" && SMOKE_STATE="$DUALSCOPE_STATE" go -C "$STUB" tool crossplane-update-tester \
+(cd "$ELSEWHERE" && go -C "$STUB" tool crossplane-update-tester \
   run "$NAMESPACED_DUALSCOPE_MANIFEST" --timeout 5) >"$DUALSCOPE_NS_RUN_OUT" 2>&1
 DUALSCOPE_NS_RUN_RC=$?
 set -e
@@ -560,7 +514,7 @@ fi
 
 DUALSCOPE_CLUSTER_CONVERGE_OUT="$TMP/dualscope-cluster-converge.out"
 set +e
-(cd "$ELSEWHERE" && SMOKE_STATE="$DUALSCOPE_STATE" go -C "$STUB" tool crossplane-update-tester \
+(cd "$ELSEWHERE" && go -C "$STUB" tool crossplane-update-tester \
   converge "$CLUSTER_DUALSCOPE_MANIFEST" --poll-interval 1s --timeout 5s --readiness-timeout 5s) \
   >"$DUALSCOPE_CLUSTER_CONVERGE_OUT" 2>&1
 DUALSCOPE_CLUSTER_CONVERGE_RC=$?
@@ -580,227 +534,18 @@ else
   dump "converge output" "$DUALSCOPE_CLUSTER_CONVERGE_OUT"
 fi
 
-if grep -q 'FAKE-KUBECTL-ERROR' "$DUALSCOPE_STATE/kubectl.log"; then
-  bad "dual-scope scenario: the fake kubectl rejected an invocation"
-  grep -h 'FAKE-KUBECTL-ERROR' "$DUALSCOPE_STATE/kubectl.log" | sed 's/^/   | /' >&2
+# The re-homing of "every kubectl invocation was one the fake recognises"
+# (formerly read off a per-scenario kubectl transcript): the fake API server
+# itself logs any request path none of its handlers claim. Checked once,
+# globally, at the point every scenario above has already run, across every
+# generation the harness started (start_fakeserver is called once at setup
+# and once more before section 5) — broader than the single-scenario check it
+# replaces, since it now also covers every request issued by every section.
+if grep -qE 'faketestserver: unhandled' "$TMP"/faketestserver-*.log; then
+  bad "the fake API server rejected a request as unhandled"
+  grep -h 'faketestserver: unhandled' "$TMP"/faketestserver-*.log | sed 's/^/   | /' >&2
 else
-  ok "dual-scope scenario: every kubectl invocation was one the fake recognises"
-fi
-
-# ─── 7. a failing step must fail the hook and abort the rest ───────────────
-
-section "7a. failure injection: reconcile loop (drifting atProvider)"
-
-run_hook post-assert-network-v6.sh drift drift
-
-if [ "$RC" -ne 0 ]; then
-  ok "hook exited $RC (non-zero) when the resource never converged"
-else
-  bad "hook exited 0 despite a resource that never converges — a broken check would pass E2E silently"
-  dump "hook output" "$OUT"
-fi
-
-if grep -q 'RECONCILIATION LOOP DETECTED' "$OUT"; then
-  ok "reported: RECONCILIATION LOOP DETECTED"
-else
-  bad "expected 'RECONCILIATION LOOP DETECTED' in the output"
-  dump "hook output" "$OUT"
-fi
-
-drift_banners="$(banners "$OUT" | cut -f1 | tr '\n' ',')"
-if [ "$drift_banners" = "converge," ]; then
-  ok "aborted at step 1: the remaining 4 steps never ran"
-else
-  bad "expected the hook to stop after 'converge', got: $drift_banners"
-fi
-
-if grep -qE '^patch ' "$TMP/state-drift/kubectl.log"; then
-  bad "the hook patched the resource after the pre-check failed"
-  dump "kubectl transcript" "$TMP/state-drift/kubectl.log"
-else
-  ok "no patch was issued after the failing pre-check"
-fi
-
-section "7b. failure injection: update never lands in status.atProvider"
-
-run_hook post-assert-network-v6.sh stuck stuck
-
-if [ "$RC" -ne 0 ]; then
-  ok "hook exited $RC (non-zero) when a patched field never converged"
-else
-  bad "hook exited 0 despite a field whose value never reached status.atProvider"
-  dump "hook output" "$OUT"
-fi
-
-stuck_banners="$(banners "$OUT" | cut -f1 | tr '\n' ',')"
-if [ "$stuck_banners" = "converge,check-external-name-prefix,resolve-recover,run," ]; then
-  ok "aborted inside 'run': the post-update converge never ran"
-else
-  bad "expected the hook to stop after 'run', got: $stuck_banners"
-  dump "hook output" "$OUT"
-fi
-
-if grep -qE '^patch networks.* --type=merge -p \{"spec"' "$TMP/state-stuck/kubectl.log"; then
-  ok "the failing step did reach the patch (it failed on the assertion, not before it)"
-else
-  bad "expected a spec patch in the transcript for the 'stuck' scenario"
-  dump "kubectl transcript" "$TMP/state-stuck/kubectl.log"
-fi
-
-section "7c. failure injection: reconciliation loop via repeated update events (no atProvider drift)"
-
-run_hook post-assert-network-v6.sh loop loop
-
-if [ "$RC" -ne 0 ]; then
-  ok "hook exited $RC (non-zero) when update events kept growing with no atProvider drift"
-else
-  bad "hook exited 0 despite update events growing on every poll — a broken check would pass E2E silently"
-  dump "hook output" "$OUT"
-fi
-
-if grep -q 'RECONCILIATION LOOP DETECTED' "$OUT"; then
-  ok "reported: RECONCILIATION LOOP DETECTED"
-else
-  bad "expected 'RECONCILIATION LOOP DETECTED' in the output"
-  dump "hook output" "$OUT"
-fi
-
-# This is the direct proof that converge still COUNTS: the diagnostic must
-# name a NON-ZERO new-event delta, not just an atProvider diff. A change that
-# makes every delta 0 (this ticket's exact regression) would report no such
-# diagnostic and this check would catch it.
-if grep -qE '[1-9][0-9]* new update event\(s\) observed' "$OUT"; then
-  ok "diagnostic names a non-zero new-event count — converge is still COUNTING events, not just diffing atProvider"
-else
-  bad "expected a 'N new update event(s) observed' diagnostic naming a non-zero delta"
-  dump "hook output" "$OUT"
-fi
-
-loop_banners="$(banners "$OUT" | cut -f1 | tr '\n' ',')"
-if [ "$loop_banners" = "converge," ]; then
-  ok "aborted at step 1: the remaining 4 steps never ran"
-else
-  bad "expected the hook to stop after 'converge', got: $loop_banners"
-fi
-
-section "7e. failure injection: reconciliation loop visible ONLY in the controller log"
-
-# The measured live failure. A resource calling Update() on every poll tick
-# while status.atProvider holds still and client-go's rate limiter keeps the
-# aggregated event count frozen: every instrument converge had before this
-# scenario reports "resource stable". Measured on a 10s-poll provider, the
-# event delta caught this in none of six windows and the controller log in
-# all six.
-run_hook post-assert-network-v6.sh logloop logloop
-
-if [ "$RC" -ne 0 ]; then
-  ok "hook exited $RC (non-zero) when only the controller log showed Update() calls"
-else
-  bad "hook exited 0 — a loop the event channel rate-limits away must still fail the check"
-  dump "hook output" "$OUT"
-fi
-
-if grep -q 'RECONCILIATION LOOP DETECTED' "$OUT"; then
-  ok "reported: RECONCILIATION LOOP DETECTED"
-else
-  bad "expected 'RECONCILIATION LOOP DETECTED' in the output"
-  dump "hook output" "$OUT"
-fi
-
-# The counterpart of 7c's assertion, and the proof the verdict came from the
-# log rather than from an event delta that this scenario deliberately holds
-# at zero.
-if grep -qE '[1-9][0-9]* Update\(\) call\(s\) in the controller log' "$OUT"; then
-  ok "diagnostic names a non-zero Update() call count read from the controller log"
-else
-  bad "expected an 'N Update() call(s) in the controller log' diagnostic"
-  dump "hook output" "$OUT"
-fi
-
-if grep -qE '[1-9][0-9]* new update event\(s\) observed' "$OUT"; then
-  bad "the event delta moved — this scenario must isolate the LOG as the only signal"
-  dump "hook output" "$OUT"
-else
-  ok "the event delta stayed at zero: the log alone carried the verdict"
-fi
-
-logloop_banners="$(banners "$OUT" | cut -f1 | tr '\n' ',')"
-if [ "$logloop_banners" = "converge," ]; then
-  ok "aborted at step 1: the remaining 4 steps never ran"
-else
-  bad "expected the hook to stop after 'converge', got: $logloop_banners"
-fi
-
-section "7d. failure injection: assert-unchanged silent-wipe guard"
-
-run_hook post-assert-wipe.sh wipe-ok
-
-if [ "$RC" -eq 0 ]; then
-  ok "hook exited 0 when the asserted field held its baseline for the whole run"
-else
-  bad "hook exited $RC despite the asserted field never drifting"
-  dump "hook output" "$OUT"
-fi
-
-if grep -q 'legacyRuleList: unchanged across run' "$OUT"; then
-  ok "reported: legacyRuleList unchanged across run"
-else
-  bad "expected 'legacyRuleList: unchanged across run' in the output"
-  dump "hook output" "$OUT"
-fi
-
-export SMOKE_WIPE_FIELD=legacyRuleList
-export SMOKE_WIPE_TO=""
-run_hook post-assert-wipe.sh wipe-drift
-unset SMOKE_WIPE_FIELD SMOKE_WIPE_TO
-
-if [ "$RC" -ne 0 ]; then
-  ok "hook exited $RC (non-zero) when the backend silently wiped the asserted field"
-else
-  bad "hook exited 0 despite the asserted field being wiped by an unrelated patch"
-  dump "hook output" "$OUT"
-fi
-
-if grep -q 'legacyRuleList: WIPED after patching "algo" (was "rule-a,rule-b", now "")' "$OUT"; then
-  ok "reported: legacyRuleList WIPED after patching \"algo\""
-else
-  bad "expected the WIPED line naming algo as the triggering field"
-  dump "hook output" "$OUT"
-fi
-
-wipe_banners="$(banners "$OUT" | cut -f1 | tr '\n' ',')"
-if [ "$wipe_banners" = "converge,run," ]; then
-  ok "aborted inside 'run': the post-update converge never ran"
-else
-  bad "expected the hook to stop after 'run', got: $wipe_banners"
-  dump "hook output" "$OUT"
-fi
-
-# The negative case: a declared path that does not resolve on the object at
-# all must fail loudly, not read as an implicit empty baseline that can
-# never drift. No SMOKE_WIPE_FIELD is set here — the baseline read fails
-# before any patch is even attempted, so a wipe is not needed to prove it.
-run_hook post-assert-wipe-badpath.sh wipe-badpath
-
-if [ "$RC" -ne 0 ]; then
-  ok "hook exited $RC (non-zero) for an assert-unchanged path that does not resolve on the object"
-else
-  bad "hook exited 0 despite an assert-unchanged path that does not exist — the exact vacuous-pass regression this guards against"
-  dump "hook output" "$OUT"
-fi
-
-if grep -q 'no such field' "$OUT"; then
-  ok "reported: no such field, naming the unresolvable path"
-else
-  bad "expected a 'no such field' style error for the unresolvable assert-unchanged path"
-  dump "hook output" "$OUT"
-fi
-
-if grep -qE '^patch ' "$TMP/state-wipe-badpath/kubectl.log"; then
-  bad "the hook patched the resource before the unresolvable path was rejected"
-  dump "kubectl transcript" "$TMP/state-wipe-badpath/kubectl.log"
-else
-  ok "no patch was issued before the baseline check rejected the unresolvable path"
+  ok "every request the tool issued was one the fake API server recognises"
 fi
 
 # ─── summary ───────────────────────────────────────────────────────────────

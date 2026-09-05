@@ -54,3 +54,64 @@ jobs:
           # green pull request red without a commit in this repo. The config in
           # .golangci.yml uses the v2 schema.
           version: v2.12.2
+
+  discover-nested-modules:
+    name: discover nested Go modules
+    runs-on: ubuntu-latest
+    outputs:
+      modules: ${{ steps.discover.outputs.modules }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - id: discover
+        name: List go.mod files below the repo root
+        run: |
+          # A go.mod anywhere below the repo root marks a nested module. The
+          # top-level `go vet`/`go test`/golangci-lint steps above only cover
+          # the root module — `./...` does not cross a nested-module boundary
+          # — so every directory found here needs its own gate. This is
+          # discovered rather than hard-coded so a second nested module is
+          # picked up automatically instead of silently going ungated.
+          mapfile -t dirs < <(find . -mindepth 2 -name go.mod -printf '%h\n' | sed 's|^\./||' | sort)
+          json=$(printf '%s\n' "${dirs[@]}" | jq -R -c '. | select(length > 0)' | jq -sc .)
+          echo "Discovered nested module directories: $json"
+          echo "modules=$json" >> "$GITHUB_OUTPUT"
+
+  nested-module:
+    name: nested module (${{ matrix.dir }})
+    needs: discover-nested-modules
+    if: needs.discover-nested-modules.outputs.modules != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: ${{ fromJson(needs.discover-nested-modules.outputs.modules) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # Each nested module resolves its own Go version independently of
+          # the parent module's go.mod.
+          go-version-file: ${{ matrix.dir }}/go.mod
+          check-latest: true
+
+      - name: go vet
+        working-directory: ${{ matrix.dir }}
+        run: go vet ./...
+
+      - name: go test
+        working-directory: ${{ matrix.dir }}
+        run: go test ./... -count=1 -race
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          # Pinned to the same version as the parent module's job so a new
+          # linter release cannot turn a green pull request red without a
+          # commit in this repo.
+          version: v2.12.2
+          working-directory: ${{ matrix.dir }}

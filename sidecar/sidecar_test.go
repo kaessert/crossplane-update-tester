@@ -214,8 +214,9 @@ func TestConflicts(t *testing.T) {
 
 // TestResolve covers everything that needs the manifest's real objects to
 // evaluate: ambiguity (with and without narrowing), the two redundant-
-// narrowing rejections, a genuine single-field narrowing, and the ".m."
-// scope-confusion hint.
+// narrowing rejections, a genuine single-field narrowing, the ".m."
+// scope-confusion hint, and two differently-spelled selectors that resolve
+// to the same target.
 func TestResolve(t *testing.T) {
 	widgetV1 := ObjectID{APIVersion: "widget.example.crossplane.io/v1alpha1", Kind: "Widget", Name: "one"}
 	widgetV2 := ObjectID{APIVersion: "widget.example.crossplane.io/v1alpha1", Kind: "Widget", Name: "two"}
@@ -223,6 +224,9 @@ func TestResolve(t *testing.T) {
 	widgetNSOther := ObjectID{APIVersion: "widget.example.crossplane.io/v1alpha1", Kind: "Widget", Name: "one", Namespace: "other"}
 	secret := ObjectID{APIVersion: "v1", Kind: "Secret", Name: "creds"}
 	namespacedWidget := ObjectID{APIVersion: "widget.example.m.crossplane.io/v1alpha1", Kind: "Widget", Name: "one", Namespace: "default"}
+	secretA := ObjectID{APIVersion: "v1", Kind: "Secret", Name: "a", Namespace: "ns1"}
+	secretB := ObjectID{APIVersion: "v1", Kind: "Secret", Name: "b", Namespace: "ns2"}
+	secretC := ObjectID{APIVersion: "v1", Kind: "Secret", Name: "c", Namespace: "ns2"}
 
 	cases := map[string]struct {
 		reason  string
@@ -286,6 +290,17 @@ func TestResolve(t *testing.T) {
 			file:    &File{Docs: []Doc{{For: "v1/Secret", APIVersion: "v1", Kind: "Secret"}}},
 			targets: []ObjectID{widgetV1},
 			wantErr: "matches no object",
+		},
+		"DifferentlySpelledSelectorsClaimingOneTargetRejected": {
+			reason: "name: a and namespace: ns1 are spelled differently but both resolve to the same object (a/ns1); " +
+				"neither redundancy guard fires because each Doc sets only one narrowing directive, so this must be " +
+				"caught as its own conflict rather than silently merged, leaving b and c with no annotations",
+			file: &File{Docs: []Doc{
+				{For: "v1/Secret", APIVersion: "v1", Kind: "Secret", Name: "a", Annotations: map[string]string{"uptest.upbound.io/timeout": "111"}},
+				{For: "v1/Secret", APIVersion: "v1", Kind: "Secret", Namespace: "ns1", Annotations: map[string]string{"uptest.upbound.io/conditions": "Ready"}},
+			}},
+			targets: []ObjectID{secretA, secretB, secretC},
+			wantErr: "both resolve to the same object (ns1/a)",
 		},
 	}
 

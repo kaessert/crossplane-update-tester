@@ -338,7 +338,8 @@ func Conflicts(f *File) error {
 // in targets. A target with no matching Doc has no entry in the returned
 // map. Resolve on a nil File returns (nil, nil): there is nothing to merge.
 //
-// Every Doc must resolve to EXACTLY one target:
+// Every Doc must resolve to EXACTLY one target, and every target must be
+// claimed by at most one Doc:
 //
 //   - for: alone already selecting exactly one target is an error if
 //     name: or namespace: is also present (redundant narrowing).
@@ -347,16 +348,27 @@ func Conflicts(f *File) error {
 //     confusion between two variants of the same kind.
 //   - for:, optionally narrowed by name:/namespace:, still matching more
 //     than one target is an error naming every remaining candidate.
+//   - two Docs with DIFFERENT selectors that each resolve to the same
+//     target are an error too — Conflicts only catches the identical-
+//     selector case, so this is the one member of the ambiguity family it
+//     cannot see (differently-spelled selectors landing on one object).
 func Resolve(f *File, targets []ObjectID) (map[int]map[string]string, error) {
 	if f == nil {
 		return nil, nil
 	}
 	out := make(map[int]map[string]string, len(f.Docs))
+	claimedBy := make(map[int]Doc, len(f.Docs))
 	for _, doc := range f.Docs {
 		idx, err := resolveOne(doc, targets)
 		if err != nil {
 			return nil, err
 		}
+		if prior, claimed := claimedBy[idx]; claimed {
+			return nil, &ConflictError{Message: fmt.Sprintf(
+				"sidecar selectors for: %s name: %q namespace: %q and for: %s name: %q namespace: %q both resolve to the same object (%s) — remove or narrow one of them",
+				prior.For, prior.Name, prior.Namespace, doc.For, doc.Name, doc.Namespace, describeCandidates(targets, []int{idx}))}
+		}
+		claimedBy[idx] = doc
 		if out[idx] == nil {
 			out[idx] = make(map[string]string, len(doc.Annotations))
 		}

@@ -32,6 +32,7 @@ import (
 	"strings"
 
 	"github.com/kaessert/crossplane-update-tester/internal/manifest"
+	"github.com/kaessert/crossplane-update-tester/sidecar"
 )
 
 // Row is one disposition-carrying skip: entry: a single field, in a single
@@ -108,10 +109,11 @@ func dispositionRank(d manifest.Disposition) int {
 }
 
 // Scan walks root for every *.yaml/*.yml file, finds the ones whose raw
-// text carries a crossplane.io/update-test annotation key line, and
-// parses each through manifest.Parse. Returned rows and failures are
-// sorted for deterministic output: rows by (disposition, fixture, field),
-// failures by path.
+// text — or whose sidecar's raw text, when one exists beside it — carries
+// a crossplane.io/update-test annotation key line, and parses each
+// through manifest.Parse (which merges that sidecar the same way).
+// Returned rows and failures are sorted for deterministic output: rows by
+// (disposition, fixture, field), failures by path.
 //
 // A walk failure (root does not exist, a directory it cannot read) is
 // returned as an error; a single fixture's own parse failure is never
@@ -140,7 +142,7 @@ func Scan(root string) (Result, error) {
 		if readErr != nil {
 			return fmt.Errorf("reading %s: %w", path, readErr)
 		}
-		if !hasAnnotationKeyLine(data) {
+		if !hasAnnotationKeyLineOrSidecar(path, data) {
 			return nil
 		}
 		res.Counts.FixturesWithAnnotation++
@@ -202,6 +204,28 @@ func hasAnnotationKeyLine(data []byte) bool {
 		}
 	}
 	return false
+}
+
+// hasAnnotationKeyLineOrSidecar extends hasAnnotationKeyLine to a migrated
+// fixture: on a manifest whose harness annotations moved into a sidecar,
+// the raw manifest text at path never carries the annotation key line
+// again, so checking data alone would silently report zero fixtures on an
+// otherwise-identical tree — a false-green on the residual count this
+// package exists to report. A sidecar read error (most commonly "no
+// sidecar exists", the un-migrated case) is treated as "no sidecar", the
+// same way manifest.Parse's own sidecar.Load treats it.
+func hasAnnotationKeyLineOrSidecar(path string, data []byte) bool {
+	if hasAnnotationKeyLine(data) {
+		return true
+	}
+	// #nosec G304 -- path comes from filepath.WalkDir over a directory the
+	// caller resolved, not attacker-controlled input; sidecar.PathFor only
+	// appends a fixed suffix.
+	sidecarData, err := os.ReadFile(sidecar.PathFor(path))
+	if err != nil {
+		return false
+	}
+	return hasAnnotationKeyLine(sidecarData)
 }
 
 // printfTo writes a report line and discards the write error: every caller

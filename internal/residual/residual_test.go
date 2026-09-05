@@ -353,3 +353,60 @@ func TestScanNonExistentRootIsAnError(t *testing.T) {
 		t.Fatal("Scan over a nonexistent root returned nil error, want one")
 	}
 }
+
+// TestScanSidecarParity is the residual false-green guard this package's
+// own migration gap demanded: a migrated fixture (its update-test
+// annotation moved into "<manifest>.yaml.uptest") must report the EXACT
+// SAME Counts and Rows as the equivalent un-migrated fixture — never a
+// clean ledger that silently stopped seeing it because the walk's
+// extension filter can't find the annotation in a ".uptest" file.
+func TestScanSidecarParity(t *testing.T) {
+	inlineRoot := t.TempDir()
+	writeFixture(t, inlineRoot, "widget/a.yaml", `
+- field: privateKey
+  skip:
+    reason: write-only
+    disposition: statically-provable
+- field: region
+  skip:
+    reason: write-only
+    disposition: one-live-patch
+`)
+
+	migratedRoot := t.TempDir()
+	writePlainFile(t, migratedRoot, "widget/a.yaml", `apiVersion: widget.example.crossplane.io/v1alpha1
+kind: Widget
+metadata:
+  name: example-widget
+`)
+	writePlainFile(t, migratedRoot, "widget/a.yaml.uptest", `for: widget.example.crossplane.io/v1alpha1/Widget
+crossplane.io/update-test: |
+  - field: privateKey
+    skip:
+      reason: write-only
+      disposition: statically-provable
+  - field: region
+    skip:
+      reason: write-only
+      disposition: one-live-patch
+`)
+
+	inlineRes, err := Scan(inlineRoot)
+	if err != nil {
+		t.Fatalf("Scan(inline): %v", err)
+	}
+	migratedRes, err := Scan(migratedRoot)
+	if err != nil {
+		t.Fatalf("Scan(migrated): %v", err)
+	}
+
+	if migratedRes.Counts.FixturesWithAnnotation == 0 {
+		t.Fatalf("Scan(migrated).Counts.FixturesWithAnnotation = 0 — the exact false-green this guard exists to catch")
+	}
+	if !reflect.DeepEqual(inlineRes.Counts, migratedRes.Counts) {
+		t.Errorf("Counts differ: inline = %+v, migrated = %+v", inlineRes.Counts, migratedRes.Counts)
+	}
+	if !reflect.DeepEqual(inlineRes.Rows, migratedRes.Rows) {
+		t.Errorf("Rows differ: inline = %#v, migrated = %#v", inlineRes.Rows, migratedRes.Rows)
+	}
+}

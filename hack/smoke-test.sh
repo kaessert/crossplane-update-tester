@@ -156,6 +156,19 @@ cp -R "$TESTDATA/examples" "$TREE/examples"
   echo "// Resolve the tool from the working tree under test, not the module"
   echo "// proxy: this harness gates the current checkout, not the last release."
   echo "replace $MODULE_PATH => $REPO_ROOT"
+  echo
+  # Forward every LOCAL (directory) replace directive the tool's own go.mod
+  # declares — e.g. its sidecar nested module — the same way: a `replace
+  # .../sidecar => ./sidecar` in a DEPENDENCY is ignored by the main module
+  # (this is the exact reason the sidecar loader is its own module rather
+  # than imported from elsewhere), so the stub needs its own copy, with the
+  # relative path rewritten to resolve against $REPO_ROOT instead of the
+  # stub's own directory.
+  grep -E '^replace .+=> \./' "$REPO_ROOT/go.mod" | while IFS= read -r line; do
+    nested_module=$(printf '%s' "$line" | awk '{print $2}')
+    rel_path=$(printf '%s' "$line" | sed -E 's#.*=> \./#./#')
+    echo "replace $nested_module => $REPO_ROOT/${rel_path#./}"
+  done
 } >"$STUB/go.mod"
 
 # go.sum for the tool's own dependencies; the replaced module itself needs no

@@ -13,6 +13,8 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/kaessert/crossplane-update-tester/sidecar"
 )
 
 // AnnotationKey names the manifest annotation carrying the per-field update
@@ -718,8 +720,16 @@ type manifestDoc struct {
 	} `yaml:"spec"`
 }
 
-// Parse reads a YAML manifest file and extracts metadata and update test
-// annotations.
+// Parse reads a YAML manifest file, merges its sidecar (if one exists at
+// sidecar.PathFor(path)) onto the decoded documents, and extracts metadata
+// and update test annotations.
+//
+// The sidecar merge happens BEFORE document selection, deliberately: on a
+// migrated manifest, AnnotationKey no longer lives in the manifest text at
+// all — it lives in the sidecar — and selection picks the document
+// carrying it. Selecting first and merging after would silently select
+// whichever document the manifest's own (companion) annotations happen to
+// carry, which is frequently not the managed resource under test.
 func Parse(path string) (*Manifest, error) {
 	// #nosec G304 -- path is an operator-supplied CLI argument (the
 	// manifest file to test), not attacker-controlled input.
@@ -727,7 +737,11 @@ func Parse(path string) (*Manifest, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading manifest: %w", err)
 	}
-	m, err := ParseBytes(data)
+	sc, err := sidecar.Load(path)
+	if err != nil {
+		return nil, fmt.Errorf("loading sidecar for %s: %w", path, err)
+	}
+	m, err := parseDocs(data, sc, path)
 	if err != nil {
 		return nil, err
 	}
@@ -743,7 +757,10 @@ func Parse(path string) (*Manifest, error) {
 	return m, nil
 }
 
-// ParseBytes parses manifest YAML bytes.
+// ParseBytes parses manifest YAML bytes with no sidecar. A caller handing
+// bytes directly rather than a filesystem path (every existing caller, and
+// every test) has no sidecar to look up — this keeps that caller's
+// behaviour exactly as it was before sidecar support existed.
 //
 // The input may be a multi-document ("---"-separated) YAML stream: Crossplane
 // example manifests sometimes ship a companion object (a Secret, a
@@ -759,12 +776,32 @@ func Parse(path string) (*Manifest, error) {
 // no update tests) behaving exactly as they did before multi-document support
 // existed.
 func ParseBytes(data []byte) (*Manifest, error) {
+	return parseDocs(data, nil, "")
+}
+
+// ownedSidecarKeys are the manifest annotation keys THIS tool reads. A
+// sidecar may declare other tools' keys too (uptest's own annotations,
+// e.g. uptest.upbound.io/timeout) — mergeSidecarDocs copies those onto the
+// selected document's annotations exactly the same way, but only these
+// three participate in the switch-not-overlay hard error below, because
+// this tool has no business rejecting a manifest over a key it never
+// reads — that is uptest's own annotation set to police.
+var ownedSidecarKeys = []string{AnnotationKey, ExpectExternalNamePrefixKey, ReadyConditionsKey}
+
+// parseDocs is the shared implementation behind Parse and ParseBytes:
+// decode every document, merge sc onto them (a nil sc is a no-op — see
+// sidecar.Resolve), select one, and convert it.
+func parseDocs(data []byte, sc *sidecar.File, path string) (*Manifest, error) {
 	docs, err := decodeManifestDocs(data)
 	if err != nil {
 		return nil, err
 	}
 	if len(docs) == 0 {
 		return nil, fmt.Errorf("manifest missing apiVersion or kind")
+	}
+
+	if err := mergeSidecarDocs(docs, sc, path); err != nil {
+		return nil, err
 	}
 
 	selected := docs[0]
@@ -776,6 +813,60 @@ func ParseBytes(data []byte) (*Manifest, error) {
 	}
 
 	return manifestFromDoc(selected)
+}
+
+// mergeSidecarDocs resolves sc against docs (in place) and merges each
+// resolved annotation set onto its target document — before the caller
+// selects one for AnnotationKey, so a sidecar-declared update-test
+// annotation is visible to that selection exactly as an inline one always
+// was. A nil sc is a no-op: the un-migrated state every manifest starts in.
+//
+// A sidecar REPLACES the manifest's harness annotations rather than
+// overlaying them: if sc is non-nil, no document in data may carry any of
+// ownedSidecarKeys inline — a key live in both files has no defensible
+// precedence, so that combination is a hard error rather than a silent
+// pick of one side.
+func mergeSidecarDocs(docs []manifestDoc, sc *sidecar.File, path string) error {
+	if sc == nil {
+		return nil
+	}
+
+	targets := make([]sidecar.ObjectID, len(docs))
+	for i, d := range docs {
+		targets[i] = sidecar.ObjectID{
+			APIVersion: d.APIVersion,
+			Kind:       d.Kind,
+			Namespace:  d.Metadata.Namespace,
+			Name:       d.Metadata.Name,
+		}
+	}
+	resolved, err := sidecar.Resolve(sc, targets)
+	if err != nil {
+		return fmt.Errorf("resolving sidecar for %s: %w", path, err)
+	}
+
+	for i := range docs {
+		for _, key := range ownedSidecarKeys {
+			if _, inline := docs[i].Metadata.Annotations[key]; inline {
+				return fmt.Errorf(
+					"%s: annotation %q is set inline while a sidecar exists at %s — a sidecar replaces the "+
+						"manifest's harness annotations rather than overlaying them; remove the inline key or "+
+						"delete the sidecar",
+					path, key, sidecar.PathFor(path))
+			}
+		}
+		anns := resolved[i]
+		if len(anns) == 0 {
+			continue
+		}
+		if docs[i].Metadata.Annotations == nil {
+			docs[i].Metadata.Annotations = make(map[string]string, len(anns))
+		}
+		for k, v := range anns {
+			docs[i].Metadata.Annotations[k] = v
+		}
+	}
+	return nil
 }
 
 // decodeManifestDocs splits a (possibly multi-document) YAML byte stream and

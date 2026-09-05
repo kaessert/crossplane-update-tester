@@ -1515,7 +1515,11 @@ including in E2E logs when a result needs explaining after the fact.
   cluster. If a check cannot be expressed that way, it belongs in the provider,
   not here.
 - Run `gofmt`, `go vet ./...` and `golangci-lint run ./...` before opening a
-  pull request; CI runs all three, plus `go test ./... -count=1 -race`.
+  pull request; CI runs all three, plus `go test ./... -count=1 -race`. None of
+  the `./...`-scoped commands cross a nested-module boundary, so run `go vet`,
+  `go test` and `golangci-lint run` inside each nested module as well (today,
+  `sidecar/`); CI gates every nested module it discovers in its own job.
+  `gofmt` is directory-based and already covers them from the repo root.
 
 ## License
 

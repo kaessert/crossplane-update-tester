@@ -55,6 +55,37 @@ jobs:
           # .golangci.yml uses the v2 schema.
           version: v2.12.2
 
+  consumer-view-gate:
+    name: consumer view (go get @commit, no repo checkout)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          check-latest: true
+
+      - name: go get the tool the way a provider actually does
+        run: |
+          # Deliberately no `actions/checkout` step in this job: every other
+          # job below builds from a local clone that already carries this
+          # repo's own go.mod, so a directory `replace` anywhere in it (or
+          # forwarded by hack/smoke-test.sh) can paper over exactly the
+          # defect this job exists to catch. `go list -m -json` cannot catch
+          # it either — it only reads proxy metadata and never builds
+          # anything, which is how a broken release (an in-tree `replace`
+          # for a nested module, invisible to any consumer) resolved cleanly
+          # and shipped undeliverable. This job is a scratch module OUTSIDE
+          # this checkout that requires the tool at the commit under test
+          # and BUILDS it — the exact operation a provider's own
+          # tools/update-tester/go.mod performs when it pins a release tag.
+          set -euo pipefail
+          SCRATCH="$(mktemp -d)"
+          cd "$SCRATCH"
+          go mod init consumerprobe
+          go get "github.com/kaessert/crossplane-update-tester@${{ github.sha }}"
+          go build github.com/kaessert/crossplane-update-tester
+
   discover-nested-modules:
     name: discover nested Go modules
     runs-on: ubuntu-latest

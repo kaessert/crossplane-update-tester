@@ -157,18 +157,18 @@ cp -R "$TESTDATA/examples" "$TREE/examples"
   echo "// proxy: this harness gates the current checkout, not the last release."
   echo "replace $MODULE_PATH => $REPO_ROOT"
   echo
-  # Forward every LOCAL (directory) replace directive the tool's own go.mod
-  # declares — e.g. its sidecar nested module — the same way: a `replace
-  # .../sidecar => ./sidecar` in a DEPENDENCY is ignored by the main module
-  # (this is the exact reason the sidecar loader is its own module rather
-  # than imported from elsewhere), so the stub needs its own copy, with the
-  # relative path rewritten to resolve against $REPO_ROOT instead of the
-  # stub's own directory.
-  grep -E '^replace .+=> \./' "$REPO_ROOT/go.mod" | while IFS= read -r line; do
-    nested_module=$(printf '%s' "$line" | awk '{print $2}')
-    rel_path=$(printf '%s' "$line" | sed -E 's#.*=> \./#./#')
-    echo "replace $nested_module => $REPO_ROOT/${rel_path#./}"
-  done
+  # The published go.mod carries NO directory `replace` for a nested module
+  # (e.g. sidecar/) — a `replace` in a published DEPENDENCY is ignored by
+  # any consumer's main module, so the tool's own go.mod requires a nested
+  # module at a real released version instead. This harness still has to
+  # gate the CURRENT WORKING TREE rather than the last tag, so it adds its
+  # own local replace for every nested module it discovers under the repo
+  # root, mirroring the discovery the CI workflow uses for the same reason
+  # (a second nested module is picked up automatically, never hard-coded).
+  while IFS= read -r nested_dir; do
+    nested_module=$(awk '$1 == "module" { print $2; exit }' "$REPO_ROOT/$nested_dir/go.mod")
+    echo "replace $nested_module => $REPO_ROOT/$nested_dir"
+  done < <(cd "$REPO_ROOT" && find . -mindepth 2 -name go.mod -printf '%h\n' | sed 's|^\./||' | sort)
 } >"$STUB/go.mod"
 
 # go.sum for the tool's own dependencies; the replaced module itself needs no

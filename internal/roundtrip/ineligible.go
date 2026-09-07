@@ -10,7 +10,7 @@ import (
 
 // IneligibilityReason names why a declared container leaf's removal
 // direction can never be exercised at all — see classifyIneligibility's own
-// doc comment for what each is derived from. Four structural causes produce
+// doc comment for what each is derived from. Four causes produce
 // it: crossplane-runtime's own reference-resolution plumbing
 // (ReasonReferenceResolution), a CEL "self == oldSelf" immutability rule on
 // the leaf or an enclosing ancestor (ReasonCELImmutable), an

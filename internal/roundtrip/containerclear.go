@@ -319,13 +319,15 @@ func ContainerClearCoverage(crd map[string]interface{}, m *manifest.Manifest) ([
 
 		if reason == ReasonAbsentFromManifest {
 			// Also never a contradiction, and for a stronger reason than
-			// reference-resolution's above: classifyIneligibility was
-			// handed coveredByPath and assigns this reason ONLY when
-			// coveredByPath[leaf.Path] is already false (see its own
-			// covered parameter), and covered here is the SAME
-			// deterministic coverageFor call against the SAME inputs, so
-			// it cannot have flipped true in between — this branch is
-			// written explicitly anyway, exactly like
+			// reference-resolution's above: classifyAbsentFromManifest was
+			// handed cellCovered and assigns this reason ONLY when the
+			// leaf's own (Shape, Depth) cell is absent from it — and
+			// cellCovered is built above from the SAME deterministic
+			// coverageFor call against the SAME inputs, marking a leaf's
+			// own cell the moment that leaf is itself covered, so a
+			// covered leaf is withheld from this reason by construction
+			// and covered here cannot have flipped true in between — this
+			// branch is written explicitly anyway, exactly like
 			// ReasonReferenceResolution above, so the leaf never even
 			// reaches the contradiction guard below, not even in
 			// principle. An ancestor tombstone crediting a leaf whose own

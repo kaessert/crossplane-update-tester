@@ -775,10 +775,12 @@ decision:
   - **ineligible** — the leaf's removal direction can never be exercised at
     all, so it is excluded from the denominator entirely rather than
     counted as a gap to close. Reported with its own `reason`, re-derived
-    from the CRD's schema on every run (never a hardcoded list, per-leaf
-    annotation, or per-provider config), so a schema change that removes
-    the shape or the rule puts the leaf back into the denominator
-    automatically. Four reasons:
+    on every run (never a hardcoded list, per-leaf annotation, or
+    per-provider config) — the first three from the CRD's schema, so a
+    schema change that removes the shape or the rule puts the leaf back
+    into the denominator automatically, and the fourth from the manifest
+    under test's own data, so an added `spec.forProvider` value or tested
+    entry does the same. Four reasons:
     - a CEL-immutable field — the leaf's own schema node, or an ancestor
       object node enclosing it, carries an `x-kubernetes-validations`
       rule requiring `self == oldSelf` (including the "immutable once

@@ -778,7 +778,7 @@ decision:
     from the CRD's schema on every run (never a hardcoded list, per-leaf
     annotation, or per-provider config), so a schema change that removes
     the shape or the rule puts the leaf back into the denominator
-    automatically. Three reasons, and only three:
+    automatically. Four reasons:
     - a CEL-immutable field — the leaf's own schema node, or an ancestor
       object node enclosing it, carries an `x-kubernetes-validations`
       rule requiring `self == oldSelf` (including the "immutable once
@@ -812,7 +812,23 @@ decision:
       way the CEL rule's `has()` guard closes nulling, and only then is the
       leaf ineligible. The reported `reason` always names the actual
       blocker (`minItems: N`, the `size()` rule's own text, or the map's
-      RFC-7386 no-op) rather than a generic "admission rejects nulling it".
+      RFC-7386 no-op) rather than a generic "admission rejects nulling it";
+    - the leaf carries no value anywhere on THIS manifest under test at
+      all — not in its own `spec.forProvider`, and not introduced by any
+      TESTED (non-`skip:`) update-test entry either, as that entry's own
+      field/value pair or as a literal value named in its `withValues:`
+      map. There is nothing on the object this fixture creates for a
+      clear-direction test to remove, so no test anyone could write
+      against THIS manifest would ever satisfy the obligation. Unlike the
+      three reasons above, this is NOT a statement about the Kind's
+      schema — it reads the manifest under test's own data, the same
+      artifact the coverage check below already reads, rather than the
+      schema alone. A leaf excluded here may still be eligible, and
+      covered, on a sibling manifest of the same Kind that does populate
+      it. It is also assigned only when the leaf is not already covered
+      below: an ancestor `clear:` tombstone that legitimately sweeps a
+      subtree holding no such key on this particular object is a real,
+      credited clear, never a contradiction to flag.
   - **covered** — ANY test entry actually exercises its removal direction:
     a `clear:` list naming it exactly, a `clear:` list naming an ANCESTOR
     of its dotted path (an RFC-7386 merge-patch null removes the whole
@@ -831,12 +847,15 @@ decision:
   closed) — that combination means an existing manifest entry disagrees
   with the ineligibility predicate, and the report surfaces that
   disagreement explicitly (`containerClearError`) rather than silently
-  preferring one side. The reference-resolution reason is exempt from that
-  error: a reference-resolution field carries no CEL rule guarding it, so
-  an ancestor `clear:` tombstone that incidentally sweeps up a
-  reference-resolution descendant alongside a genuinely tested sibling is
-  never rejected by admission and is not evidence the predicate is wrong —
-  it is simply reported `ineligible`, `covered: false`, with no error.
+  preferring one side. Two reasons are exempt from that error: the
+  reference-resolution reason, because a reference-resolution field
+  carries no CEL rule guarding it, so an ancestor `clear:` tombstone that
+  incidentally sweeps up a reference-resolution descendant alongside a
+  genuinely tested sibling is never rejected by admission and is not
+  evidence the predicate is wrong — it is simply reported `ineligible`,
+  `covered: false`, with no error; and the absent-from-manifest reason,
+  because it is assigned only to a leaf already determined NOT covered, so
+  it can never disagree with `covered: true` in the first place.
 
   This whole breakdown is advisory ONLY: it is informational in every
   report and never turns the command's exit code non-zero, regardless of

@@ -217,20 +217,18 @@ const (
 // classifyIneligibility) skips all of the above: its removal direction can
 // never be exercised at all, so it is reported with Ineligible set and
 // Covered always false — see this function's own contradiction check below
-// for what happens when an existing manifest entry disagrees. The
-// reference-resolution reason is exempt from that error (see the check's
-// own comment): closing a leaf ANOTHER field's ancestor tombstone
-// incidentally sweeps up is never rejected by admission — there is no CEL
-// rule guarding a reference-resolution field — so it is not evidence the
-// predicate is wrong, only that crossplane-runtime already discarded a
-// field the manifest happened to also mention.
+// for what happens when an existing manifest entry disagrees. Two reasons
+// are exempt from that error (see each check's own comment below): the
+// reference-resolution reason, because closing a leaf ANOTHER field's
+// ancestor tombstone incidentally sweeps up is never rejected by admission —
+// there is no CEL rule guarding a reference-resolution field — so it is not
+// evidence the predicate is wrong, only that crossplane-runtime already
+// discarded a field the manifest happened to also mention; and
+// ReasonAbsentFromManifest, because it is assigned only to a leaf coverageFor
+// has already determined is NOT covered, so it can never disagree with
+// "covered" in the first place.
 func ContainerClearCoverage(crd map[string]interface{}, m *manifest.Manifest) ([]ContainerClearFinding, error) {
 	leaves, err := DeclaredContainerLeaves(crd)
-	if err != nil {
-		return nil, err
-	}
-
-	ineligible, err := classifyIneligibility(crd, leaves)
 	if err != nil {
 		return nil, err
 	}
@@ -252,6 +250,40 @@ func ContainerClearCoverage(crd map[string]interface{}, m *manifest.Manifest) ([
 			perKeyNulled[t.Field] = true
 		}
 		selfByField[t.Field] = t
+	}
+
+	// Computed once, AHEAD of classifyAbsentFromManifest: ReasonAbsentFromManifest
+	// must never strip a member out of a (Shape, Depth) cell that is
+	// already Covered via some OTHER member's direct route — doing so
+	// would withdraw the cell-membership credit the report already grants
+	// that member (see ReasonAbsentFromManifest's own doc comment on
+	// "coverage never withdrawn"). structural carries the three
+	// schema-derived reasons ONLY — a structurally-ineligible leaf never
+	// contributes coverage of its own and is excluded from cellCovered's
+	// construction here exactly as ClearCellReport.Covered excludes it
+	// (see GroupClearCells' own doc comment).
+	structural, err := classifyIneligibility(crd, leaves)
+	if err != nil {
+		return nil, err
+	}
+
+	cellCovered := make(map[CellKey]bool, len(leaves))
+	for _, leaf := range leaves {
+		if _, already := structural[leaf.Path]; already {
+			continue
+		}
+		covered, _, _ := coverageFor(leaf, clearedSiblings, withValuesEmptyList, perKeyNulled, selfByField)
+		if covered {
+			cellCovered[CellKey{Classification: ClassNA, Shape: leaf.Shape, Direction: DirectionClear, Depth: depthOf(leaf.Path)}] = true
+		}
+	}
+
+	ineligible := make(map[string]IneligibilityReason, len(leaves))
+	for path, reason := range structural {
+		ineligible[path] = reason
+	}
+	for path, reason := range classifyAbsentFromManifest(leaves, m, structural, cellCovered) {
+		ineligible[path] = reason
 	}
 
 	findings := make([]ContainerClearFinding, 0, len(leaves))
@@ -278,6 +310,31 @@ func ContainerClearCoverage(crd map[string]interface{}, m *manifest.Manifest) ([
 			// signal here is not evidence the predicate disagrees with the
 			// manifest; it is crossplane-runtime having already discarded
 			// this field regardless of what the merge patch says.
+			findings = append(findings, ContainerClearFinding{
+				Path: leaf.Path, Shape: leaf.Shape, Ineligible: true, Reason: reason,
+				Detail: string(reason),
+			})
+			continue
+		}
+
+		if reason == ReasonAbsentFromManifest {
+			// Also never a contradiction, and for a stronger reason than
+			// reference-resolution's above: classifyIneligibility was
+			// handed coveredByPath and assigns this reason ONLY when
+			// coveredByPath[leaf.Path] is already false (see its own
+			// covered parameter), and covered here is the SAME
+			// deterministic coverageFor call against the SAME inputs, so
+			// it cannot have flipped true in between — this branch is
+			// written explicitly anyway, exactly like
+			// ReasonReferenceResolution above, so the leaf never even
+			// reaches the contradiction guard below, not even in
+			// principle. An ancestor tombstone crediting a leaf whose own
+			// exact path holds no key on this object (the http-loadbalancer
+			// shape: one ancestor clear: sweeping many descendant leaves
+			// that were never individually set) is a legitimate no-op,
+			// never a manifest claiming an impossible removal — which is
+			// exactly why this reason is withheld from an already-covered
+			// leaf in the first place rather than reported alongside it.
 			findings = append(findings, ContainerClearFinding{
 				Path: leaf.Path, Shape: leaf.Shape, Ineligible: true, Reason: reason,
 				Detail: string(reason),

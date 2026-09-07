@@ -4,24 +4,39 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+
+	"github.com/kaessert/crossplane-update-tester/internal/manifest"
 )
 
 // IneligibilityReason names why a declared container leaf's removal
 // direction can never be exercised at all — see classifyIneligibility's own
-// doc comment for what each is derived from. Three structural causes
-// produce it: crossplane-runtime's own reference-resolution plumbing
+// doc comment for what each is derived from. Four structural causes produce
+// it: crossplane-runtime's own reference-resolution plumbing
 // (ReasonReferenceResolution), a CEL "self == oldSelf" immutability rule on
-// the leaf or an enclosing ancestor (ReasonCELImmutable), and an
+// the leaf or an enclosing ancestor (ReasonCELImmutable), an
 // x-kubernetes-validations rule requiring the leaf under the object's
-// default managementPolicies. The third cause renders as one of three
-// concrete reasons depending on the leaf's own shape and schema, because a
-// LIST leaf has a removal route a MAP leaf does not: `value: []` is
-// RFC-7386 wholesale replacement (the same route selfTombstoned already
-// credits), so a CEL-required LIST leaf is ineligible ONLY when its own
-// schema also blocks the empty-list route — via `minItems > 0` or a second
-// CEL rule requiring `<path>.size() > 0`. A CEL-required LIST leaf with
-// neither guard is not ineligible at all: it is left out of the map
-// entirely, exactly like any other eligible leaf.
+// default managementPolicies, and the leaf carrying no value anywhere on
+// THIS manifest under test at all (ReasonAbsentFromManifest). The third
+// cause renders as one of three concrete reasons depending on the leaf's
+// own shape and schema, because a LIST leaf has a removal route a MAP leaf
+// does not: `value: []` is RFC-7386 wholesale replacement (the same route
+// selfTombstoned already credits), so a CEL-required LIST leaf is
+// ineligible ONLY when its own schema also blocks the empty-list route —
+// via `minItems > 0` or a second CEL rule requiring `<path>.size() > 0`. A
+// CEL-required LIST leaf with neither guard is not ineligible at all: it is
+// left out of the map entirely, exactly like any other eligible leaf.
+//
+// The first three reasons are derived purely from crd's own schema — the
+// same answer for every manifest of the Kind. ReasonAbsentFromManifest is
+// the odd one out, and deliberately so: it is the only reason that reads
+// the manifest under test's own data (m.ForProvider and m.Tests) rather
+// than the schema alone, because the question it answers — "does THIS
+// object ever carry a value here" — has no schema-only answer. That is
+// sound rather than a layering violation: ContainerClearCoverage's own
+// coverage half (coverageFor) already reads exactly the same manifest data
+// to decide whether a leaf's removal was exercised; this reason reads it to
+// decide whether the leaf's PRESENCE was ever exercised, the strictly prior
+// question.
 type IneligibilityReason string
 
 const (
@@ -56,6 +71,35 @@ const (
 	// value are all rejected identically. No clear-direction test can ever
 	// reach the backend.
 	ReasonCELImmutable IneligibilityReason = "CEL-immutable: an x-kubernetes-validations rule requires self == oldSelf on this leaf or an enclosing ancestor, so admission rejects EVERY mutation of the field — not merely a null or empty-value patch, unlike the has()-guard reasons above — and no clear-direction test can ever reach the backend"
+
+	// ReasonAbsentFromManifest reports that leaf carries no value anywhere
+	// on the manifest under test — not in its own spec.forProvider, and
+	// not introduced by any TESTED (non-skip) update-test entry either,
+	// whether as that entry's own field-value pair or as a literal value
+	// named in its withValues: map. There is nothing on the object this
+	// fixture creates for a clear-direction test to remove, so no test
+	// anyone could write against THIS manifest would ever satisfy the
+	// obligation.
+	//
+	// Unlike the three reasons above, this one is NOT a statement about
+	// the Kind's schema — it is a statement about this one fixture. A leaf
+	// excluded here may still be eligible, and covered, on a sibling
+	// manifest of the same Kind that does populate it (a separate
+	// DeclaredContainerLeaves/classifyAbsentFromManifest run against that
+	// manifest's own data). It is also assigned only when the leaf's own
+	// (Shape, Depth) cell — see CellKey and GroupClearCells — carries no
+	// OTHER member with direct coverageFor coverage of its own: a cell
+	// credits every eligible member the moment ANY one of them is
+	// genuinely tested (one representative covers the whole cell), so
+	// stripping an untested sibling out of that cell's eligible set would
+	// withdraw a credit the report already grants it, which coverage must
+	// never do. An ancestor tombstone that legitimately sweeps a subtree
+	// holding no such key on this particular object is a real, credited
+	// clear either way — never a contradiction — and
+	// ContainerClearCoverage's own ineligible/covered guard is written to
+	// never see this reason paired with covered: true at all (see that
+	// guard's own comment).
+	ReasonAbsentFromManifest IneligibilityReason = "absent from this manifest: neither spec.forProvider nor any tested update-test entry gives this leaf a value on the object under test, so its removal direction cannot be exercised here — a sibling manifest of the same Kind that does populate it may still cover it"
 )
 
 // listRequiredByCELReason builds the ineligibility reason for a LIST leaf
@@ -72,11 +116,20 @@ func listRequiredByCELReason(blocker string) IneligibilityReason {
 }
 
 // classifyIneligibility derives, for every leaf in leaves, whether its
-// removal direction can ever be exercised against crd's schema at all.
-// Re-derived from the schema on EVERY call — nothing here is a hardcoded
-// list, a per-provider config, or an annotation a human must remember to
-// update, so a CRD change that removes the shape or the rule puts the leaf
-// back in the denominator automatically on the very next run.
+// removal direction can ever be exercised against crd's schema at all — the
+// first three reasons in IneligibilityReason's own doc comment, each
+// derived purely from the Kind's schema and therefore the same answer for
+// every manifest of that Kind. Re-derived from the schema on EVERY call —
+// nothing here is a hardcoded list, a per-provider config, or an
+// annotation a human must remember to update, so a CRD change that removes
+// the shape or the rule puts the leaf back in the denominator
+// automatically on the very next run.
+//
+// The fourth reason, ReasonAbsentFromManifest, is NOT derived here — it
+// reads the manifest under test's own data rather than the schema, and
+// needs a cell-level coverage lookup only the caller can build (see
+// classifyAbsentFromManifest and ContainerClearCoverage's own two-pass
+// construction).
 //
 // A leaf matching none of the reasons in IneligibilityReason's own doc
 // comment is left out of the returned map entirely; it is not ineligible.
@@ -117,22 +170,138 @@ func classifyIneligibility(crd map[string]interface{}, leaves []ContainerLeaf) (
 			out[leaf.Path] = ReasonCELImmutable
 			continue
 		}
-		if !hasDefault || !requiredByManagementPolicies(schema, leaf.Path, mpDefault) {
-			continue
-		}
-		if leaf.Shape == ShapeMap {
-			out[leaf.Path] = ReasonRequiredByCELMap
-			continue
-		}
-		// ShapeList: required by CEL is not, on its own, enough — a list
-		// leaf's `value: []` is an admissible wholesale-replacement clear
-		// under RFC-7386 (selfTombstoned already credits it) unless the
-		// leaf's own schema ALSO blocks the empty-list route.
-		if blocker, blocked := listEmptyRouteBlocked(fpSchema, schema, leaf.Path); blocked {
-			out[leaf.Path] = listRequiredByCELReason(blocker)
+		if hasDefault && requiredByManagementPolicies(schema, leaf.Path, mpDefault) {
+			if leaf.Shape == ShapeMap {
+				out[leaf.Path] = ReasonRequiredByCELMap
+				continue
+			}
+			// ShapeList: required by CEL is not, on its own, enough — a
+			// list leaf's `value: []` is an admissible
+			// wholesale-replacement clear under RFC-7386 (selfTombstoned
+			// already credits it) unless the leaf's own schema ALSO
+			// blocks the empty-list route.
+			if blocker, blocked := listEmptyRouteBlocked(fpSchema, schema, leaf.Path); blocked {
+				out[leaf.Path] = listRequiredByCELReason(blocker)
+			}
 		}
 	}
 	return out, nil
+}
+
+// classifyAbsentFromManifest derives ReasonAbsentFromManifest for every
+// leaf that is: not already structurally ineligible (structural — the
+// three reasons classifyIneligibility derives); and not a member of a
+// (Shape, Depth) cell that cellCovered already reports Covered (see
+// ContainerClearCoverage's own construction of cellCovered) — stripping
+// such a member out of eligibility would WITHDRAW the cell-membership
+// credit the container-clear cell report already grants it (one credited
+// representative covers every sibling sharing its cell), which coverage
+// must never do. Only once neither exemption applies does this check the
+// leaf's own presence: absent from m.ForProvider AND absent from every
+// TESTED update-test entry's own data (see testEntryDataTree).
+func classifyAbsentFromManifest(leaves []ContainerLeaf, m *manifest.Manifest, structural map[string]IneligibilityReason, cellCovered map[CellKey]bool) map[string]IneligibilityReason {
+	testData := testEntryDataTree(m)
+	out := make(map[string]IneligibilityReason)
+	for _, leaf := range leaves {
+		if _, already := structural[leaf.Path]; already {
+			continue
+		}
+		key := CellKey{Classification: ClassNA, Shape: leaf.Shape, Direction: DirectionClear, Depth: depthOf(leaf.Path)}
+		if cellCovered[key] {
+			continue
+		}
+		if !presentAtPath(m.ForProvider, leaf.Path) && !presentAtPath(testData, leaf.Path) {
+			out[leaf.Path] = ReasonAbsentFromManifest
+		}
+	}
+	return out
+}
+
+// presentAtPath reports whether root carries a value at dotted (a
+// container leaf's own dot-joined path), navigating root's nested
+// map[string]interface{} structure exactly the way DeclaredContainerLeaves
+// itself walks a schema tree. A key counts as present the moment it is its
+// own explicit member — an empty list, an empty map, or an explicit null
+// are all PRESENT: RFC 7386 (and manifest.UpdateTest.ValueExplicit's own
+// convention) treats "the key was written" as a materially different fact
+// from "the key was never mentioned at all", regardless of what value it
+// was written to. Absent the moment any segment along the way is missing,
+// or a non-terminal segment resolves to something other than a nested
+// object — a container leaf can never be reached through a scalar or a
+// list ancestor.
+func presentAtPath(root map[string]interface{}, dotted string) bool {
+	cur := root
+	segments := strings.Split(dotted, ".")
+	for i, seg := range segments {
+		if cur == nil {
+			return false
+		}
+		v, ok := cur[seg]
+		if !ok {
+			return false
+		}
+		if i == len(segments)-1 {
+			return true
+		}
+		next, ok := v.(map[string]interface{})
+		if !ok {
+			return false
+		}
+		cur = next
+	}
+	return false
+}
+
+// testEntryDataTree assembles a synthetic presence tree from every TESTED
+// (non-skip) entry in m.Tests — never a skip: entry, which authors no test
+// at all and so introduces no data of its own — merging each entry's own
+// Field/Value pair, plus every sibling literal named in its withValues:
+// map, at the dotted path each names. presentAtPath walks the result
+// exactly as it walks a manifest's own spec.forProvider, so a leaf whose
+// value is introduced for the very first time by the update-test
+// annotation itself — never by the base spec — is still found present
+// here: the worked case this exists to keep eligible is
+// FixedAddress.options, absent from fixed-address-allocate.yaml's own
+// spec.forProvider but carrying a genuine, non-empty value: list on its
+// own `field: options` entry.
+func testEntryDataTree(m *manifest.Manifest) map[string]interface{} {
+	tree := map[string]interface{}{}
+	if m == nil {
+		return tree
+	}
+	for _, t := range m.Tests {
+		if t.Skip.Present() {
+			continue
+		}
+		if t.Field != "" {
+			setAtPath(tree, t.Field, t.Value)
+		}
+		for sibling, v := range t.WithValues {
+			setAtPath(tree, sibling, v)
+		}
+	}
+	return tree
+}
+
+// setAtPath writes value into tree at dotted, creating intermediate
+// map[string]interface{} nodes as needed. Mirrors presentAtPath's own
+// segment-by-segment navigation exactly, so a path this function writes is
+// always the same path presentAtPath finds.
+func setAtPath(tree map[string]interface{}, dotted string, value interface{}) {
+	segments := strings.Split(dotted, ".")
+	cur := tree
+	for i, seg := range segments {
+		if i == len(segments)-1 {
+			cur[seg] = value
+			return
+		}
+		next, ok := cur[seg].(map[string]interface{})
+		if !ok {
+			next = map[string]interface{}{}
+			cur[seg] = next
+		}
+		cur = next
+	}
 }
 
 // listEmptyRouteBlocked reports whether leafPath's OWN `value: []` clear

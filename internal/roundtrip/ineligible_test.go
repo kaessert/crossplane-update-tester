@@ -281,9 +281,39 @@ spec:
                           type: string
 `
 
+// ineligibleFixtureForProvider populates spec.forProvider with a value at
+// EVERY container leaf ineligibleFixtureCRD declares — including the ones a
+// CEL-immutable/CEL-required/reference-resolution reason already excludes
+// regardless of presence. It exists so this file's tests keep exercising
+// exactly REASON 1–3 in isolation, the purpose they were written for: with
+// ReasonAbsentFromManifest in play, a leaf with no manifest data of its own
+// would otherwise be reclassified out from under a test asserting it stays
+// eligible for an entirely different reason (or no reason at all).
+func ineligibleFixtureForProvider() map[string]interface{} {
+	return map[string]interface{}{
+		"tags":                     []interface{}{"prod"},
+		"backendConfigRefs":        []interface{}{map[string]interface{}{"id": "a", "kind": "b"}},
+		"weirdSelector":            map[string]interface{}{"mode": map[string]interface{}{"k": "v"}},
+		"subscriptions":            []interface{}{"topic"},
+		"deleteOnlyList":           []interface{}{"x"},
+		"specAnchoredRequired":     []interface{}{"y"},
+		"requiredMinItemsList":     []interface{}{"a"},
+		"requiredSizeGuardList":    []interface{}{"a"},
+		"requiredMap":              map[string]interface{}{"k": "v"},
+		"vpcSelector":              map[string]interface{}{"matchLabels": map[string]interface{}{"k": "v"}},
+		"vpcRefs":                  []interface{}{map[string]interface{}{"name": "x"}},
+		"namespacedVpcSelector":    map[string]interface{}{"matchLabels": map[string]interface{}{"k": "v"}},
+		"mirroredSelector":         map[string]interface{}{"matchLabels": map[string]interface{}{"k": "v"}},
+		"immutableTags":            []interface{}{"a"},
+		"immutableGroup":           map[string]interface{}{"members": []interface{}{"a"}},
+		"conditionalImmutableList": []interface{}{"a"},
+		"guardedGroup":             map[string]interface{}{"someField": []interface{}{"a"}},
+	}
+}
+
 func ineligibleFindingsByPath(t *testing.T, crd map[string]interface{}) map[string]ContainerClearFinding {
 	t.Helper()
-	findings, err := ContainerClearCoverage(crd, &manifest.Manifest{})
+	findings, err := ContainerClearCoverage(crd, &manifest.Manifest{ForProvider: ineligibleFixtureForProvider()})
 	if err != nil {
 		t.Fatalf("ContainerClearCoverage: %v", err)
 	}
@@ -1032,5 +1062,235 @@ func TestParentPath(t *testing.T) {
 				t.Errorf("parentPath(%q) = %q, want %q", tc.path, got, tc.want)
 			}
 		})
+	}
+}
+
+// absentFromManifestFixtureCRD declares six leaves, one per case
+// TestContainerClearCoverageAbsentFromManifest exercises: a leaf with no
+// data anywhere in the manifest at all (topAbsent), a leaf absent from
+// spec.forProvider but populated by its own tested entry
+// (topPopulatedByTest — the FixedAddress.options worked case), a leaf
+// present as an empty list (topEmptyList), a leaf present and populated
+// (topPresent), a nested leaf whose ancestor object is itself entirely
+// absent from spec (nested.child), and a leaf swept by an ancestor
+// tombstone that names an ancestor holding no such key on this object
+// (ancestorSwept.child).
+const absentFromManifestFixtureCRD = `apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+spec:
+  group: widgets.crossplane.io
+  names:
+    kind: Widget
+    plural: widgets
+  versions:
+  - name: v1alpha1
+    served: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            properties:
+              forProvider:
+                type: object
+                properties:
+                  name:
+                    type: string
+                  topAbsent:
+                    type: array
+                    items:
+                      type: string
+                  topPopulatedByTest:
+                    type: array
+                    items:
+                      type: string
+                  topEmptyList:
+                    type: array
+                    items:
+                      type: string
+                  topPresent:
+                    type: array
+                    items:
+                      type: string
+                  nested:
+                    type: object
+                    properties:
+                      child:
+                        type: array
+                        items:
+                          type: string
+                  ancestorSwept:
+                    type: object
+                    properties:
+                      child:
+                        type: object
+                        additionalProperties:
+                          type: string
+          status:
+            type: object
+            properties:
+              atProvider:
+                type: object
+                properties:
+                  name:
+                    type: string
+`
+
+// TestContainerClearCoverageAbsentFromManifest is the ticket's own required
+// pin: the six cases ReasonAbsentFromManifest must get right, in one
+// fixture rather than six disconnected ones, so the ineligible and eligible
+// cases sit side by side against the exact same manifest.
+func TestContainerClearCoverageAbsentFromManifest(t *testing.T) {
+	crd := decodeCRD(t, absentFromManifestFixtureCRD)
+	m := &manifest.Manifest{
+		ForProvider: map[string]interface{}{
+			"topEmptyList": []interface{}{},
+			"topPresent":   []interface{}{"x"},
+			// topAbsent, topPopulatedByTest, nested and ancestorSwept are
+			// all deliberately absent from spec.forProvider — that
+			// absence is exactly what each of their cases below tests.
+		},
+		Tests: []manifest.UpdateTest{
+			// topPopulatedByTest carries no spec.forProvider value at
+			// all, but its own tested entry gives it a genuine,
+			// non-empty value — the FixedAddress.options shape: a field
+			// populated for the first time by the update-test annotation
+			// itself, never by the base spec.
+			{Field: "topPopulatedByTest", Value: []interface{}{"a"}},
+			// name's own clear: list names "ancestorSwept", an object
+			// ancestor that holds no "child" key anywhere in THIS
+			// manifest — the RFC-7386 whole-subtree tombstone still
+			// covers ancestorSwept.child, a legitimate no-op sweep, not
+			// a contradiction.
+			{Field: "name", Value: "updated", Clear: []string{"ancestorSwept"}},
+		},
+	}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+	byPath := findingsByPath(findings)
+
+	cases := map[string]struct {
+		path           string
+		wantIneligible bool
+		wantCovered    bool
+		wantReason     IneligibilityReason
+	}{
+		"absent from spec and from every entry": {
+			path: "topAbsent", wantIneligible: true, wantReason: ReasonAbsentFromManifest,
+		},
+		"absent from spec but populated by a tested entry": {
+			path: "topPopulatedByTest", wantIneligible: false, wantCovered: false,
+		},
+		"present as an empty list": {
+			path: "topEmptyList", wantIneligible: false, wantCovered: false,
+		},
+		"present and populated": {
+			path: "topPresent", wantIneligible: false, wantCovered: false,
+		},
+		"nested leaf whose ancestor is absent": {
+			path: "nested.child", wantIneligible: true, wantReason: ReasonAbsentFromManifest,
+		},
+		"absent leaf covered by an ancestor tombstone stays covered": {
+			path: "ancestorSwept.child", wantIneligible: false, wantCovered: true,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			f, ok := byPath[tc.path]
+			if !ok {
+				t.Fatalf("%s not found in findings: %+v", tc.path, byPath)
+			}
+			if f.Ineligible != tc.wantIneligible {
+				t.Errorf("%s.Ineligible = %v, want %v (finding: %+v)", tc.path, f.Ineligible, tc.wantIneligible, f)
+			}
+			if tc.wantIneligible && f.Reason != tc.wantReason {
+				t.Errorf("%s.Reason = %q, want %q", tc.path, f.Reason, tc.wantReason)
+			}
+			if !tc.wantIneligible && f.Covered != tc.wantCovered {
+				t.Errorf("%s.Covered = %v, want %v (finding: %+v)", tc.path, f.Covered, tc.wantCovered, f)
+			}
+		})
+	}
+
+	// ancestorSwept.child must carry the ancestor-tombstone route, the
+	// same as any other leaf that route credits — nothing about being
+	// absent from this object's own spec changes which route earns it
+	// coverage.
+	if got := byPath["ancestorSwept.child"].Route; got != RouteAncestorTombstone {
+		t.Errorf("ancestorSwept.child.Route = %q, want %q", got, RouteAncestorTombstone)
+	}
+}
+
+// TestPresentAtPath covers the presence-walk helper directly: nil input,
+// an empty string terminal path is never exercised (no leaf ever has one),
+// a present-but-nil (explicit null) member, an empty container member, a
+// missing intermediate segment, and a terminal segment reached through a
+// non-object intermediate value.
+func TestPresentAtPath(t *testing.T) {
+	cases := map[string]struct {
+		root map[string]interface{}
+		path string
+		want bool
+	}{
+		"nil root": {
+			root: nil, path: "a", want: false,
+		},
+		"top-level key present with a real value": {
+			root: map[string]interface{}{"a": []interface{}{"x"}}, path: "a", want: true,
+		},
+		"top-level key present but explicitly null": {
+			root: map[string]interface{}{"a": nil}, path: "a", want: true,
+		},
+		"top-level key present as an empty list": {
+			root: map[string]interface{}{"a": []interface{}{}}, path: "a", want: true,
+		},
+		"top-level key missing entirely": {
+			root: map[string]interface{}{"b": "x"}, path: "a", want: false,
+		},
+		"nested key present": {
+			root: map[string]interface{}{"a": map[string]interface{}{"b": "x"}}, path: "a.b", want: true,
+		},
+		"nested key missing because the intermediate object is absent": {
+			root: map[string]interface{}{"c": "x"}, path: "a.b", want: false,
+		},
+		"nested key missing because the intermediate value is not an object": {
+			root: map[string]interface{}{"a": "scalar"}, path: "a.b", want: false,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := presentAtPath(tc.root, tc.path); got != tc.want {
+				t.Errorf("presentAtPath(%#v, %q) = %v, want %v", tc.root, tc.path, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTestEntryDataTree confirms skip: entries are excluded from the
+// synthetic presence tree, a tested Field/Value pair is included, and a
+// withValues: literal on an OTHER entry is included under its own sibling
+// name.
+func TestTestEntryDataTree(t *testing.T) {
+	m := &manifest.Manifest{
+		Tests: []manifest.UpdateTest{
+			{Field: "tested", Value: []interface{}{"a"}},
+			{Field: "skipped", Skip: manifest.SkipInfo{Reason: manifest.SkipWriteOnly}},
+			{Field: "other", Value: "x", WithValues: map[string]interface{}{"sibling": []interface{}{}}},
+		},
+	}
+	tree := testEntryDataTree(m)
+
+	if !presentAtPath(tree, "tested") {
+		t.Error(`"tested" not present in the synthetic tree, want it introduced by its own Field/Value pair`)
+	}
+	if presentAtPath(tree, "skipped") {
+		t.Error(`"skipped" present in the synthetic tree — a skip: entry authors no test data and must never introduce presence`)
+	}
+	if !presentAtPath(tree, "sibling") {
+		t.Error(`"sibling" not present in the synthetic tree, want it introduced by "other"'s own withValues: map`)
 	}
 }

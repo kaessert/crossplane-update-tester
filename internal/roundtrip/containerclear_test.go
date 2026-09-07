@@ -337,6 +337,7 @@ spec:
 func TestContainerClearCoverageReportsDispositionOnUncoveredLeaf(t *testing.T) {
 	crd := decodeCRD(t, containerClearFixtureCRD)
 	m := &manifest.Manifest{
+		ForProvider: map[string]interface{}{"tags": []interface{}{"prod"}},
 		Tests: []manifest.UpdateTest{
 			{
 				Field: "tags",
@@ -494,7 +495,20 @@ func TestContainerClearCoverageIneligibleLeafNeverReportsDisposition(t *testing.
 // do so.
 func TestContainerClearCoverageZeroCoverageStillProducesFindingsNoError(t *testing.T) {
 	crd := decodeCRD(t, containerClearFixtureCRD)
-	m := &manifest.Manifest{Tests: nil} // no update-test entries at all
+	m := &manifest.Manifest{
+		// Every declared leaf present in spec.forProvider so this test
+		// stays what it was written to be — zero clear-direction
+		// coverage with everything otherwise ELIGIBLE — rather than
+		// tripping the "no value anywhere on this manifest" ineligibility
+		// reason, which is a different concern entirely.
+		ForProvider: map[string]interface{}{
+			"tags":       []interface{}{"prod"},
+			"labels":     map[string]interface{}{"k": "v"},
+			"network":    map[string]interface{}{"cidr": "10.0.0.0/8", "subnets": map[string]interface{}{"a": "10.0.1.0/24"}},
+			"helmValues": map[string]interface{}{"replicaCount": 1},
+		},
+		Tests: nil, // no update-test entries at all
+	}
 
 	findings, err := ContainerClearCoverage(crd, m)
 	if err != nil {
@@ -1134,6 +1148,10 @@ func TestDepthOfDerivesFromDottedPath(t *testing.T) {
 func TestClearCellReportCoverageIsExistential(t *testing.T) {
 	crd := decodeCRD(t, clearCellFixtureCRD)
 	m := &manifest.Manifest{
+		// aliases present in spec so it stays the eligible, uncovered
+		// sibling this test's own doc comment describes, rather than
+		// tripping the "no value anywhere on this manifest" reason.
+		ForProvider: map[string]interface{}{"aliases": []interface{}{"b"}},
 		Tests: []manifest.UpdateTest{
 			// tags self-tombstoned: value: [] on its own entry.
 			{Field: "tags", Value: []interface{}{}},
@@ -1173,6 +1191,14 @@ func TestClearCellReportCoverageIsExistential(t *testing.T) {
 func TestClearCellReportImpossibilityIsUniversalAsymmetric(t *testing.T) {
 	crd := decodeCRD(t, clearCellFixtureCRD)
 	m := &manifest.Manifest{
+		// tags and aliases both present in spec so this cell's two members
+		// stay ELIGIBLE — the disposition-asymmetry this test exists to
+		// prove is a separate concern from whether either leaf has a value
+		// anywhere on the manifest at all.
+		ForProvider: map[string]interface{}{
+			"tags":    []interface{}{"a"},
+			"aliases": []interface{}{"b"},
+		},
 		Tests: []manifest.UpdateTest{
 			{
 				Field: "tags",
@@ -1214,6 +1240,12 @@ func TestClearCellReportImpossibilityIsUniversalBothDisposed(t *testing.T) {
 		Disposition: manifest.DispositionOneLivePatch,
 	}
 	m := &manifest.Manifest{
+		// Both present in spec — this test is about disposition coverage,
+		// not about whether either leaf carries a value anywhere at all.
+		ForProvider: map[string]interface{}{
+			"tags":    []interface{}{"a"},
+			"aliases": []interface{}{"b"},
+		},
 		Tests: []manifest.UpdateTest{
 			{Field: "tags", Skip: disposedSkip},
 			{Field: "aliases", Skip: disposedSkip},
@@ -1509,6 +1541,10 @@ spec:
 func TestClearCellReportMixedCellCreditsOnlyEligibleMembers(t *testing.T) {
 	crd := decodeCRD(t, mixedClearCellFixtureCRD)
 	m := &manifest.Manifest{
+		// aliases present in spec so it stays the eligible, uncovered
+		// member this test's own name promises — tags earns its coverage
+		// from the self-tombstone entry below regardless.
+		ForProvider: map[string]interface{}{"aliases": []interface{}{"x"}},
 		Tests: []manifest.UpdateTest{
 			{Field: "tags", Value: []interface{}{}},
 		},
@@ -1634,6 +1670,14 @@ spec:
 func TestClearCellReportUncoveredCellWithIneligibleMemberDispositionedRendersOnlyEligible(t *testing.T) {
 	crd := decodeCRD(t, uncoveredDispositionedMixedCellFixtureCRD)
 	m := &manifest.Manifest{
+		// Both present in spec — this test is about the disposition render
+		// path, not about whether either leaf carries a value at all; both
+		// entries below are skip: entries, which author no test data of
+		// their own.
+		ForProvider: map[string]interface{}{
+			"aliases": []interface{}{"a"},
+			"labels":  []interface{}{"b"},
+		},
 		Tests: []manifest.UpdateTest{
 			{
 				Field: "aliases",

@@ -264,8 +264,11 @@ func classifyIneligibility(crd map[string]interface{}, leaves []ContainerLeaf) (
 }
 
 // classifyAbsentFromManifest derives ReasonAbsentFromManifest for every
-// leaf that is: not already structurally ineligible (structural — the
-// three reasons classifyIneligibility derives); and not a member of a
+// leaf that is: not already carrying an ineligibility reason from the
+// caller (structural — every reason ContainerClearCoverage has finalized
+// by this point: classifyIneligibility's structural map PLUS whichever of
+// its markerOnly reasons survived that function's own coverage
+// reconciliation); and not a member of a
 // (Shape, Depth) cell that cellCovered already reports Covered (see
 // ContainerClearCoverage's own construction of cellCovered) — stripping
 // such a member out of eligibility would WITHDRAW the cell-membership

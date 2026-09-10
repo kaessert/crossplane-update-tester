@@ -103,6 +103,24 @@ const withValuesTargetUnknownStatus = "withValues-target-unknown"
 // ValidateManifest.
 const fieldTargetUnknownStatus = "field-target-unknown"
 
+// nestedFieldCreditStatus is the status a TOP-LEVEL field is credited
+// under when its ONLY "field:" nomination is a dotted path underneath it
+// (e.g. "useTls.useMtlsObj" naming "useTls"), tested or skipped alike. The
+// report loop in ValidateManifest looks up coverage strictly by a
+// declared field's own top-level JSONName, so a dotted "field:" entry's
+// literal string — the pre-existing recording key — is never the thing
+// looked up for the field it nests under: it would sit in `tested` as a
+// live map entry no lookup can ever reach, leaving the parent MISSING
+// even though a sub-path under it was deliberately reasoned about.
+// Crediting it here, under its own status, stops that false MISSING
+// without folding it into "tested"/"skipped": a nested nomination proves
+// the named sub-path converges, never that the struct's OTHER members do,
+// so it must read differently from a field whose own value was directly
+// asserted. It is credited only when the field has no stronger direct
+// entry of its own, mirroring the clear:/assert-unchanged credit ordering
+// elsewhere in ValidateManifest. See ValidateManifest.
+const nestedFieldCreditStatus = "covered-nested"
+
 // topPathSegment returns the first dot-separated segment of a field path,
 // or the whole string when it carries no dot. A dotted "field:" or
 // "assert-unchanged:" entry names a top-level struct field followed by
@@ -404,25 +422,38 @@ func ValidateManifest(m *manifest.Manifest, fields []FieldInfo) *ValidationResul
 		AllGood: true,
 	}
 
-	// Build a set of tested/skipped fields from the annotation. This pass
-	// records only each entry's own "field:" — a second pass below layers
-	// clear: credit on top, so that a field's OWN direct entry (whichever
-	// order the two appear in m.Tests) always wins over a weaker credit
-	// picked up only because some other entry's clear: happened to name it.
-	// An entry whose field: does not resolve to a declared field — judged
-	// on its first path segment only, exactly like the assert-unchanged
+	// Build a set of tested/skipped fields from the annotation, in two
+	// passes so a field's OWN direct top-level entry always wins over a
+	// nested-path credit for the same field, regardless of which order
+	// the two appear in m.Tests.
+	//
+	// Pass 1 records only an entry whose "field:" names a top-level
+	// struct field DIRECTLY (no dot) — the field's own claim of coverage,
+	// under the exact JSONName the report loop below looks it up by. An
+	// entry whose field: does not resolve to a declared field — judged on
+	// its first path segment only, exactly like the assert-unchanged
 	// credit below — is flagged under fieldTargetUnknownStatus instead of
-	// being recorded here at all: it is not a coverage entry for anything,
-	// tested or skipped alike, so it must not silently occupy a `tested`
-	// slot no declared field will ever be looked up under.
-	tested := make(map[string]string) // jsonName → "tested", "skipped" or "skipped-unstructured"
+	// being recorded here at all: it is not a coverage entry for
+	// anything, tested or skipped alike, so it must not silently occupy a
+	// `tested` slot no declared field will ever be looked up under. A
+	// dotted entry that DOES resolve is deferred to pass 2: recording it
+	// here under its own full literal string (e.g. "useTls.useMtlsObj")
+	// would be a live map entry the report loop's JSONName lookup can
+	// never reach, since that loop only ever enumerates top-level names.
+	tested := make(map[string]string) // jsonName → "tested", "skipped", "skipped-unstructured" or nestedFieldCreditStatus
+	var nestedTests []manifest.UpdateTest
 	for _, t := range m.Tests {
-		if !fieldSet[topPathSegment(t.Field)] {
+		top := topPathSegment(t.Field)
+		if !fieldSet[top] {
 			result.Fields = append(result.Fields, FieldValidation{
 				JSONName: t.Field,
 				Status:   fieldTargetUnknownStatus,
 			})
 			result.AllGood = false
+			continue
+		}
+		if top != t.Field {
+			nestedTests = append(nestedTests, t)
 			continue
 		}
 		switch {
@@ -432,6 +463,23 @@ func ValidateManifest(m *manifest.Manifest, fields []FieldInfo) *ValidationResul
 			tested[t.Field] = "skipped"
 		default:
 			tested[t.Field] = "tested"
+		}
+	}
+
+	// Pass 2: a nested "field:" entry — deferred above — is evidence its
+	// top-level parent was reasoned about even though nothing enumerates
+	// the parent's full value as tested. Credit the parent under
+	// nestedFieldCreditStatus, but only when pass 1 left it with no
+	// stronger direct entry of its own — pass 1 has already populated
+	// every direct entry in full by the time this runs, so declaration
+	// order in m.Tests cannot change which one wins. A skip: nested entry
+	// credits exactly like a tested one: the point of this credit is that
+	// the field was reasoned about, not what conclusion that reasoning
+	// reached.
+	for _, t := range nestedTests {
+		top := topPathSegment(t.Field)
+		if _, ok := tested[top]; !ok {
+			tested[top] = nestedFieldCreditStatus
 		}
 	}
 
@@ -572,6 +620,7 @@ var statusOrder = []statusIconDetail{
 	{Status: "immutable", Icon: "✓", Detail: "immutable (excluded)"},
 	{Status: "reference-plumbing", Icon: "✓", Detail: "reference plumbing (excluded)"},
 	{Status: clearCreditStatus, Icon: "✓", Detail: "covered (nulled by a sibling entry's clear: — proven clearable, not independently value-tested)"},
+	{Status: nestedFieldCreditStatus, Icon: "⊙", Detail: "covered (nested) — no entry of its own, but a dotted field: path underneath it was nominated (tested or skipped)"},
 	{Status: assertUnchangedCreditStatus, Icon: "⊙", Detail: "guarded (assert-unchanged) — proven never to drift, not independently value-tested"},
 	{Status: "MISSING", Icon: "✗", Detail: "MISSING — not covered by update-test annotation"},
 	{Status: fieldTargetUnknownStatus, Icon: "✗", Detail: "INVALID — field: does not resolve to a declared field on this type"},

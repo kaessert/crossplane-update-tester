@@ -388,6 +388,17 @@ overrides discovery.
   reported under its own status: assert-unchanged proves the field never
   drifts, never that a specific new value can be written to it, so it is
   never folded into `tested` or `skipped`.
+- `covered-nested` — the field has no entry of its own, but a dotted `field:`
+  path underneath it (e.g. `useTls.useMtlsObj` naming `useTls`) was nominated,
+  tested or skipped alike. Coverage is normally looked up by a field's own
+  top-level name, so a nested path's literal string is never that name — this
+  status is what stops the parent from reporting `MISSING` even though a
+  sub-path under it was deliberately reasoned about. A field with its own
+  direct `field:`/`skip:` entry keeps that entry's status; this credit fills
+  the gap only when nothing else claims the field directly. Reported under
+  its own status because a nested nomination proves only the named sub-path
+  converges, never the struct's other members — never folded into `tested` or
+  `skipped`.
 - `MISSING` — none of the above; the command exits non-zero.
 
 This is what stops an annotation from quietly falling behind the API type as

@@ -231,19 +231,12 @@ func TestValidateManifestMissingField(t *testing.T) {
 // skip is still a false claim about a real field, so it fails too).
 //
 // The dotted-known-first-segment case asserts only the narrow property
-// this ticket owns — no fieldTargetUnknownStatus entry is produced for a
+// this test owns — no fieldTargetUnknownStatus entry is produced for a
 // legitimately-resolving nested path. It deliberately does NOT assert
-// AllGood or the declared field's own status: ValidateManifest's coverage
-// map is keyed on the entry's full literal "field:" string, so a dotted
-// entry never lands under its top-level field's own JSONName key in
-// `tested` either — that field still reports MISSING, exactly as it did
-// before this check existed (the ticket's own census measured "useMtlsObj"
-// and "useTls.useMtlsObj" as producing byte-identical output). Whether a
-// dotted field: should credit its own top-level field is a distinct,
-// pre-existing question this ticket's scope excludes (validator.go's
-// unknown-target check only, never the runner or the coverage-crediting
-// behavior clear:/withValues:/assert-unchanged: already had before this
-// change).
+// AllGood or the declared field's own status: a dotted entry's separate
+// credit of its top-level parent under nestedFieldCreditStatus is
+// TestValidateManifestNestedFieldCreditsTopLevelField's own concern, not
+// this test's.
 func TestValidateManifestFieldTargetUnknown(t *testing.T) {
 	fields := []FieldInfo{
 		{GoName: "UseTls", JSONName: "useTls"},
@@ -332,6 +325,86 @@ func TestValidateManifestFieldTargetUnknownValidEntryStillCredited(t *testing.T)
 	}
 	if got := statusMap(result)["useTls"]; got != statusTested {
 		t.Errorf(`status["useTls"] = %q, want %q`, got, statusTested)
+	}
+}
+
+// TestValidateManifestNestedFieldCreditsTopLevelField proves a top-level
+// field whose ONLY "field:" nomination is a dotted path underneath it is
+// credited under nestedFieldCreditStatus rather than reporting MISSING —
+// ValidateManifest's report loop looks coverage up strictly by a declared
+// field's own top-level JSONName, which a dotted entry's full literal
+// string never is. Table-driven per the four required shapes: a nested
+// skip: nomination only, a nested value (tested) nomination only, both a
+// direct top-level entry AND a nested one for the same field (the direct
+// entry must win, regardless of which order the two appear in m.Tests),
+// and no nomination at all (still MISSING, unchanged).
+func TestValidateManifestNestedFieldCreditsTopLevelField(t *testing.T) {
+	fields := []FieldInfo{
+		{GoName: "UseTls", JSONName: "useTls"},
+	}
+
+	cases := map[string]struct {
+		reason string
+		tests  []manifest.UpdateTest
+		want   string
+	}{
+		"NestedSkipOnly": {
+			reason: "a nested skip: nomination is still evidence the field was reasoned about — credited, not MISSING",
+			tests: []manifest.UpdateTest{
+				{Field: "useTls.useMtlsObj", Skip: manifest.LegacySkip("not applicable in this environment")},
+			},
+			want: nestedFieldCreditStatus,
+		},
+		"NestedValueOnly": {
+			reason: "a nested value (tested) nomination credits the parent the same way a nested skip: does",
+			tests: []manifest.UpdateTest{
+				{Field: "useTls.useMtlsObj", Value: true},
+			},
+			want: nestedFieldCreditStatus,
+		},
+		"DirectEntryWinsOverNestedDeclaredFirst": {
+			reason: "a direct top-level entry for the same field always wins over a nested credit — direct entry declared first",
+			tests: []manifest.UpdateTest{
+				{Field: "useTls", Value: map[string]interface{}{"useMtlsObj": true}},
+				{Field: "useTls.useMtlsObj", Value: true},
+			},
+			want: statusTested,
+		},
+		"DirectEntryWinsOverNestedDeclaredAfter": {
+			reason: "declaration order must not matter — the nested entry appears BEFORE the direct one here",
+			tests: []manifest.UpdateTest{
+				{Field: "useTls.useMtlsObj", Value: true},
+				{Field: "useTls", Value: map[string]interface{}{"useMtlsObj": true}},
+			},
+			want: statusTested,
+		},
+		"NoNomination": {
+			reason: "no field: entry at all must still report MISSING — this credit never widens beyond what was actually nominated",
+			tests:  nil,
+			want:   statusMissing,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			m := &manifest.Manifest{
+				Kind:  kindWidget,
+				Tests: tc.tests,
+			}
+
+			result := ValidateManifest(m, fields)
+
+			got := statusMap(result)["useTls"]
+			if got != tc.want {
+				t.Errorf("%s: status[\"useTls\"] = %q, want %q; fields: %+v", tc.reason, got, tc.want, result.Fields)
+			}
+			if tc.want == statusMissing && result.AllGood {
+				t.Errorf("%s: expected AllGood=false when useTls reports MISSING", tc.reason)
+			}
+			if tc.want != statusMissing && !result.AllGood {
+				t.Errorf("%s: expected AllGood=true; got fields: %+v", tc.reason, result.Fields)
+			}
+		})
 	}
 }
 

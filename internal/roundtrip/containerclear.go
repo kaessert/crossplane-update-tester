@@ -257,12 +257,14 @@ func ContainerClearCoverage(crd map[string]interface{}, m *manifest.Manifest) ([
 	// already Covered via some OTHER member's direct route — doing so
 	// would withdraw the cell-membership credit the report already grants
 	// that member (see ReasonAbsentFromManifest's own doc comment on
-	// "coverage never withdrawn"). structural carries the three
+	// "coverage never withdrawn"). structural carries the HARD,
 	// schema-derived reasons ONLY — a structurally-ineligible leaf never
 	// contributes coverage of its own and is excluded from cellCovered's
 	// construction here exactly as ClearCellReport.Covered excludes it
-	// (see GroupClearCells' own doc comment).
-	structural, err := classifyIneligibility(crd, leaves)
+	// (see GroupClearCells' own doc comment). markerOnly is reconciled
+	// below, AFTER every leaf's own coverage AND cellCovered are known —
+	// see the loop immediately following.
+	structural, markerOnly, err := classifyIneligibility(crd, leaves)
 	if err != nil {
 		return nil, err
 	}
@@ -282,7 +284,27 @@ func ContainerClearCoverage(crd map[string]interface{}, m *manifest.Manifest) ([
 	for path, reason := range structural {
 		ineligible[path] = reason
 	}
-	for path, reason := range classifyAbsentFromManifest(leaves, m, structural, cellCovered) {
+	// markerOnly is reconciled against cellCovered, NEVER against a
+	// standalone per-leaf coverage check: the leaf's own `value: null`
+	// (direct, sibling, or ancestor tombstone) validates at admission
+	// regardless of the `value: []` route markerOnly's own blocker closes
+	// (see listNeverEmptyReason's own doc comment), so a manifest crediting
+	// EITHER this leaf directly OR any other member sharing its (Shape,
+	// Depth) cell is not evidence of anything wrong — and withholding the
+	// reason only on DIRECT coverage, while ignoring cell membership, would
+	// itself withdraw the cell-credit every OTHER member of that cell
+	// already earns (measured against provider-f5xc: several cells whose
+	// representative covers markerOnly siblings via cell-sharing, not a
+	// direct route of their own). Exactly the guard shape
+	// classifyAbsentFromManifest already applies to cellCovered below.
+	for path, reason := range markerOnly {
+		key := CellKey{Classification: ClassNA, Shape: ShapeList, Direction: DirectionClear, Depth: depthOf(path)}
+		if cellCovered[key] {
+			continue
+		}
+		ineligible[path] = reason
+	}
+	for path, reason := range classifyAbsentFromManifest(leaves, m, ineligible, cellCovered) {
 		ineligible[path] = reason
 	}
 

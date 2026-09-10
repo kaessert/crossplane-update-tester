@@ -80,6 +80,19 @@ import (
 //     fleet has zero such leaves today, but the case is unit-tested
 //     anyway: `value: {}` is an RFC-7386 no-op, so a MAP leaf has no
 //     escape route the way a LIST leaf's `value: []` does.
+//   - neverEmptyList: the MARKER-ONLY case — minItems: 1, with NO
+//     x-kubernetes-validations rule of any kind, required or otherwise.
+//     Measured verbatim against provider-f5xc's IPPrefixSet.ipv4Prefixes:
+//     its `value: []` clear route is closed by minItems alone, with no
+//     presence rule ever guarding it, so it is ineligible purely on that
+//     basis — an explicit whole-field tombstone is not rejected by
+//     minItems and still validates at admission, but closing the
+//     empty-list route is sufficient on its own.
+//   - neverEmptySizeGuardList: the size()-guard analogue of
+//     neverEmptyList — no minItems, but an UNCONDITIONAL root CEL rule
+//     requires `.size() > 0` on it with no managementPolicies guard at
+//     all, so there is no presence rule here either. No fleet example
+//     exists today (unit-only control).
 const ineligibleFixtureCRD = `apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 spec:
@@ -106,6 +119,8 @@ spec:
           rule: "self.spec.forProvider.requiredSizeGuardList.size() > 0"
         - message: requiredMap is required once managementPolicies includes '*', 'Create', or 'Update'
           rule: "!has(self.spec) || !has(self.spec.managementPolicies) || !('*' in self.spec.managementPolicies || 'Create' in self.spec.managementPolicies || 'Update' in self.spec.managementPolicies) || has(self.spec.forProvider.requiredMap)"
+        - message: neverEmptySizeGuardList must never be emptied, with no presence rule of any kind guarding it
+          rule: "self.spec.forProvider.neverEmptySizeGuardList.size() > 0"
         properties:
           spec:
             type: object
@@ -160,6 +175,15 @@ spec:
                     items:
                       type: string
                   requiredSizeGuardList:
+                    type: array
+                    items:
+                      type: string
+                  neverEmptyList:
+                    type: array
+                    minItems: 1
+                    items:
+                      type: string
+                  neverEmptySizeGuardList:
                     type: array
                     items:
                       type: string
@@ -299,6 +323,8 @@ func ineligibleFixtureForProvider() map[string]interface{} {
 		"specAnchoredRequired":     []interface{}{"y"},
 		"requiredMinItemsList":     []interface{}{"a"},
 		"requiredSizeGuardList":    []interface{}{"a"},
+		"neverEmptyList":           []interface{}{"a"},
+		"neverEmptySizeGuardList":  []interface{}{"a"},
 		"requiredMap":              map[string]interface{}{"k": "v"},
 		"vpcSelector":              map[string]interface{}{"matchLabels": map[string]interface{}{"k": "v"}},
 		"vpcRefs":                  []interface{}{map[string]interface{}{"name": "x"}},
@@ -534,6 +560,129 @@ func TestContainerClearCoverageRequiredListWithSizeGuardStaysIneligible(t *testi
 	}
 	if !strings.Contains(string(f.Reason), "size()") {
 		t.Errorf("requiredSizeGuardList.Reason = %q, want it to name the size() guard as the actual blocker", f.Reason)
+	}
+}
+
+// TestContainerClearCoverageMinItemsOnlyListIneligible pins the fix this
+// ticket exists to make: a LIST leaf whose own schema closes the
+// `value: []` route via minItems alone — with NO x-kubernetes-validations
+// rule of any kind guarding its presence — is ineligible purely on that
+// basis, checked independently of any presence rule. Measured verbatim
+// against provider-f5xc's IPPrefixSet.ipv4Prefixes. The reason must name
+// minItems as the blocker, must NOT claim a has() guard rejects nulling it
+// (there is no presence rule here to reject anything), and must instead
+// say a whole-field tombstone still validates at admission.
+func TestContainerClearCoverageMinItemsOnlyListIneligible(t *testing.T) {
+	crd := decodeCRD(t, ineligibleFixtureCRD)
+	byPath := ineligibleFindingsByPath(t, crd)
+
+	f, ok := byPath["neverEmptyList"]
+	if !ok {
+		t.Fatalf("neverEmptyList not found in findings: %+v", byPath)
+	}
+	if !f.Ineligible {
+		t.Fatalf("neverEmptyList not marked Ineligible, want it blocked by minItems alone: %+v", f)
+	}
+	if !strings.Contains(string(f.Reason), "minItems: 1") {
+		t.Errorf("neverEmptyList.Reason = %q, want it to name minItems: 1 as the actual blocker", f.Reason)
+	}
+	if strings.Contains(string(f.Reason), "has() guard") {
+		t.Errorf("neverEmptyList.Reason = %q, must not claim a has() guard rejects nulling it — no presence rule guards this leaf at all", f.Reason)
+	}
+	if !strings.Contains(string(f.Reason), "still validates at admission") {
+		t.Errorf("neverEmptyList.Reason = %q, want it to say a whole-field tombstone still validates at admission with no presence rule in force", f.Reason)
+	}
+	if f.Reason == listRequiredByCELReason("minItems: 1") {
+		t.Errorf("neverEmptyList.Reason must not collapse to the has()-guard reason text — this leaf carries no presence rule")
+	}
+}
+
+// TestContainerClearCoverageSizeGuardOnlyListIneligible is the size()-guard
+// analogue of the minItems case above: an UNCONDITIONAL root CEL rule
+// requiring `.size() > 0`, with no managementPolicies guard of any kind,
+// is equally sufficient on its own.
+func TestContainerClearCoverageSizeGuardOnlyListIneligible(t *testing.T) {
+	crd := decodeCRD(t, ineligibleFixtureCRD)
+	byPath := ineligibleFindingsByPath(t, crd)
+
+	f, ok := byPath["neverEmptySizeGuardList"]
+	if !ok {
+		t.Fatalf("neverEmptySizeGuardList not found in findings: %+v", byPath)
+	}
+	if !f.Ineligible {
+		t.Fatalf("neverEmptySizeGuardList not marked Ineligible, want it blocked by its unconditional size() guard: %+v", f)
+	}
+	if !strings.Contains(string(f.Reason), "size()") {
+		t.Errorf("neverEmptySizeGuardList.Reason = %q, want it to name the size() guard as the actual blocker", f.Reason)
+	}
+	if strings.Contains(string(f.Reason), "has() guard") {
+		t.Errorf("neverEmptySizeGuardList.Reason = %q, must not claim a has() guard rejects nulling it — no presence rule guards this leaf at all", f.Reason)
+	}
+}
+
+// TestContainerClearCoverageMinItemsOnlyListCoverageWinsOverIneligibility is
+// the fleet-measured regression this reconciliation exists to prevent
+// (AC "coverage is never withdrawn"): minItems alone never rejects an
+// explicit whole-field tombstone (`value: null`), only `value: []`, so an
+// ancestor `clear:` tombstone that genuinely sweeps a minItems-only leaf
+// still validates at admission. Measured against provider-f5xc: dozens of
+// existing, passing examples credit a minItems-marked descendant this
+// exact way, and marking every one of them ineligible out from under that
+// coverage would be a mass over-exclusion, not a fix. A leaf found covered
+// here must be reported Covered, never Ineligible, and ContainerClearCoverage
+// must return no error — this is NOT the same guard as
+// ReasonRequiredByCELMap/ReasonCELImmutable/listRequiredByCELReason's hard
+// contradiction check, because those three reasons really do close BOTH
+// routes, so a "covered" signal there is genuine evidence of disagreement;
+// a markerOnly leaf's null route was never closed to begin with.
+func TestContainerClearCoverageMinItemsOnlyListCoverageWinsOverIneligibility(t *testing.T) {
+	crd := decodeCRD(t, ineligibleFixtureCRD)
+	m := &manifest.Manifest{
+		Tests: []manifest.UpdateTest{
+			{Field: "neverEmptyList", Value: nil, ValueExplicit: true},
+		},
+	}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage returned an error for neverEmptyList covered via an admission-valid whole-field tombstone, want no error: %v", err)
+	}
+	byPath := findingsByPath(findings)
+	f, ok := byPath["neverEmptyList"]
+	if !ok {
+		t.Fatalf("neverEmptyList not found in findings: %+v", byPath)
+	}
+	if f.Ineligible {
+		t.Errorf("neverEmptyList = %+v, want Ineligible=false — an explicit value: null test covers it, and minItems never blocked that route", f)
+	}
+	if !f.Covered {
+		t.Errorf("neverEmptyList = %+v, want Covered=true via the self-tombstone route", f)
+	}
+}
+
+// TestContainerClearCoverageMinItemsOnlyListUncoveredStaysIneligible is the
+// companion negative control: with NO manifest entry covering it at all,
+// neverEmptyList stays ineligible exactly as
+// TestContainerClearCoverageMinItemsOnlyListIneligible already pins —
+// repeated here against an explicit empty manifest (rather than the shared
+// fixture's forProvider) to prove the "coverage wins" reconciliation added
+// above does not silently exempt this leaf unconditionally.
+func TestContainerClearCoverageMinItemsOnlyListUncoveredStaysIneligible(t *testing.T) {
+	crd := decodeCRD(t, ineligibleFixtureCRD)
+	findings, err := ContainerClearCoverage(crd, &manifest.Manifest{})
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+	byPath := findingsByPath(findings)
+	f, ok := byPath["neverEmptyList"]
+	if !ok {
+		t.Fatalf("neverEmptyList not found in findings: %+v", byPath)
+	}
+	if !f.Ineligible {
+		t.Errorf("neverEmptyList = %+v, want Ineligible=true — nothing in an empty manifest covers it", f)
+	}
+	if f.Covered {
+		t.Errorf("neverEmptyList = %+v, want Covered=false", f)
 	}
 }
 

@@ -808,13 +808,20 @@ decision:
       existing member untouched, so no clear-direction test can ever reach
       the backend. For a LIST leaf, `value: []` is itself an admissible
       wholesale-replacement clear under RFC-7386 (the same route "covered"
-      below credits), so a CEL-required list stays ELIGIBLE unless its own
-      schema ALSO declares `minItems > 0`, or a second CEL rule requires
-      `<path>.size() > 0` — either one closes the `value: []` route the same
-      way the CEL rule's `has()` guard closes nulling, and only then is the
-      leaf ineligible. The reported `reason` always names the actual
-      blocker (`minItems: N`, the `size()` rule's own text, or the map's
-      RFC-7386 no-op) rather than a generic "admission rejects nulling it";
+      below credits), so whether THAT route is closed — by the leaf's own
+      `minItems > 0`, or a second CEL rule requiring `<path>.size() > 0` —
+      is checked independently of the presence rule: it answers a separate
+      question (can the list ever be emptied at all) from whether it is
+      also required to be present, and closing it is enough on its own to
+      make a LIST leaf ineligible, whether or not a presence rule also
+      applies. The reported `reason` always names the actual blocker
+      (`minItems: N`, the `size()` rule's own text, or the map's RFC-7386
+      no-op) rather than a generic "admission rejects nulling it", and
+      states plainly when no presence rule is in force: an explicit
+      whole-field tombstone is not rejected by `minItems` or `size()` and
+      still validates at admission, but the blocker is nonetheless a
+      standing, schema-level statement that the list itself must never be
+      emptied;
     - the leaf carries no value anywhere on THIS manifest under test at
       all — not in its own `spec.forProvider`, and not introduced by any
       TESTED (non-`skip:`) update-test entry either, as that entry's own
@@ -844,10 +851,10 @@ decision:
   - **uncovered** — neither of the above; a gap this manifest could close.
 
   A leaf is never reported as both ineligible and covered for either of
-  the CEL-derived reasons — CEL-immutable, or CEL-required (map, or a
-  list whose empty-clear route is also
-  closed) — that combination means an existing manifest entry disagrees
-  with the ineligibility predicate, and the report surfaces that
+  the CEL-derived reasons — CEL-immutable, CEL-required MAP, or a LIST
+  leaf whose `value: []` route is closed (whether or not a presence rule
+  also applies) — that combination means an existing manifest entry
+  disagrees with the ineligibility predicate, and the report surfaces that
   disagreement explicitly (`containerClearError`) rather than silently
   preferring one side. Two reasons are exempt from that error: the
   reference-resolution reason, because a reference-resolution field

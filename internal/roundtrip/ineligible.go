@@ -13,18 +13,35 @@ import (
 // doc comment for what each is derived from. Four causes produce
 // it: crossplane-runtime's own reference-resolution plumbing
 // (ReasonReferenceResolution), a CEL "self == oldSelf" immutability rule on
-// the leaf or an enclosing ancestor (ReasonCELImmutable), an
-// x-kubernetes-validations rule requiring the leaf under the object's
-// default managementPolicies, and the leaf carrying no value anywhere on
-// THIS manifest under test at all (ReasonAbsentFromManifest). The third
-// cause renders as one of three concrete reasons depending on the leaf's
-// own shape and schema, because a LIST leaf has a removal route a MAP leaf
-// does not: `value: []` is RFC-7386 wholesale replacement (the same route
-// selfTombstoned already credits), so a CEL-required LIST leaf is
-// ineligible ONLY when its own schema also blocks the empty-list route —
-// via `minItems > 0` or a second CEL rule requiring `<path>.size() > 0`. A
-// CEL-required LIST leaf with neither guard is not ineligible at all: it is
-// left out of the map entirely, exactly like any other eligible leaf.
+// the leaf or an enclosing ancestor (ReasonCELImmutable), a LIST or MAP
+// leaf whose own schema closes its clear route, and the leaf carrying no
+// value anywhere on THIS manifest under test at all
+// (ReasonAbsentFromManifest). The third cause renders as one of three
+// concrete reasons depending on the leaf's own shape and schema:
+//
+//   - a free-form MAP leaf required by an x-kubernetes-validations rule
+//     under the object's default managementPolicies (ReasonRequiredByCELMap)
+//     — nulling it is rejected by that rule's has() guard, and `value: {}`
+//     is an RFC-7386 no-op, so the presence rule alone is enough;
+//   - a LIST leaf has a removal route a MAP leaf does not: `value: []` is
+//     RFC-7386 wholesale replacement (the same route selfTombstoned already
+//     credits). Whether that route itself is closed — by the leaf's own
+//     `minItems > 0` or a second CEL rule requiring `<path>.size() > 0` —
+//     is checked independently of any presence rule: it answers a separate
+//     question (can the list ever be emptied at all) from whether it is
+//     also required to be present, and it is sufficient ON ITS OWN to make
+//     the leaf ineligible, whether or not a presence rule also applies.
+//     The reason text differs by which guards are in force: both a
+//     presence rule AND a closed empty-list route (listRequiredByCELReason)
+//     name the presence rule's has() guard alongside the empty-list
+//     blocker; a closed empty-list route with NO presence rule
+//     (listNeverEmptyReason) names only the empty-list blocker, and says so
+//     — an explicit whole-field tombstone is not rejected by that blocker
+//     and still validates at admission, but the blocker is a standing,
+//     schema-level statement that the list itself must never be emptied. A
+//     LIST leaf whose empty-list route stays open is not ineligible at all,
+//     whether or not it is CEL-required: it is left out of the map
+//     entirely, exactly like any other eligible leaf.
 //
 // The first three reasons are derived purely from crd's own schema — the
 // same answer for every manifest of the Kind. ReasonAbsentFromManifest is
@@ -115,36 +132,78 @@ func listRequiredByCELReason(blocker string) IneligibilityReason {
 		blocker, blocker))
 }
 
+// listNeverEmptyReason builds the ineligibility reason for a LIST leaf
+// whose OWN schema closes the `value: []` clear route — via `minItems > 0`
+// or a second x-kubernetes-validations rule requiring `<path>.size() > 0` —
+// with NO x-kubernetes-validations rule requiring the leaf's presence
+// under the default managementPolicies. blocker names the actual thing
+// closing the route, exactly as listRequiredByCELReason's own blocker
+// does.
+//
+// Unlike listRequiredByCELReason's case, nothing here rejects an explicit
+// whole-field tombstone: with no presence rule, removing the leaf entirely
+// (`value: null`, or a sibling/ancestor clear:) still validates at
+// admission, because minItems and a size() guard both constrain a PRESENT
+// list's own length and say nothing about the leaf being absent. blocker
+// is nonetheless a standing, schema-level statement — present on every
+// manifest of the Kind, not a per-manifest choice — that the list itself
+// must never be emptied, and closing the `value: []` route is sufficient
+// on its own: listEmptyRouteBlocked answers a question no presence rule
+// ever asked.
+func listNeverEmptyReason(blocker string) IneligibilityReason {
+	return IneligibilityReason(fmt.Sprintf(
+		"%s closes this list's `value: []` clear route on its own; no x-kubernetes-validations rule requires the leaf's presence, so an explicit whole-field tombstone (`value: null`, or a sibling/ancestor clear:) is not rejected by %s and still validates at admission — %s is nonetheless a standing, schema-level statement that the list itself must never be emptied, and closing that route alone is why this leaf is ineligible",
+		blocker, blocker, blocker))
+}
+
 // classifyIneligibility derives, for every leaf in leaves, whether its
-// removal direction can ever be exercised against crd's schema at all — the
-// first three reasons in IneligibilityReason's own doc comment, each
-// derived purely from the Kind's schema and therefore the same answer for
-// every manifest of that Kind. Re-derived from the schema on EVERY call —
-// nothing here is a hardcoded list, a per-provider config, or an
-// annotation a human must remember to update, so a CRD change that removes
-// the shape or the rule puts the leaf back in the denominator
-// automatically on the very next run.
+// removal direction can ever be exercised against crd's schema at all,
+// returning two maps. structural holds the HARD reasons — both of a LIST
+// leaf's two clear routes closed (ReasonCELImmutable, ReasonReferenceResolution,
+// ReasonRequiredByCELMap, or listRequiredByCELReason), where the admission
+// rule a "covered" manifest entry would have to have passed is the SAME
+// rule this function already found closes the route: a manifest claiming
+// coverage anyway is evidence the predicate or the manifest disagrees, and
+// ContainerClearCoverage's own hard-error contradiction check is written
+// to treat it that way. markerOnly holds listNeverEmptyReason candidates —
+// a LIST leaf whose `value: []` route alone is closed, with NO presence
+// rule also in force. Unlike structural, closing only ONE of the two
+// routes never rejects an admission-accepted whole-field tombstone
+// (`value: null`, or a sibling/ancestor clear:), so a manifest that
+// credits one of THESE leaves via that route is not evidence of anything
+// wrong — it is a genuine, working clear test. ContainerClearCoverage
+// reconciles markerOnly against each leaf's own coverage before finalizing
+// ineligibility, exactly as it already reconciles ReasonAbsentFromManifest
+// against cellCovered: coverage already earned is never withdrawn.
+//
+// Both maps are derived purely from the Kind's schema — the same answer
+// for every manifest of that Kind — and re-derived on EVERY call: nothing
+// here is a hardcoded list, a per-provider config, or an annotation a
+// human must remember to update, so a CRD change that removes the shape or
+// the rule puts the leaf back in the denominator automatically on the very
+// next run.
 //
 // The fourth reason, ReasonAbsentFromManifest, is NOT derived here — it
 // reads the manifest under test's own data rather than the schema, and
 // needs a cell-level coverage lookup only the caller can build (see
-// classifyAbsentFromManifest and ContainerClearCoverage's own two-pass
+// classifyAbsentFromManifest and ContainerClearCoverage's own
 // construction).
 //
 // A leaf matching none of the reasons in IneligibilityReason's own doc
-// comment is left out of the returned map entirely; it is not ineligible.
-func classifyIneligibility(crd map[string]interface{}, leaves []ContainerLeaf) (map[string]IneligibilityReason, error) {
+// comment is left out of both returned maps entirely; it is not
+// ineligible.
+func classifyIneligibility(crd map[string]interface{}, leaves []ContainerLeaf) (structural, markerOnly map[string]IneligibilityReason, err error) {
 	schema, err := servedSchema(crd)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	fpSchema, err := fieldSchema(schema, "spec", "forProvider")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	apSchema, err := fieldSchema(schema, "status", "atProvider")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	apPaths := make(map[string]bool)
 	for _, p := range leafPaths(apSchema, "") {
@@ -160,32 +219,48 @@ func classifyIneligibility(crd map[string]interface{}, leaves []ContainerLeaf) (
 
 	mpDefault, hasDefault := managementPoliciesDefault(schema)
 
-	out := make(map[string]IneligibilityReason, len(leaves))
+	structural = make(map[string]IneligibilityReason, len(leaves))
+	markerOnly = make(map[string]IneligibilityReason)
 	for _, leaf := range leaves {
 		if referenceResolutionShape(fpSchema, leaf, apPaths) {
-			out[leaf.Path] = ReasonReferenceResolution
+			structural[leaf.Path] = ReasonReferenceResolution
 			continue
 		}
 		if immutable[leaf.Path] {
-			out[leaf.Path] = ReasonCELImmutable
+			structural[leaf.Path] = ReasonCELImmutable
 			continue
 		}
-		if hasDefault && requiredByManagementPolicies(schema, leaf.Path, mpDefault) {
-			if leaf.Shape == ShapeMap {
-				out[leaf.Path] = ReasonRequiredByCELMap
-				continue
-			}
-			// ShapeList: required by CEL is not, on its own, enough — a
-			// list leaf's `value: []` is an admissible
-			// wholesale-replacement clear under RFC-7386 (selfTombstoned
-			// already credits it) unless the leaf's own schema ALSO
-			// blocks the empty-list route.
-			if blocker, blocked := listEmptyRouteBlocked(fpSchema, schema, leaf.Path); blocked {
-				out[leaf.Path] = listRequiredByCELReason(blocker)
-			}
+		requiredByCEL := hasDefault && requiredByManagementPolicies(schema, leaf.Path, mpDefault)
+		if requiredByCEL && leaf.Shape == ShapeMap {
+			structural[leaf.Path] = ReasonRequiredByCELMap
+			continue
+		}
+		if leaf.Shape != ShapeList {
+			continue
+		}
+		// listEmptyRouteBlocked is consulted here ONCE, in its own branch,
+		// for every list leaf — checked independently of requiredByCEL
+		// above: whether the list's own `value: []` route is closed
+		// answers a SEPARATE question (can it be emptied at all) from
+		// whether it is also required to be present, and is sufficient ON
+		// ITS OWN to make the leaf a markerOnly candidate. requiredByCEL
+		// only changes which map (and which reason text) the leaf lands
+		// in, never whether this leaf is checked at all.
+		blocker, blocked := listEmptyRouteBlocked(fpSchema, schema, leaf.Path)
+		if !blocked {
+			continue
+		}
+		if requiredByCEL {
+			// Both routes closed: a hard, structural reason exactly like
+			// ReasonRequiredByCELMap above.
+			structural[leaf.Path] = listRequiredByCELReason(blocker)
+		} else {
+			// Only the `value: []` route is closed; the caller reconciles
+			// this against actual coverage before treating it as final.
+			markerOnly[leaf.Path] = listNeverEmptyReason(blocker)
 		}
 	}
-	return out, nil
+	return structural, markerOnly, nil
 }
 
 // classifyAbsentFromManifest derives ReasonAbsentFromManifest for every

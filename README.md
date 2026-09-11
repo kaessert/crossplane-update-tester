@@ -1128,11 +1128,15 @@ crossplane.io/update-test: |
       reconfirm: "2027-01-01"
 ```
 
-`disposition:` is currently report-only: `roundtrip-verify`'s
+`disposition:` is read by `validate`'s container-clear cell gate: an
+uncovered container-clear cell whose eligible members all carry a
+disposition passes, and one carrying an eligible member with no
+`disposition:` fails `validate`, which exits non-zero. `roundtrip-verify`'s
 `containerClear` findings surface, per uncovered container-typed leaf,
-whether its own `skip:` entry (if any) carries a disposition and which, but
-nothing folds it into an exit code today, and an absent `disposition:` is
-reported as absent rather than defaulted to any of the four values.
+whether its own `skip:` entry (if any) carries a disposition and which, and
+stay report-only — that command's own exit code never reads them. An absent
+`disposition:` is reported as absent rather than defaulted to any of the
+four values.
 
 #### Whole-field tombstones without a sibling field
 

@@ -97,14 +97,18 @@ func collectContainerLeaves(schema interface{}, prefix string, out *[]ContainerL
 // always false when Ineligible is true — ContainerClearCoverage refuses to
 // produce a finding that is both (see its own doc comment).
 //
-// REPORT-ONLY, by construction: this type carries no field a caller could
-// fold into a process exit code without writing new code to do so, and no
-// function in this file returns a bool or error that means "fail" for the
-// covered/uncovered split. Six of the fleet's seven providers measure zero
-// clear-direction coverage today; enforcing this would break every one of
-// their E2E runs the moment it shipped. Flipping this from advisory to
-// enforcing is a distinct, deliberate, later act — not a side effect of
-// this type existing.
+// This type itself carries no pass/fail field, and no function in this
+// file returns a bool or error for the covered/uncovered split — grouping
+// findings into cells (GroupClearCells) and rendering the verdict
+// (PrintClearCellReport) is where the gate lives, and it gates on exactly
+// ONE of the states above: an uncovered cell with at least one eligible,
+// undispositioned member. A Vacuous cell (every member ineligible) and an
+// uncovered cell whose eligible members are all dispositioned both pass —
+// see ClearCellReport's own doc comment for why. The `validate` subcommand
+// folds that verdict into its own exit code (see printContainerClearCells);
+// roundtrip-verify's JSON encoding of this same type (containerClearJSON)
+// stays report-only, since that command's exit code is derived solely from
+// its own must-test denominator.
 type ContainerClearFinding struct {
 	Path    string
 	Shape   Shape
@@ -599,6 +603,14 @@ type ClearCellReport struct {
 	// IneligibleMembers is the subset of Members classifyIneligibility
 	// excluded from this cell's eligible set, sorted.
 	IneligibleMembers []string
+	// IneligibilityReasons maps each path in IneligibleMembers to the
+	// IneligibilityReason classifyIneligibility assigned it — the same
+	// population as IneligibleMembers, carried through so an offline
+	// reader of PrintClearCellReport's output can see WHY a member is
+	// excluded, not merely THAT it is. Keyed by path rather than
+	// index-aligned with IneligibleMembers so a caller never has to
+	// zip the two slices together to look one up.
+	IneligibilityReasons map[string]IneligibilityReason
 	// Covered is RULING 2's existential half: true the moment ANY eligible
 	// member carries clear-direction coverage of its own.
 	Covered bool
@@ -687,6 +699,10 @@ func buildClearCellReport(key CellKey, members []ContainerClearFinding) ClearCel
 		report.Members = append(report.Members, m.Path)
 		if m.Ineligible {
 			report.IneligibleMembers = append(report.IneligibleMembers, m.Path)
+			if report.IneligibilityReasons == nil {
+				report.IneligibilityReasons = make(map[string]IneligibilityReason, len(members))
+			}
+			report.IneligibilityReasons[m.Path] = m.Reason
 			continue
 		}
 		eligibleCount++
@@ -722,20 +738,25 @@ func buildClearCellReport(key CellKey, members []ContainerClearFinding) ClearCel
 }
 
 // PrintClearCellReport renders reports as text, in the shape the `validate`
-// subcommand prints alongside its other offline checks — report-only, by
-// construction: nothing here returns a value a caller could fold into an
-// exit-code decision. The verdict line states TWO numbers, cells and
-// leaves, never one — the two denominators move independently once a
-// single cell credits several leaves.
-func PrintClearCellReport(printFn func(format string, args ...interface{}), reports []ClearCellReport) {
+// subcommand prints alongside its other offline checks, and returns the
+// number of BLOCKING cells found — the one state of the four a cell can
+// take that fails the gate (see the switch below): an uncovered cell
+// carrying at least one eligible member with no authored disposition.
+// Every other state — Vacuous, Covered, or uncovered-but-fully-dispositioned
+// — passes; `cmdValidate` folds the returned count into its own exit-code
+// decision exactly as it does its other checks (see printContainerClearCells).
+// The verdict line states TWO numbers, cells and leaves, never one — the
+// two denominators move independently once a single cell credits several
+// leaves.
+func PrintClearCellReport(printFn func(format string, args ...interface{}), reports []ClearCellReport) int {
 	if len(reports) == 0 {
 		printFn("container-clear cells: no declared container-typed leaves\n")
-		return
+		return 0
 	}
 
-	printFn("container-clear cell coverage (report-only — RULING 1-3, cell key: shape+depth, clear direction):\n")
+	printFn("container-clear cell coverage (RULING 1-3, cell key: shape+depth, clear direction; only an uncovered cell with an undispositioned member fails):\n")
 
-	totalCells, coveredCells, vacuousCells := 0, 0, 0
+	totalCells, coveredCells, vacuousCells, blockingCells := 0, 0, 0, 0
 	totalLeaves, coveredLeaves := 0, 0
 	for _, r := range reports {
 		totalCells++
@@ -744,8 +765,10 @@ func PrintClearCellReport(printFn func(format string, args ...interface{}), repo
 		switch {
 		case r.Vacuous:
 			vacuousCells++
-			printFn("  ⊘ %s/%s: VACUOUS — every member ineligible: %s\n",
-				r.Key.Shape, r.Key.Depth, strings.Join(r.IneligibleMembers, ", "))
+			printFn("  ⊘ %s/%s: VACUOUS — every member ineligible:\n", r.Key.Shape, r.Key.Depth)
+			for _, path := range r.IneligibleMembers {
+				printFn("      %s: %s\n", path, r.IneligibilityReasons[path])
+			}
 		case r.Covered:
 			coveredCells++
 			coveredLeaves += eligible
@@ -763,6 +786,7 @@ func PrintClearCellReport(printFn func(format string, args ...interface{}), repo
 				printFn("      excluded (ineligible): %s\n", strings.Join(r.IneligibleMembers, ", "))
 			}
 		default:
+			blockingCells++
 			totalLeaves += eligible
 			printFn("  ✗ %s/%s: uncovered, undispositioned member(s): %s\n",
 				r.Key.Shape, r.Key.Depth, strings.Join(r.UndispositionedMembers, ", "))
@@ -771,4 +795,5 @@ func PrintClearCellReport(printFn func(format string, args ...interface{}), repo
 
 	printFn("container-clear cell verdict: %d/%d cells covered, %d/%d leaves covered (%d vacuous cell(s), excluded from both denominators)\n",
 		coveredCells, totalCells-vacuousCells, coveredLeaves, totalLeaves, vacuousCells)
+	return blockingCells
 }

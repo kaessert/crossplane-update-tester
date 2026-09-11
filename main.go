@@ -558,7 +558,7 @@ func cmdValidate(args []string) error {
 	skipReasonFindings := validator.CheckSkipReasons(m, fields)
 	validator.PrintSkipReasons(skipReasonFindings)
 
-	printContainerClearCells(opts.root, opts.manifestPath, m)
+	blockingClearCells := printContainerClearCells(opts.root, opts.manifestPath, m)
 
 	if !result.AllGood {
 		return errors.New("mutable-field coverage is incomplete")
@@ -581,6 +581,9 @@ func cmdValidate(args []string) error {
 	if len(skipReasonFindings) > 0 {
 		return errors.New("skip: reason does not resolve against this manifest's own declared coverage")
 	}
+	if blockingClearCells > 0 {
+		return errors.New("container-clear cell coverage has an uncovered, undispositioned member blocking the update-test gate")
+	}
 	return nil
 }
 
@@ -591,16 +594,22 @@ func cmdValidate(args []string) error {
 // same computation sits behind `roundtrip-verify`, a subcommand no
 // provider invokes.
 //
-// REPORT-ONLY: the return value is deliberately discarded by cmdValidate
-// and nothing here is wired into result.AllGood or any of cmdValidate's
-// other exit-code decisions — flipping this from advisory to enforcing is
-// a distinct, later, conversation-reserved act (see roundtrip.
-// ContainerClearFinding's own doc comment for why). A CRD that cannot be
-// found is silently skipped, exactly as roundtrip-verify already treats
-// that case: `validate` has always run without a CRD present (its other
-// checks resolve against the Go types file, never the CRD), so a provider
-// mid-generation with no CRD yet must not start failing a check that was
-// never gating before.
+// Returns the number of BLOCKING cells (roundtrip.PrintClearCellReport's
+// own count: an uncovered cell with at least one eligible, undispositioned
+// member), which cmdValidate folds into its own exit-code decision exactly
+// as it does its other checks. A Vacuous cell (every member ineligible)
+// and an uncovered cell whose eligible members are all dispositioned both
+// pass and are never counted here. A CRD that cannot be found is silently
+// skipped — zero returned, never a failure — exactly as roundtrip-verify
+// already treats that case: `validate` has always run without a CRD
+// present (its other checks resolve against the Go types file, never the
+// CRD), so a provider mid-generation with no CRD yet does not start
+// failing a check that was never gating before. A contradiction from
+// roundtrip.ContainerClearCoverage itself (a leaf classified both
+// ineligible and covered) is printed but likewise never gates here —
+// exactly as it never gates roundtrip-verify's own exit code — so a
+// predicate/manifest disagreement is visible without being wired into a
+// second, separate failure mode this function does not own.
 //
 // root ALONE is not a reliable place to find package/crds: six of the
 // fleet's seven update-test.validate Makefile recipes invoke this command
@@ -614,7 +623,7 @@ func cmdValidate(args []string) error {
 // inferProviderRootFromManifest walks up from ITS OWN directory instead,
 // which reaches the provider root reliably regardless of what the tool
 // process's own cwd became.
-func printContainerClearCells(root, manifestPath string, m *manifest.Manifest) {
+func printContainerClearCells(root, manifestPath string, m *manifest.Manifest) int {
 	crd, _ := roundtrip.FindCRD(root, m.APIVersion, m.Kind)
 	if crd == nil {
 		if inferredRoot, ok := inferProviderRootFromManifest(manifestPath); ok {
@@ -622,14 +631,14 @@ func printContainerClearCells(root, manifestPath string, m *manifest.Manifest) {
 		}
 	}
 	if crd == nil {
-		return
+		return 0
 	}
 	findings, err := roundtrip.ContainerClearCoverage(crd, m)
 	if err != nil {
 		printfTo(os.Stdout, "container-clear: ERROR — %s\n", err)
-		return
+		return 0
 	}
-	roundtrip.PrintClearCellReport(func(format string, args ...interface{}) {
+	return roundtrip.PrintClearCellReport(func(format string, args ...interface{}) {
 		printfTo(os.Stdout, format, args...)
 	}, roundtrip.BuildClearCellReport(findings))
 }
@@ -1548,9 +1557,14 @@ type cellCreditJSON struct {
 }
 
 // containerClearJSON is the machine-readable shape one
-// roundtrip.ContainerClearFinding renders as. REPORT-ONLY: nothing reads
-// this slice to decide anyFindings — see buildRoundtripVerifyReport.
-// Ineligible/Reason surface the third state (see
+// roundtrip.ContainerClearFinding renders as, for roundtrip-verify's own
+// report. This encoding stays report-only: buildRoundtripVerifyReport's
+// anyFindings never reads this slice, so a JSON line here never affects
+// roundtrip-verify's own exit code. That is a separate claim from
+// roundtrip.ContainerClearFinding's own doc comment, which the `validate`
+// subcommand's cell gate (printContainerClearCells) DOES fold into an
+// exit-code decision — through ClearCellReport, never through this JSON
+// encoding. Ineligible/Reason surface the third state (see
 // roundtrip.ContainerClearFinding's own doc comment): Covered is always
 // false when Ineligible is true, and Reason is empty otherwise.
 // Disposition is also report-only and empty whenever Covered is true,

@@ -2048,6 +2048,139 @@ func TestPrintContainerClearCellsFallsBackWhenRootIsWrong(t *testing.T) {
 	}
 }
 
+// TestPrintContainerClearCellsReturnsZeroWhenCRDAbsent is the container-clear
+// cell gate's own CRD-absent skip, pinned end-to-end: `validate` has always
+// run without a CRD present (its other checks resolve against the Go types
+// file, never the CRD), so a provider mid-generation with no package/crds
+// directory anywhere must not start failing this check now that it gates.
+// No CRD fixture is written under root at all — roundtrip.FindCRD, and its
+// inferProviderRootFromManifest fallback, both find nothing.
+func TestPrintContainerClearCellsReturnsZeroWhenCRDAbsent(t *testing.T) {
+	root := t.TempDir() // no package/crds directory anywhere under root
+	manifestPath := filepath.Join(root, "widget.yaml")
+	if err := os.WriteFile(manifestPath, []byte("kind: Widget\n"), 0o600); err != nil {
+		t.Fatalf("writing manifest fixture: %v", err)
+	}
+	m := &manifest.Manifest{APIVersion: "widgets.crossplane.io/v1alpha1", Kind: "Widget", Name: "example"}
+
+	got := printContainerClearCells(root, manifestPath, m)
+	if got != 0 {
+		t.Errorf("printContainerClearCells with no CRD anywhere = %d blocking cells, want 0 — a provider mid-generation with no CRD yet must never fail this gate", got)
+	}
+}
+
+// vacuousContainerClearFixtureCRDForMain declares a single top-level List
+// leaf, immutableTags, whose only x-kubernetes-validations rule is
+// self == oldSelf — CEL-immutable, and therefore INELIGIBLE
+// (roundtrip.ReasonCELImmutable). With zero eligible members, its
+// (list, top) cell is VACUOUS — one of the three cell states that must
+// never block cmdValidate's exit code, proven end-to-end by
+// TestCmdValidateDoesNotFailOnVacuousContainerClearCell below.
+const vacuousContainerClearFixtureCRDForMain = `apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+spec:
+  group: widgets.crossplane.io
+  names:
+    kind: Widget
+    plural: widgets
+  versions:
+  - name: v1alpha1
+    served: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            properties:
+              forProvider:
+                type: object
+                properties:
+                  name:
+                    type: string
+                  immutableTags:
+                    type: array
+                    items:
+                      type: string
+                    x-kubernetes-validations:
+                    - message: immutableTags is immutable
+                      rule: "self == oldSelf"
+          status:
+            type: object
+            properties:
+              atProvider:
+                type: object
+                properties:
+                  name:
+                    type: string
+`
+
+// TestCmdValidateDoesNotFailOnVacuousContainerClearCell is the flip's own
+// negative pin: a manifest whose only declared container leaf is
+// CEL-immutable — every member of its cell ineligible, VACUOUS — must still
+// pass cmdValidate. Every other check trivially passes (writeValidateFixtures'
+// own empty WidgetParameters struct, an annotation-free manifest), so a
+// non-nil error here could only come from the container-clear gate wrongly
+// failing a state AC 2 rules must pass.
+func TestCmdValidateDoesNotFailOnVacuousContainerClearCell(t *testing.T) {
+	root := t.TempDir()
+	writeCRDFixture(t, root, "widget.yaml", vacuousContainerClearFixtureCRDForMain)
+	manifestPath, _ := writeValidateFixtures(t, root, "widgets.crossplane.io/v1alpha1", "apis/cluster/v1alpha1/zz_widget_types.go")
+
+	if err := cmdValidate([]string{"--root", root, manifestPath}); err != nil {
+		t.Fatalf("cmdValidate with a VACUOUS-only container-clear cell = %v, want nil — a vacuous cell must never block the gate", err)
+	}
+}
+
+// TestCmdValidateFailsOnBlockingContainerClearCell is the flip's own
+// positive pin: containerClearFixtureCRDForMain's "tags" leaf is the sole
+// member of its (list, top) cell, present in spec.forProvider and named by
+// an update-test entry whose value is neither a clear:, a tombstone, nor a
+// per-key removal — eligible, uncovered, and undispositioned (no skip:).
+// That is the ONE cell state AC 2 requires actually fail the gate, and this
+// is the end-to-end proof it does, through cmdValidate's own exit code
+// rather than through printContainerClearCells or PrintClearCellReport in
+// isolation.
+func TestCmdValidateFailsOnBlockingContainerClearCell(t *testing.T) {
+	root := t.TempDir()
+	writeCRDFixture(t, root, "widget.yaml", containerClearFixtureCRDForMain)
+
+	typesPath := filepath.Join(root, "apis/cluster/v1alpha1/zz_widget_types.go")
+	if err := os.MkdirAll(filepath.Dir(typesPath), 0o750); err != nil {
+		t.Fatalf("creating parent dirs for types file: %v", err)
+	}
+	src := "package v1alpha1\n\ntype WidgetParameters struct {\n\tTags []string `json:\"tags,omitempty\"`\n}\n"
+	if err := os.WriteFile(typesPath, []byte(src), 0o600); err != nil {
+		t.Fatalf("writing types file: %v", err)
+	}
+
+	manifestPath := filepath.Join(root, "widget.yaml")
+	yamlDoc := "apiVersion: widgets.crossplane.io/v1alpha1\n" +
+		"kind: Widget\n" +
+		"metadata:\n" +
+		"  name: example-widget\n" +
+		"  annotations:\n" +
+		"    crossplane.io/update-test: |\n" +
+		"      - field: tags\n" +
+		"        value:\n" +
+		"        - updated\n" +
+		"spec:\n" +
+		"  forProvider:\n" +
+		"    tags:\n" +
+		"    - original\n"
+	if err := os.WriteFile(manifestPath, []byte(yamlDoc), 0o600); err != nil {
+		t.Fatalf("writing manifest fixture: %v", err)
+	}
+
+	err := cmdValidate([]string{"--root", root, manifestPath})
+	if err == nil {
+		t.Fatal("cmdValidate with an uncovered, undispositioned container-clear cell = nil error, want a blocking failure")
+	}
+	if !strings.Contains(err.Error(), "container-clear") {
+		t.Errorf("cmdValidate error = %q, want it to mention container-clear", err.Error())
+	}
+}
+
 // TestBuildRoundtripVerifyReportContainerClearNeverAffectsExitCode is the
 // ticket's own required pin: a manifest with ZERO clear-direction
 // coverage anywhere — the measured state of most of the fleet — still

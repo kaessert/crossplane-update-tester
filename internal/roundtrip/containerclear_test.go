@@ -1748,3 +1748,138 @@ func TestClearCellReportUncoveredCellWithIneligibleMemberDispositionedRendersOnl
 		t.Errorf("ineligible member immutableC must remain VISIBLE as excluded, not silently dropped from output entirely:\n%s", full)
 	}
 }
+
+// TestPrintClearCellReportBlockingCountPerCellState is the flip's own core
+// pin (UTV-TOOL-CELLGATE change A): PrintClearCellReport returns the number
+// of BLOCKING cells, and exactly ONE of the four cell states blocks — an
+// uncovered cell carrying at least one eligible, undispositioned member.
+// Vacuous, Covered, and uncovered-but-fully-dispositioned all return 0,
+// regardless of how many ineligible or dispositioned members they carry.
+//
+// Each case is a REAL fixture already proven elsewhere in this file to
+// reach the state it claims (see the fixture's own comment) — this test
+// adds only the return-value assertion those earlier tests never made,
+// since PrintClearCellReport had nothing to return before this ticket.
+//
+// Mutated by hand against each case while developing this test — widening
+// the "default" branch's condition (e.g. dropping the Vacuous or Covered
+// guard ahead of it) turns the corresponding "blocking count" case red,
+// confirming the assertion is not vacuously true.
+func TestPrintClearCellReportBlockingCountPerCellState(t *testing.T) {
+	cases := map[string]struct {
+		reason        string
+		crdYAML       string
+		forProvider   map[string]interface{}
+		tests         []manifest.UpdateTest
+		wantBlocking  int
+		wantSubstring string
+	}{
+		"vacuous cell never blocks": {
+			reason:        "every member of the (list, top) cell is CEL-immutable and therefore ineligible — VACUOUS, RULING'd green on 2026-08-29",
+			crdYAML:       vacuousClearCellFixtureCRD,
+			tests:         nil,
+			wantBlocking:  0,
+			wantSubstring: "VACUOUS",
+		},
+		"covered cell never blocks": {
+			reason:      "tags earns clear-direction credit via a self-tombstone; the cell is Covered even though aliases (its sibling) is uncovered and immutableC is ineligible",
+			crdYAML:     mixedClearCellFixtureCRD,
+			forProvider: map[string]interface{}{"aliases": []interface{}{"x"}},
+			tests: []manifest.UpdateTest{
+				{Field: "tags", Value: []interface{}{}},
+			},
+			wantBlocking:  0,
+			wantSubstring: "covered via",
+		},
+		"uncovered cell fully dispositioned never blocks": {
+			reason:      "aliases and labels are both uncovered but each carries an authored skip: disposition; immutableC is ineligible",
+			crdYAML:     uncoveredDispositionedMixedCellFixtureCRD,
+			forProvider: map[string]interface{}{"aliases": []interface{}{"a"}, "labels": []interface{}{"b"}},
+			tests: []manifest.UpdateTest{
+				{Field: "aliases", Skip: manifest.SkipInfo{Reason: manifest.SkipVendorDefect, Evidence: "observed a 400", Disposition: manifest.DispositionOneLivePatch}},
+				{Field: "labels", Skip: manifest.SkipInfo{Reason: manifest.SkipWriteOnly, Disposition: manifest.DispositionStaticallyProvable}},
+			},
+			wantBlocking:  0,
+			wantSubstring: "every eligible member dispositioned",
+		},
+		"uncovered, undispositioned cell blocks": {
+			reason:        "tags and aliases are both present, both eligible, both uncovered, and NEITHER carries a skip: disposition — the one state AC 2 requires actually fail the gate",
+			crdYAML:       mixedClearCellFixtureCRD,
+			forProvider:   map[string]interface{}{"aliases": []interface{}{"x"}, "tags": []interface{}{"y"}},
+			tests:         nil,
+			wantBlocking:  1,
+			wantSubstring: "undispositioned member(s)",
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			crd := decodeCRD(t, tc.crdYAML)
+			m := &manifest.Manifest{ForProvider: tc.forProvider, Tests: tc.tests}
+
+			findings, err := ContainerClearCoverage(crd, m)
+			if err != nil {
+				t.Fatalf("%s: ContainerClearCoverage: %v", tc.reason, err)
+			}
+			reports := BuildClearCellReport(findings)
+
+			var out []string
+			blocking := PrintClearCellReport(func(format string, args ...interface{}) {
+				out = append(out, fmt.Sprintf(format, args...))
+			}, reports)
+			full := strings.Join(out, "")
+
+			if blocking != tc.wantBlocking {
+				t.Errorf("%s: PrintClearCellReport blocking count = %d, want %d\noutput:\n%s", tc.reason, blocking, tc.wantBlocking, full)
+			}
+			if !strings.Contains(full, tc.wantSubstring) {
+				t.Errorf("%s: output does not contain %q:\n%s", tc.reason, tc.wantSubstring, full)
+			}
+		})
+	}
+}
+
+// TestPrintClearCellReportRendersIneligibilityReasonPerMember is AC 4
+// (UTV-TOOL-CELLGATE change B): a VACUOUS cell's rendered report names
+// EACH ineligible member together with its own IneligibilityReason, not
+// merely its name — the offline path every provider's own
+// `make update-test.validate` actually reaches, unlike
+// buildRoundtripVerifyReport's JSON encoding of the same Reason field,
+// which sits behind the live-only `roundtrip-verify` subcommand.
+func TestPrintClearCellReportRendersIneligibilityReasonPerMember(t *testing.T) {
+	crd := decodeCRD(t, vacuousClearCellFixtureCRD)
+	m := &manifest.Manifest{Tests: nil}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+	reports := BuildClearCellReport(findings)
+
+	var out []string
+	PrintClearCellReport(func(format string, args ...interface{}) {
+		out = append(out, fmt.Sprintf(format, args...))
+	}, reports)
+	full := strings.Join(out, "")
+
+	for _, path := range []string{"immutableA", "immutableB"} {
+		if !strings.Contains(full, path) {
+			t.Errorf("report does not name ineligible member %q at all:\n%s", path, full)
+		}
+	}
+	if !strings.Contains(full, string(ReasonCELImmutable)) {
+		t.Errorf("report names ineligible members but never renders their IneligibilityReason (%q):\n%s", ReasonCELImmutable, full)
+	}
+	// Each member's OWN line must carry the reason, not merely the reason
+	// appearing somewhere in the report — a single trailing reason line
+	// shared across every member would still pass a bare Contains check
+	// but would not actually be "per member".
+	for _, line := range out {
+		if strings.Contains(line, "immutableA") && !strings.Contains(line, string(ReasonCELImmutable)) {
+			t.Errorf("immutableA's own line carries no IneligibilityReason: %q", line)
+		}
+		if strings.Contains(line, "immutableB") && !strings.Contains(line, string(ReasonCELImmutable)) {
+			t.Errorf("immutableB's own line carries no IneligibilityReason: %q", line)
+		}
+	}
+}

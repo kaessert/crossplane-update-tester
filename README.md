@@ -115,14 +115,17 @@ For each entry in the manifest's `crossplane.io/update-test` annotation, `run`:
     live check only runs when the entry it is attributed to reaches that
     point in the loop — an entry can be attributed a credit and never reach
     it, for three distinct reasons: the entry carries `skip:` alongside
-    `clear:`/`withValues:`, so it never runs; the entry's own target value
-    already equals the resource's current value, so it short-circuits to a
-    no-op before any patch is built; or no entry at all could be matched as
-    the credit's origin. Each is reported by name — which entry, which
-    credit mechanism, why the check never ran — and fails the whole
-    invocation exactly like a credit that *was* checked and found false. A
-    credit that is never checked proves nothing, and this exists so that
-    silence is never mistaken for a pass.
+    `clear:`/`withValues:` — a combination the manifest parser itself
+    rejects, so this reason guards only a `Manifest` built without going
+    through it; the entry's own target value already equals the resource's
+    current value, so it short-circuits to a no-op before any patch is
+    built — the one reason an ordinary annotation can still reach; or no
+    entry at all could be matched as the credit's origin, which the shared
+    classifier that assigns the credit cannot itself produce. Each is
+    reported by name — which entry, which credit mechanism, why the check
+    never ran — and fails the whole invocation exactly like a credit that
+    *was* checked and found false. A credit that is never checked proves
+    nothing, and this exists so that silence is never mistaken for a pass.
 
 Point 6 is the reason this tool exists rather than a `kubectl patch` followed by
 a value assertion. A value match alone cannot distinguish "the controller

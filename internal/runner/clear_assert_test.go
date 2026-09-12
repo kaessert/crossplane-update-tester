@@ -346,6 +346,50 @@ func TestClearCellReportsFor(t *testing.T) {
 	})
 }
 
+// TestClearCellReportsForBackendDiscardsNeverReachesGateA is the ticket's
+// own required interlock, proven with a fixture rather than by reasoning:
+// tags carries a REAL tested value: of its own plus a top-level
+// disposition: backend-discards, and no OTHER entry credits it, so its
+// cell is uncovered. unobservedClearCredits — the function that decides
+// which cells the live clear-credit assertion (Gate A) checks — must
+// report nothing for it: an uncovered cell was never a candidate for Gate
+// A in the first place (see unobservedClearCredits' own `!report.Covered`
+// guard), and this is the end-to-end proof that withdrawing the credit
+// via a disposition, rather than merely reasoning about it, actually
+// reaches that guard.
+func TestClearCellReportsForBackendDiscardsNeverReachesGateA(t *testing.T) {
+	root := writeClearAssertFixtureCRD(t)
+	m := &manifest.Manifest{
+		APIVersion: "widgets.crossplane.io/v1alpha1", Kind: "ExampleResource",
+		Tests: []manifest.UpdateTest{
+			{Field: "tags", Value: []interface{}{"updated"}, Disposition: manifest.DispositionBackendDiscards},
+		},
+	}
+	reports := clearCellReportsFor(root, m)
+
+	var found bool
+	for _, r := range reports {
+		if r.Key.Shape != roundtrip.ShapeList || r.Key.Depth != roundtrip.DepthTop {
+			continue
+		}
+		found = true
+		if r.Covered {
+			t.Fatalf("(list, top) cell reported Covered — this test needs it uncovered to prove Gate A stays quiet on it: %+v", r)
+		}
+	}
+	if !found {
+		t.Fatalf("no (list, top) cell reported at all: %+v", reports)
+	}
+
+	pending, unresolved := unobservedClearCredits(reports, m.Tests)
+	if len(pending) != 0 {
+		t.Errorf("unobservedClearCredits pending = %+v, want empty — Gate A must never fire on a dispositioned, uncovered cell", pending)
+	}
+	if len(unresolved) != 0 {
+		t.Errorf("unresolved = %+v, want empty", unresolved)
+	}
+}
+
 // ─── RunTests-level integration tests ───────────────────────────────────
 
 // TestRunTestsClearCreditSiblingClearPassesWhenRepresentativeGenuinelyEmpties

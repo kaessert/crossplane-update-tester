@@ -1496,6 +1496,106 @@ func TestParseAnnotationDispositionNeverInferredFromReason(t *testing.T) {
 	}
 }
 
+// TestParseAnnotationTopLevelDispositionBackendDiscardsRoundTrips confirms
+// the carrier the ticket exists to add: a field whose entry ALREADY
+// carries a tested value: (so skip: is unavailable — ValidateFieldEntryMix
+// rejects it beside tested content) can still declare disposition:
+// backend-discards, authored at the entry's own top level rather than
+// nested inside a skip: block.
+func TestParseAnnotationTopLevelDispositionBackendDiscardsRoundTrips(t *testing.T) {
+	tests, _, _, _, err := ParseAnnotation(`
+- field: options
+  value:
+    a: "1"
+  disposition: backend-discards
+`)
+	if err != nil {
+		t.Fatalf("ParseAnnotation() error = %v, want nil — backend-discards is a peer of the other four dispositions and must be declarable beside a tested value:", err)
+	}
+	if len(tests) != 1 {
+		t.Fatalf("got %d entries, want 1", len(tests))
+	}
+	got := tests[0]
+	if got.Disposition != DispositionBackendDiscards {
+		t.Errorf("Disposition = %q, want %q", got.Disposition, DispositionBackendDiscards)
+	}
+	if got.Value == nil {
+		t.Errorf("Value = nil, want the tested value to survive alongside the top-level disposition:")
+	}
+	if got.EffectiveDisposition() != DispositionBackendDiscards {
+		t.Errorf("EffectiveDisposition() = %q, want %q", got.EffectiveDisposition(), DispositionBackendDiscards)
+	}
+}
+
+// TestParseAnnotationTopLevelDispositionRejectsInvalidShapes pins the
+// top-level disposition: carrier's own parse-time rejections: a value
+// outside the closed set, a value inside the closed set but not
+// backend-discards (the other four all answer "why does no test exist",
+// which contradicts an entry that HAS tested content), and the carrier
+// collision with a skip: block on the same entry.
+func TestParseAnnotationTopLevelDispositionRejectsInvalidShapes(t *testing.T) {
+	cases := map[string]struct {
+		reason        string
+		annotation    string
+		wantErrSubstr string
+	}{
+		"UnknownDisposition": {
+			reason: "a misspelling outside the closed set is rejected naming the valid set",
+			annotation: `
+- field: options
+  value: "v1"
+  disposition: bogus-value
+`,
+			wantErrSubstr: `disposition "bogus-value" is not one of the valid dispositions`,
+		},
+		"ValidButNotBackendDiscards": {
+			reason: "a disposition inside the closed set, but not backend-discards, is rejected at the top level — it belongs inside skip:",
+			annotation: `
+- field: options
+  value: "v1"
+  disposition: one-live-patch
+`,
+			wantErrSubstr: "not valid outside a skip: block",
+		},
+		"CarrierCollisionWithSkip": {
+			reason: "declaring disposition: at the top level AND a skip: block on the same entry is an unresolvable ambiguity about which carrier governs",
+			annotation: `
+- field: options
+  disposition: backend-discards
+  skip:
+    reason: write-only
+`,
+			wantErrSubstr: "also carries skip:",
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, _, _, _, err := ParseAnnotation(tc.annotation)
+			if err == nil {
+				t.Fatalf("%s: expected an error, got nil", tc.reason)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrSubstr) {
+				t.Errorf("%s: error = %q, want substring %q", tc.reason, err.Error(), tc.wantErrSubstr)
+			}
+		})
+	}
+}
+
+// TestValidateFieldEntryMixNeverSeesTopLevelDisposition confirms the whole
+// point of the new carrier: ValidateFieldEntryMix — deliberately left
+// untouched — never rejects a tested entry for carrying a top-level
+// disposition:, because Skip.Present() is false for such an entry and the
+// mix guard only ever inspects Skip.
+func TestValidateFieldEntryMixNeverSeesTopLevelDisposition(t *testing.T) {
+	tests := []UpdateTest{
+		{Field: "options", Value: map[string]interface{}{"a": "1"}, Disposition: DispositionBackendDiscards},
+	}
+	if err := ValidateFieldEntryMix(tests); err != nil {
+		t.Errorf("ValidateFieldEntryMix() error = %v, want nil — a top-level disposition: on a tested entry is not a skip:/tested mix", err)
+	}
+}
+
 // TestParseAnnotationStructuredSkipRejectsInvalidShapes pins every
 // parse-time rejection a structured skip: entry can trigger: an unknown
 // reason, the "immutable" reason specifically, and each reason's own

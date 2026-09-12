@@ -486,6 +486,127 @@ func TestContainerClearCoverageIneligibleLeafNeverReportsDisposition(t *testing.
 	}
 }
 
+// TestContainerClearCoverageBackendDiscardsOnUncoveredLeafReportsDisposition
+// is the ticket's own scenario: tags carries a REAL, non-empty tested
+// value: of its own (the update path IS tested) and, alongside it, a
+// top-level disposition: backend-discards — the carrier that exists
+// specifically because tags' own entry already carries tested content, so
+// skip: is unavailable. With no OTHER route crediting tags, the leaf must
+// report uncovered, its disposition, and no contradiction.
+func TestContainerClearCoverageBackendDiscardsOnUncoveredLeafReportsDisposition(t *testing.T) {
+	crd := decodeCRD(t, containerClearFixtureCRD)
+	m := &manifest.Manifest{
+		ForProvider: map[string]interface{}{"tags": []interface{}{"prod"}},
+		Tests: []manifest.UpdateTest{
+			{
+				Field:       "tags",
+				Value:       []interface{}{"updated"},
+				Disposition: manifest.DispositionBackendDiscards,
+			},
+		},
+	}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+
+	tags := findingsByPath(findings)["tags"]
+	if tags.Covered {
+		t.Fatalf("tags reported covered — no route should credit it in this fixture: %+v", tags)
+	}
+	if tags.Contradiction {
+		t.Fatalf("tags reported Contradiction with no surviving credit: %+v", tags)
+	}
+	if tags.Disposition != manifest.DispositionBackendDiscards {
+		t.Errorf("tags.Disposition = %q, want %q", tags.Disposition, manifest.DispositionBackendDiscards)
+	}
+}
+
+// TestContainerClearCoverageBackendDiscardsContradictsSurvivingCredit is
+// the ticket's own required interlock: authoring disposition:
+// backend-discards on tags' own entry while a SIBLING entry's clear: list
+// still names tags is a contradiction — the credit was never withdrawn —
+// and ContainerClearCoverage must report it as such rather than silently
+// picking either half.
+func TestContainerClearCoverageBackendDiscardsContradictsSurvivingCredit(t *testing.T) {
+	crd := decodeCRD(t, containerClearFixtureCRD)
+	m := &manifest.Manifest{
+		Tests: []manifest.UpdateTest{
+			// name's clear: [tags] still credits tags via RouteSiblingClear
+			// — the credit this ticket requires be withdrawn before the
+			// disposition may be authored, deliberately left in place here.
+			{Field: "name", Value: "new-name", Clear: []string{"tags"}},
+			{
+				Field:       "tags",
+				Value:       []interface{}{"updated"},
+				Disposition: manifest.DispositionBackendDiscards,
+			},
+		},
+	}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+
+	tags := findingsByPath(findings)["tags"]
+	if !tags.Contradiction {
+		t.Fatalf("tags did not report Contradiction despite a surviving sibling clear: credit: %+v", tags)
+	}
+	if tags.Covered {
+		t.Errorf("tags.Covered = true, want false — the credit must be WITHDRAWN, not merely flagged alongside")
+	}
+	if tags.Route != "" {
+		t.Errorf("tags.Route = %q, want empty — Covered false must mean Route empty even under Contradiction", tags.Route)
+	}
+	if tags.Disposition != "" {
+		t.Errorf("tags.Disposition = %q, want empty — a contradictory leaf reports via ContradictionDetail, not Disposition", tags.Disposition)
+	}
+	if !strings.Contains(tags.ContradictionDetail, string(RouteSiblingClear)) {
+		t.Errorf("ContradictionDetail = %q, want it to name the withdrawn route %q", tags.ContradictionDetail, RouteSiblingClear)
+	}
+	if !strings.Contains(tags.ContradictionDetail, string(manifest.DispositionBackendDiscards)) {
+		t.Errorf("ContradictionDetail = %q, want it to name the disposition %q", tags.ContradictionDetail, manifest.DispositionBackendDiscards)
+	}
+}
+
+// TestContainerClearCoverageBackendDiscardsOtherDispositionsNeverContradictCoverage
+// pins the boundary of the new interlock: it is scoped to backend-discards
+// alone. The pre-existing combination this fleet already relies on — a
+// covered leaf whose own entry ALSO carries a skip: disposition from one of
+// the other four tiers — must keep resolving exactly as
+// TestContainerClearCoverageCoveredLeafNeverReportsDisposition already
+// pins: Covered wins, no error, no Contradiction.
+func TestContainerClearCoverageBackendDiscardsOtherDispositionsNeverContradictCoverage(t *testing.T) {
+	crd := decodeCRD(t, containerClearFixtureCRD)
+	m := &manifest.Manifest{
+		Tests: []manifest.UpdateTest{
+			{Field: "name", Value: "new-name", Clear: []string{"tags"}},
+			{
+				Field: "tags",
+				Skip: manifest.SkipInfo{
+					Reason:      manifest.SkipWriteOnly,
+					Disposition: manifest.DispositionOneLivePatch,
+				},
+			},
+		},
+	}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+
+	tags := findingsByPath(findings)["tags"]
+	if tags.Contradiction {
+		t.Fatalf("tags reported Contradiction for a non-backend-discards disposition, want the pre-existing Covered-wins resolution: %+v", tags)
+	}
+	if !tags.Covered {
+		t.Fatalf("tags not covered by clear:, findings = %+v", findings)
+	}
+}
+
 // TestContainerClearCoverageZeroCoverageStillProducesFindingsNoError is the
 // pin the ticket requires: a manifest with NO clear-direction coverage at
 // all — the measured state of six of the fleet's seven providers — still
@@ -1450,6 +1571,70 @@ func TestClearCellReportRouteNamedForEachMechanism(t *testing.T) {
 	}
 }
 
+// TestClearCellReportBackendDiscardsUncoveredCellFullyDispositioned is the
+// ticket's own acceptance criterion: a cell whose ONLY eligible member
+// carries disposition: backend-discards on its own tested entry — no
+// route crediting it — reports uncovered, dispositioned, and NEITHER
+// Covered nor Contradictory. containerClearFixtureCRD's (list, top) cell
+// has exactly one member, tags, so this exercises the cell-level rendering
+// with no other sibling in play.
+func TestClearCellReportBackendDiscardsUncoveredCellFullyDispositioned(t *testing.T) {
+	crd := decodeCRD(t, containerClearFixtureCRD)
+	m := &manifest.Manifest{
+		Tests: []manifest.UpdateTest{
+			{Field: "tags", Value: []interface{}{"updated"}, Disposition: manifest.DispositionBackendDiscards},
+		},
+	}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+	cell := clearCellReportsByKey(BuildClearCellReport(findings))["list/top"]
+
+	if cell.Covered {
+		t.Fatalf("list/top cell reported Covered — no route credits tags in this fixture: %+v", cell)
+	}
+	if len(cell.Contradictory) != 0 {
+		t.Fatalf("list/top cell reported Contradictory with no surviving credit: %+v", cell)
+	}
+	if len(cell.UndispositionedMembers) != 0 {
+		t.Errorf("UndispositionedMembers = %v, want empty — tags carries a backend-discards disposition", cell.UndispositionedMembers)
+	}
+}
+
+// TestClearCellReportBackendDiscardsContradictionIsReportedAndWithdrawsCredit
+// pins the cell-level view of the ticket's own required interlock: when
+// tags' own entry declares disposition: backend-discards while a sibling
+// entry's clear: STILL names tags, the cell must report the member as
+// Contradictory rather than Covered — the credit is withdrawn, not merely
+// annotated alongside.
+func TestClearCellReportBackendDiscardsContradictionIsReportedAndWithdrawsCredit(t *testing.T) {
+	crd := decodeCRD(t, containerClearFixtureCRD)
+	m := &manifest.Manifest{
+		Tests: []manifest.UpdateTest{
+			{Field: "name", Value: "new-name", Clear: []string{"tags"}},
+			{Field: "tags", Value: []interface{}{"updated"}, Disposition: manifest.DispositionBackendDiscards},
+		},
+	}
+
+	findings, err := ContainerClearCoverage(crd, m)
+	if err != nil {
+		t.Fatalf("ContainerClearCoverage: %v", err)
+	}
+	cell := clearCellReportsByKey(BuildClearCellReport(findings))["list/top"]
+
+	if cell.Covered {
+		t.Fatalf("list/top cell reported Covered despite its sole member's credit being contradicted: %+v", cell)
+	}
+	if !reflect.DeepEqual(cell.Contradictory, []string{"tags"}) {
+		t.Errorf("Contradictory = %v, want [tags]", cell.Contradictory)
+	}
+	if cell.ContradictionDetails["tags"] == "" {
+		t.Errorf("ContradictionDetails[%q] is empty, want the withdrawn route and disposition named", "tags")
+	}
+}
+
 // TestPrintClearCellReportRendersAllThreeRequiredThings confirms the text
 // report AC 10 demands: (a) a credited leaf names its representative and
 // route, (b) a vacuous cell is printed rather than skipped, and (c) the
@@ -1809,6 +1994,27 @@ func TestPrintClearCellReportBlockingCountPerCellState(t *testing.T) {
 			tests:         nil,
 			wantBlocking:  1,
 			wantSubstring: "undispositioned member(s)",
+		},
+		"backend-discards dispositioned cell never blocks": {
+			reason:      "tags carries a REAL tested value: of its own plus a top-level disposition: backend-discards, and no route credits it — uncovered, fully dispositioned, must not block",
+			crdYAML:     containerClearFixtureCRD,
+			forProvider: map[string]interface{}{"tags": []interface{}{"prod"}},
+			tests: []manifest.UpdateTest{
+				{Field: "tags", Value: []interface{}{"updated"}, Disposition: manifest.DispositionBackendDiscards},
+			},
+			wantBlocking:  0,
+			wantSubstring: "every eligible member dispositioned",
+		},
+		"backend-discards beside a surviving credit blocks as a contradiction": {
+			reason:      "name's clear: [tags] still credits tags while tags' own entry ALSO declares disposition: backend-discards — the credit was never withdrawn, which must block rather than silently pick one half",
+			crdYAML:     containerClearFixtureCRD,
+			forProvider: nil,
+			tests: []manifest.UpdateTest{
+				{Field: "name", Value: "new-name", Clear: []string{"tags"}},
+				{Field: "tags", Value: []interface{}{"updated"}, Disposition: manifest.DispositionBackendDiscards},
+			},
+			wantBlocking:  1,
+			wantSubstring: "CONTRADICTION",
 		},
 	}
 

@@ -906,6 +906,16 @@ decision:
   because it is assigned only to a leaf already determined NOT covered, so
   it can never disagree with `covered: true` in the first place.
 
+  A DIFFERENT disagreement — a leaf both `covered` and carrying
+  `disposition: backend-discards` on its own entry — is a separate axis
+  entirely: see "`backend-discards`'s own carrier" above. `covered` is
+  forced to `false` and `contradiction`/`contradictionDetail` are populated
+  instead, naming the withdrawn route and the disposition. Unlike the rest
+  of this breakdown, this ONE piece is not purely advisory here: `validate`'s
+  own container-clear cell gate rejects it outright. `roundtrip-verify`'s
+  own exit code still never reads it, exactly like everything else in this
+  section — only `validate`'s does.
+
   This whole breakdown is advisory ONLY: it is informational in every
   report and never turns the command's exit code non-zero, regardless of
   how much or how little of a manifest's container-typed surface is
@@ -936,10 +946,11 @@ update-tester residual <examples-dir>
 ```
 
 Walks a directory tree of example manifests and reports the repo-scope
-cell-denominator residual: every `skip:` entry across every fixture that
+cell-denominator residual: every update-test entry across every fixture that
 declares an evidence-tier `disposition:` (`statically-provable`,
-`one-live-patch`, `declared-exclusion`, or `defect`), enumerated one row per
-field per fixture.
+`one-live-patch`, `declared-exclusion`, `defect`, or `backend-discards`) —
+through either carrier, a nested `skip:` block or an entry's own top-level
+`disposition:` key — enumerated one row per field per fixture.
 
 It exists because every ad-hoc script that has taken this measurement by hand
 parsed the `crossplane.io/update-test` annotation itself. The annotation body
@@ -963,7 +974,7 @@ fixture that fails to parse is named rather than silently dropped:
 - Rows are grouped by disposition, then by fixture, then by field — never
   collapsed into a bare total. `declared-exclusion` (a standing human
   declaration that can never be mechanically re-checked) is always its own
-  group, distinct from the other three dispositions, which are re-checkable
+  group, distinct from the other four dispositions, which are re-checkable
   claims.
 
 This command is entirely offline and read-only: no cluster is touched, and it
@@ -1036,6 +1047,7 @@ three top-level directive lines: `converge-skip:`, `assert-unchanged:` and
 | `withValues` | Optional. A mapping of OTHER top-level `spec.forProvider` field names to an explicit, non-null literal value set in the SAME merge patch that sets `field`'s value — see "Backend-coupled fields: converging a source field and its derived field in one patch" below. Only valid when `field` itself is top-level (not dotted); a dotted key, a key naming `field` itself, or a key also present in this entry's own `clear` list is rejected at parse time. |
 | `ignoreMapKeys` | Optional. A list of top-level member keys excluded, on BOTH sides, from `run`'s equality check between `expect` (or `value`, when `expect` is unset) and the live `status.atProvider` value — see "`ignoreMapKeys:` — excluding a provider-injected map member" below. Mutually exclusive with `skip` (there is no comparison left for it to affect). |
 | `ignoreListElementKeys` | Optional. A list of per-element member keys excluded, on BOTH sides and from EVERY element, from `run`'s equality check between `expect` (or `value`, when `expect` is unset) and the live `status.atProvider` value, for a list-of-objects field — see "`ignoreListElementKeys:` — excluding a provider-injected per-element member" below. Mutually exclusive with `skip` (there is no comparison left for it to affect). |
+| `disposition` | Optional. Declares `backend-discards` — and ONLY `backend-discards` — directly on a TESTED entry, alongside `value`/`expect`/`clear`/`withValues`, for a field whose update path IS genuinely tested but whose CLEAR direction specifically cannot be evidenced against this backend. See "`skip:` dispositions" below for the full vocabulary and why this one value needs a carrier `skip:` cannot host. |
 
 None of `converge-skip: <reason>`, `assert-unchanged: <fields>` or
 `ignore-fields: <fields>` is valid YAML as a sibling of top-level sequence
@@ -1140,6 +1152,7 @@ the valid set.
 | `one-live-patch` | a claim about backend runtime behaviour, resolvable by firing ONE request with no lasting consequence (a rejection leaves state unchanged; an acceptance is undoable by a further, similarly-priced request) — including a claim whose evidence was already gathered and is recorded in the reason's own prose | none |
 | `declared-exclusion` | firing the `one-live-patch`-shaped probe is ITSELF the irreversible or destructive act, or damages state shared with other runs, so no mechanical check can ever confirm it — a standing human commitment instead | `declared-by:` and `reconfirm:`, both required |
 | `defect` | the repo's own artifacts contradict the stated reason, or the reason names nothing checkable at all | none |
+| `backend-discards` | the backend answers 200, keeps the container's contents, and returns them unchanged on the next read — no route can ever evidence this leaf's CLEAR direction, even though its update path may be genuinely tested | none |
 
 ```yaml
 crossplane.io/update-test: |
@@ -1162,10 +1175,49 @@ uncovered container-clear cell whose eligible members all carry a
 disposition passes, and one carrying an eligible member with no
 `disposition:` fails `validate`, which exits non-zero. `roundtrip-verify`'s
 `containerClear` findings surface, per uncovered container-typed leaf,
-whether its own `skip:` entry (if any) carries a disposition and which, and
-stay report-only — that command's own exit code never reads them. An absent
-`disposition:` is reported as absent rather than defaulted to any of the
-four values.
+whether its own entry (its `skip:`, if any, or its own top-level
+`disposition:`) carries a disposition and which, and stay report-only —
+that command's own exit code never reads them. An absent `disposition:` is
+reported as absent rather than defaulted to any of the five values.
+
+##### `backend-discards`'s own carrier: a top-level `disposition:`, not `skip:`
+
+Every disposition above answers a question that presupposes `reason:`: WHY
+does no test exist for this field. `backend-discards` answers a different
+question — the field's update path IS tested, only its CLEAR direction
+specifically cannot be shown to converge — so nesting it inside `skip:`
+would require a `skip:` block sitting beside the very tested content
+(`value:`/`expect:`/`clear:`/`withValues:`) that `skip:` can never coexist
+with on the same field (see the mix rejection above).
+
+So `backend-discards`, and ONLY `backend-discards`, may also be declared as
+a top-level `disposition:` key directly on a TESTED entry:
+
+```yaml
+crossplane.io/update-test: |
+  - field: options
+    value:
+      encryption: enabled
+    disposition: backend-discards
+```
+
+A top-level `disposition:` naming anything other than `backend-discards` is
+a parse-time error: the other four all mean "no test exists", which
+contradicts an entry this same key already proves is tested — author those
+inside `skip:` instead. Declaring a top-level `disposition:` AND a `skip:`
+block on the same entry is also a parse-time error — the two carriers
+disagreeing about which governs is never resolved silently.
+
+**The credit-plus-disposition contradiction.** Authoring `disposition:
+backend-discards` on a field whose clear direction is STILL credited by
+some other route (a sibling's `clear:`/`withValues:` naming it, or the
+field's own tombstone) is a contradiction — the field cannot be both
+covered and beyond evidencing. `validate`'s container-clear cell gate
+rejects that combination outright, naming both the withdrawn route and the
+disposition, rather than silently preferring one half. Withdraw the credit
+(delete the sibling `clear:`/`withValues:` entry, or the field's own
+tombstone) before authoring the disposition — the disposition and the
+credit are exclusive, never additive.
 
 #### Whole-field tombstones without a sibling field
 

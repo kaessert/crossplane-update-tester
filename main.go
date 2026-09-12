@@ -1610,6 +1610,13 @@ type cellCreditJSON struct {
 	Vacuous                bool     `json:"vacuous,omitempty"`
 	UndispositionedMembers []string `json:"undispositionedMembers,omitempty"`
 	Route                  string   `json:"route,omitempty"`
+	// Contradictory and ContradictionDetails are clear-direction-only too:
+	// the members ContainerClearCoverage found both credited and carrying
+	// disposition: backend-discards on their own entry (see
+	// roundtrip.ClearCellReport.Contradictory). Empty for every report
+	// that predates the disposition axis.
+	Contradictory        []string          `json:"contradictory,omitempty"`
+	ContradictionDetails map[string]string `json:"contradictionDetails,omitempty"`
 }
 
 // containerClearJSON is the machine-readable shape one
@@ -1624,21 +1631,28 @@ type cellCreditJSON struct {
 // roundtrip.ContainerClearFinding's own doc comment): Covered is always
 // false when Ineligible is true, and Reason is empty otherwise.
 // Disposition is also report-only and empty whenever Covered is true,
-// Ineligible is true, or no disposition: was authored on the leaf's own
-// skip: entry — omitempty means a report from a manifest with zero
-// authored dispositions (every manifest in the fleet today) renders
-// byte-identical to before this field existed. Route names Covered's own
-// credit mechanism (one of the five ClearRoute constants) and is empty
-// whenever Covered is false.
+// Ineligible is true, Contradiction is true, or no disposition: was
+// authored on the leaf's own entry — omitempty means a report from a
+// manifest with zero authored dispositions (every manifest in the fleet
+// before this field existed) renders byte-identical to before this field
+// existed. Route names Covered's own credit mechanism (one of the five
+// ClearRoute constants) and is empty whenever Covered is false — including
+// when Covered was withdrawn because Contradiction is true. Contradiction
+// and ContradictionDetail surface the leaf-level covered+backend-discards
+// disagreement `validate`'s own cell gate rejects; both are empty/false for
+// every finding that predates the disposition axis, so this stays another
+// byte-identical extension for a report carrying no contradiction.
 type containerClearJSON struct {
-	Path        string `json:"path"`
-	Shape       string `json:"shape"`
-	Covered     bool   `json:"covered"`
-	Ineligible  bool   `json:"ineligible,omitempty"`
-	Reason      string `json:"reason,omitempty"`
-	Detail      string `json:"detail"`
-	Disposition string `json:"disposition,omitempty"`
-	Route       string `json:"route,omitempty"`
+	Path                string `json:"path"`
+	Shape               string `json:"shape"`
+	Covered             bool   `json:"covered"`
+	Ineligible          bool   `json:"ineligible,omitempty"`
+	Reason              string `json:"reason,omitempty"`
+	Detail              string `json:"detail"`
+	Disposition         string `json:"disposition,omitempty"`
+	Route               string `json:"route,omitempty"`
+	Contradiction       bool   `json:"contradiction,omitempty"`
+	ContradictionDetail string `json:"contradictionDetail,omitempty"`
 }
 
 // waiverFindingJSON is the machine-readable shape one
@@ -1674,6 +1688,7 @@ func toContainerClearJSON(findings []roundtrip.ContainerClearFinding) []containe
 			Path: f.Path, Shape: string(f.Shape), Covered: f.Covered,
 			Ineligible: f.Ineligible, Reason: string(f.Reason), Detail: f.Detail,
 			Disposition: string(f.Disposition), Route: string(f.Route),
+			Contradiction: f.Contradiction, ContradictionDetail: f.ContradictionDetail,
 		}
 	}
 	return out
@@ -1701,6 +1716,8 @@ func toClearCellCreditJSON(reports []roundtrip.ClearCellReport) []cellCreditJSON
 			Vacuous:                r.Vacuous,
 			UndispositionedMembers: r.UndispositionedMembers,
 			Route:                  string(r.Route),
+			Contradictory:          r.Contradictory,
+			ContradictionDetails:   r.ContradictionDetails,
 		}
 		if r.Covered {
 			line.Representatives = []string{r.Representative}

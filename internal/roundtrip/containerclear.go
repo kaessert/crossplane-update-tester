@@ -124,19 +124,39 @@ type ContainerClearFinding struct {
 	Reason IneligibilityReason
 	Detail string
 	// Disposition is the evidence-tier disposition (manifest.Disposition)
-	// declared on the skip: entry, if any, that directly names this leaf's
-	// own field path — populated ONLY for an uncovered, eligible leaf
-	// (Covered false, Ineligible false); a covered or ineligible leaf
-	// carries no disposition report at all, since neither is a gap this
-	// axis tracks. Empty means no disposition was authored — whether
-	// because no entry names this leaf, the entry names it with no skip:
-	// at all, or its skip: predates the disposition axis. Never guessed
-	// from Reason or Evidence prose: absent is reported as absent, not
-	// defaulted to a tier.
+	// declared on the entry that directly names this leaf's own field path
+	// — either its top-level disposition: key (manifest.UpdateTest.Disposition)
+	// or its nested skip: disposition: key (manifest.SkipInfo.Disposition) —
+	// populated ONLY for an uncovered, eligible, non-contradictory leaf
+	// (Covered false, Ineligible false, Contradiction false); a covered or
+	// ineligible leaf carries no disposition report at all, since neither is
+	// a gap this axis tracks, and a contradictory leaf reports its
+	// disposition inside ContradictionDetail instead — see Contradiction's
+	// own doc comment for why. Empty means no disposition was authored —
+	// whether because no entry names this leaf, or the entry that does
+	// authors neither carrier. Never guessed from Reason or Evidence prose:
+	// absent is reported as absent, not defaulted to a tier.
 	Disposition manifest.Disposition
 	// Route names the mechanism that produced Covered — one of the five
 	// ClearRoute constants. Empty whenever Covered is false.
 	Route ClearRoute
+	// Contradiction is true when this leaf is credited by a live route
+	// (some route in coverageFor's own list would have set Covered true)
+	// while its own entry ALSO declares disposition: backend-discards — a
+	// leaf cannot claim both that its clear direction is covered and that
+	// no route can ever evidence it. Covered is forced false and Route is
+	// forced empty whenever Contradiction is true: the credit is WITHDRAWN,
+	// not merely flagged, so no caller can silently prefer the covered half
+	// of the disagreement over the rejected one. See ContainerClearCoverage's
+	// own loop for where this is detected. Only ever true for
+	// DispositionBackendDiscards: the other four tiers never coexist with
+	// tested content on the same entry in the first place (validateSkipInfo
+	// via ValidateFieldEntryMix already refuses that combination), so this
+	// axis has nothing to say about them.
+	Contradiction bool
+	// ContradictionDetail names the credit route that was withdrawn and the
+	// disposition that contradicts it. Empty unless Contradiction is true.
+	ContradictionDetail string
 }
 
 // ClearRoute names the mechanism that credited one covered container leaf's
@@ -319,8 +339,25 @@ func ContainerClearCoverage(crd map[string]interface{}, m *manifest.Manifest) ([
 		reason, isIneligible := ineligible[leaf.Path]
 		if !isIneligible {
 			finding := ContainerClearFinding{Path: leaf.Path, Shape: leaf.Shape, Covered: covered, Route: route, Detail: detail}
-			if !covered {
-				finding.Disposition = dispositionFor(leaf, selfByField)
+			disp := dispositionFor(leaf, selfByField)
+			switch {
+			case covered && disp == manifest.DispositionBackendDiscards:
+				// The credit is WITHDRAWN, not merely flagged alongside —
+				// see ContainerClearFinding.Contradiction's own doc comment
+				// for why leaving Covered/Route set would let a caller
+				// silently pick one half of the disagreement over the
+				// other.
+				finding.Covered = false
+				finding.Route = ""
+				finding.Contradiction = true
+				finding.ContradictionDetail = fmt.Sprintf(
+					"credited via %s (%s) while this leaf's own entry also declares disposition: %s — "+
+						"a leaf cannot claim both that its clear direction is covered and that no route can "+
+						"ever evidence it; withdraw the credit (the sibling clear:/withValues: entry, or "+
+						"this leaf's own tombstone) or remove the disposition:",
+					route, detail, disp)
+			case !covered:
+				finding.Disposition = disp
 			}
 			findings = append(findings, finding)
 			continue
@@ -426,18 +463,22 @@ func coverageFor(leaf ContainerLeaf, clearedSiblings, withValuesEmptyList, perKe
 }
 
 // dispositionFor reports the evidence-tier disposition, if any, declared on
-// the skip: entry that directly names leaf's own field path — called only
-// for a leaf ContainerClearCoverage has already determined is uncovered and
-// eligible (see ContainerClearFinding.Disposition's own doc comment for
-// why). Returns the empty Disposition, never a guess, when no entry names
-// this leaf, the entry carries no skip: at all, or the skip: it carries
-// authored no disposition: key.
+// the entry that directly names leaf's own field path — see
+// manifest.UpdateTest.EffectiveDisposition for the two carriers this reads
+// (an entry's top-level disposition: key, or its nested skip: disposition:
+// key) and which one wins when an entry somehow carries both. Called for
+// EVERY leaf with a self entry regardless of Covered, so
+// ContainerClearCoverage's own loop can detect the covered+backend-discards
+// contradiction; callers that only want the report-facing value still gate
+// on !covered themselves (see ContainerClearFinding.Disposition's own doc
+// comment). Returns the empty Disposition, never a guess, when no entry
+// names this leaf.
 func dispositionFor(leaf ContainerLeaf, selfByField map[string]manifest.UpdateTest) manifest.Disposition {
 	self, hasSelf := selfByField[leaf.Path]
-	if !hasSelf || !self.Skip.Present() {
+	if !hasSelf {
 		return ""
 	}
-	return self.Skip.Disposition
+	return self.EffectiveDisposition()
 }
 
 // clearedAncestor reports whether some strict ancestor of the dotted path
@@ -636,7 +677,22 @@ type ClearCellReport struct {
 	// uncovered, non-vacuous cell is fully dispositioned only once this is
 	// empty — a single disposed member never speaks for an undisposed
 	// sibling in the same cell. Always empty when Covered or Vacuous.
+	// Never includes a member in Contradictory: that member's own
+	// disposition is real, it is the CREDIT beside it that is the problem,
+	// which is a different failure from having authored no disposition at
+	// all.
 	UndispositionedMembers []string
+	// Contradictory lists the eligible members ContainerClearCoverage
+	// found BOTH credited and carrying disposition: backend-discards on
+	// their own entry — sorted. Always blocking when non-empty: see
+	// PrintClearCellReport, which counts a cell with any contradictory
+	// member regardless of what Covered/Vacuous/UndispositionedMembers
+	// otherwise report for its other members.
+	Contradictory []string
+	// ContradictionDetails maps each path in Contradictory to the
+	// ContainerClearFinding.ContradictionDetail that named the withdrawn
+	// credit and the disposition disagreeing with it.
+	ContradictionDetails map[string]string
 }
 
 // EligibleMembers returns Members filtered to exclude everything in
@@ -706,6 +762,14 @@ func buildClearCellReport(key CellKey, members []ContainerClearFinding) ClearCel
 			continue
 		}
 		eligibleCount++
+		if m.Contradiction {
+			report.Contradictory = append(report.Contradictory, m.Path)
+			if report.ContradictionDetails == nil {
+				report.ContradictionDetails = make(map[string]string, len(members))
+			}
+			report.ContradictionDetails[m.Path] = m.ContradictionDetail
+			continue
+		}
 		if m.Covered {
 			coveredEligible = append(coveredEligible, m)
 		}
@@ -726,7 +790,7 @@ func buildClearCellReport(key CellKey, members []ContainerClearFinding) ClearCel
 
 	if !report.Vacuous {
 		for _, m := range sorted {
-			if m.Ineligible || m.Covered {
+			if m.Ineligible || m.Covered || m.Contradiction {
 				continue
 			}
 			if m.Disposition == "" {
@@ -739,9 +803,14 @@ func buildClearCellReport(key CellKey, members []ContainerClearFinding) ClearCel
 
 // PrintClearCellReport renders reports as text, in the shape the `validate`
 // subcommand prints alongside its other offline checks, and returns the
-// number of BLOCKING cells found — the one state of the four a cell can
-// take that fails the gate (see the switch below): an uncovered cell
-// carrying at least one eligible member with no authored disposition.
+// number of BLOCKING cells found — TWO states of a cell fail the gate (see
+// the checks below): an uncovered cell carrying at least one eligible
+// member with no authored disposition, or a cell carrying ANY member
+// ContainerClearCoverage found both credited and carrying disposition:
+// backend-discards on its own entry (see ClearCellReport.Contradictory) —
+// a contradiction is checked and reported before, and independent of, the
+// ordinary Vacuous/Covered/dispositioned states below, since the SAME cell
+// can otherwise be reported both a genuine credit AND a rejected one.
 // Every other state — Vacuous, Covered, or uncovered-but-fully-dispositioned
 // — passes; `cmdValidate` folds the returned count into its own exit-code
 // decision exactly as it does its other checks (see printContainerClearCells).
@@ -761,6 +830,17 @@ func PrintClearCellReport(printFn func(format string, args ...interface{}), repo
 	for _, r := range reports {
 		totalCells++
 		eligible := len(r.Members) - len(r.IneligibleMembers)
+
+		if len(r.Contradictory) > 0 {
+			blockingCells++
+			totalLeaves += eligible
+			printFn("  ✗ %s/%s: CONTRADICTION — member(s) claim both live coverage and disposition: backend-discards:\n",
+				r.Key.Shape, r.Key.Depth)
+			for _, path := range r.Contradictory {
+				printFn("      %s: %s\n", path, r.ContradictionDetails[path])
+			}
+			continue
+		}
 
 		switch {
 		case r.Vacuous:

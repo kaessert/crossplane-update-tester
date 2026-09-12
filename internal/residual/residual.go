@@ -1,7 +1,9 @@
 // Package residual walks a directory of Crossplane example manifests and
-// reports the repo-scope cell-denominator residual: every skip: entry that
-// declares an evidence-tier disposition (see manifest.Disposition),
-// enumerated per field per fixture rather than as a single count.
+// reports the repo-scope cell-denominator residual: every update-test entry
+// that declares an evidence-tier disposition (see manifest.Disposition) —
+// through its nested skip: disposition: key, or its own top-level
+// disposition: key (manifest.UpdateTest.EffectiveDisposition) — enumerated
+// per field per fixture rather than as a single count.
 //
 // Every ad-hoc script written to take this measurement by hand has parsed
 // the crossplane.io/update-test annotation itself, using a bare YAML load
@@ -35,13 +37,14 @@ import (
 	"github.com/kaessert/crossplane-update-tester/sidecar"
 )
 
-// Row is one disposition-carrying skip: entry: a single field, in a single
-// fixture, whose skip: block declares an evidence-tier disposition. A
-// legacy free-prose skip, or a structured skip with no disposition: key at
-// all, is not a Row here — those are tracked by the tool's other coverage
-// surfaces (validator's offline checks, roundtrip's own must-test
-// denominator); this package reports only the evidence-tier axis a
-// disposition: key declares.
+// Row is one disposition-carrying entry: a single field, in a single
+// fixture, whose update-test entry declares an evidence-tier disposition —
+// via either carrier (see manifest.UpdateTest.EffectiveDisposition). A
+// legacy free-prose skip, or an entry with no disposition: key at all
+// (through either carrier), is not a Row here — those are tracked by the
+// tool's other coverage surfaces (validator's offline checks, roundtrip's
+// own must-test denominator); this package reports only the evidence-tier
+// axis a disposition: key declares.
 type Row struct {
 	// Fixture is the manifest file path, relative to the walked root when
 	// the file lives under it (the common case), else the path as given.
@@ -93,6 +96,7 @@ var Dispositions = []manifest.Disposition{
 	manifest.DispositionOneLivePatch,
 	manifest.DispositionDeclaredExclusion,
 	manifest.DispositionDefect,
+	manifest.DispositionBackendDiscards,
 }
 
 // dispositionRank returns Dispositions' index for d, or len(Dispositions)
@@ -159,10 +163,11 @@ func Scan(root string) (Result, error) {
 			fixture = rel
 		}
 		for _, t := range m.Tests {
-			if !t.Skip.Present() || t.Skip.Disposition == "" {
+			disp := t.EffectiveDisposition()
+			if disp == "" {
 				continue
 			}
-			res.Rows = append(res.Rows, Row{Fixture: fixture, Field: t.Field, Disposition: t.Skip.Disposition})
+			res.Rows = append(res.Rows, Row{Fixture: fixture, Field: t.Field, Disposition: disp})
 		}
 		return nil
 	})
@@ -239,7 +244,7 @@ func printfTo(w io.Writer, format string, args ...any) {
 // PrintReport renders Counts as a pair, every parse failure by name, and
 // every row grouped by disposition, then by fixture, then by field —
 // never as a bare total. declared-exclusion is rendered as its own group,
-// distinct from the other three dispositions, because a standing human
+// distinct from the other four dispositions, because a standing human
 // declaration is not the same kind of evidence as a re-checkable one, and
 // a reader must be able to see which is which without recomputing it.
 func PrintReport(w io.Writer, res Result) {

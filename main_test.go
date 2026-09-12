@@ -2184,6 +2184,109 @@ func TestCmdValidateFailsOnBlockingContainerClearCell(t *testing.T) {
 	}
 }
 
+// TestCmdValidatePassesOnBackendDiscardsDispositionedFieldWithLiveTestedValue
+// is the ticket's own end-to-end scenario: tags' entry carries a REAL
+// tested value: (the update path is genuinely exercised) plus a top-level
+// disposition: backend-discards, with no route crediting its clear
+// direction — the shape skip: cannot express, because ValidateFieldEntryMix
+// rejects a skip: beside this same entry's tested content. cmdValidate must
+// pass, and its own container-clear output must show the cell as
+// uncovered-but-dispositioned rather than blocking.
+func TestCmdValidatePassesOnBackendDiscardsDispositionedFieldWithLiveTestedValue(t *testing.T) {
+	root := t.TempDir()
+	writeCRDFixture(t, root, "widget.yaml", containerClearFixtureCRDForMain)
+
+	typesPath := filepath.Join(root, "apis/cluster/v1alpha1/zz_widget_types.go")
+	if err := os.MkdirAll(filepath.Dir(typesPath), 0o750); err != nil {
+		t.Fatalf("creating parent dirs for types file: %v", err)
+	}
+	src := "package v1alpha1\n\ntype WidgetParameters struct {\n\tTags []string `json:\"tags,omitempty\"`\n}\n"
+	if err := os.WriteFile(typesPath, []byte(src), 0o600); err != nil {
+		t.Fatalf("writing types file: %v", err)
+	}
+
+	manifestPath := filepath.Join(root, "widget.yaml")
+	yamlDoc := "apiVersion: widgets.crossplane.io/v1alpha1\n" +
+		"kind: Widget\n" +
+		"metadata:\n" +
+		"  name: example-widget\n" +
+		"  annotations:\n" +
+		"    crossplane.io/update-test: |\n" +
+		"      - field: tags\n" +
+		"        value:\n" +
+		"        - updated\n" +
+		"        disposition: backend-discards\n" +
+		"spec:\n" +
+		"  forProvider:\n" +
+		"    tags:\n" +
+		"    - original\n"
+	if err := os.WriteFile(manifestPath, []byte(yamlDoc), 0o600); err != nil {
+		t.Fatalf("writing manifest fixture: %v", err)
+	}
+
+	out := captureOSStdout(t, func() {
+		if err := cmdValidate([]string{"--root", root, manifestPath}); err != nil {
+			t.Errorf("cmdValidate() error = %v, want nil — a field with a REAL tested value: plus disposition: backend-discards must pass", err)
+		}
+	})
+	if !strings.Contains(out, "every eligible member dispositioned") {
+		t.Errorf("cmdValidate output does not report the cell as uncovered-but-dispositioned:\n%s", out)
+	}
+	if strings.Contains(out, "CONTRADICTION") {
+		t.Errorf("cmdValidate output reports a CONTRADICTION with no surviving credit in this fixture:\n%s", out)
+	}
+}
+
+// TestCmdValidateFailsOnBackendDiscardsBesideSurvivingCredit is the
+// end-to-end proof of the contradiction interlock: tags' entry declares
+// disposition: backend-discards while a SIBLING entry's clear: list still
+// names tags — the credit was never withdrawn. cmdValidate must fail,
+// naming the contradiction.
+func TestCmdValidateFailsOnBackendDiscardsBesideSurvivingCredit(t *testing.T) {
+	root := t.TempDir()
+	writeCRDFixture(t, root, "widget.yaml", containerClearFixtureCRDForMain)
+
+	typesPath := filepath.Join(root, "apis/cluster/v1alpha1/zz_widget_types.go")
+	if err := os.MkdirAll(filepath.Dir(typesPath), 0o750); err != nil {
+		t.Fatalf("creating parent dirs for types file: %v", err)
+	}
+	src := "package v1alpha1\n\ntype WidgetParameters struct {\n\tName string `json:\"name,omitempty\"`\n\tTags []string `json:\"tags,omitempty\"`\n}\n"
+	if err := os.WriteFile(typesPath, []byte(src), 0o600); err != nil {
+		t.Fatalf("writing types file: %v", err)
+	}
+
+	manifestPath := filepath.Join(root, "widget.yaml")
+	yamlDoc := "apiVersion: widgets.crossplane.io/v1alpha1\n" +
+		"kind: Widget\n" +
+		"metadata:\n" +
+		"  name: example-widget\n" +
+		"  annotations:\n" +
+		"    crossplane.io/update-test: |\n" +
+		"      - field: name\n" +
+		"        value: new-name\n" +
+		"        clear: [tags]\n" +
+		"      - field: tags\n" +
+		"        value:\n" +
+		"        - updated\n" +
+		"        disposition: backend-discards\n" +
+		"spec:\n" +
+		"  forProvider:\n" +
+		"    name: original\n" +
+		"    tags:\n" +
+		"    - original\n"
+	if err := os.WriteFile(manifestPath, []byte(yamlDoc), 0o600); err != nil {
+		t.Fatalf("writing manifest fixture: %v", err)
+	}
+
+	err := cmdValidate([]string{"--root", root, manifestPath})
+	if err == nil {
+		t.Fatal("cmdValidate with backend-discards beside a surviving credit = nil error, want a blocking failure")
+	}
+	if !strings.Contains(err.Error(), "container-clear") {
+		t.Errorf("cmdValidate error = %q, want it to mention container-clear", err.Error())
+	}
+}
+
 // TestBuildRoundtripVerifyReportContainerClearNeverAffectsExitCode is the
 // ticket's own required pin: a manifest with ZERO clear-direction
 // coverage anywhere — the measured state of most of the fleet — still
@@ -2990,5 +3093,67 @@ func TestToClearCellCreditJSONExcludesIneligibleFromCredited(t *testing.T) {
 	}
 	if !reflect.DeepEqual(line.Credited, []string{"aliases"}) {
 		t.Errorf("Credited = %v, want [aliases] — immutableC is INELIGIBLE and must never be credited by cell membership", line.Credited)
+	}
+}
+
+// TestToContainerClearJSONCarriesContradiction confirms the new
+// Contradiction/ContradictionDetail axis survives the JSON encoding
+// roundtrip-verify's own report uses — a silent drop here would leave that
+// command's readers unable to see the same disagreement `validate`'s text
+// report already surfaces.
+func TestToContainerClearJSONCarriesContradiction(t *testing.T) {
+	findings := []roundtrip.ContainerClearFinding{
+		{
+			Path: "tags", Shape: roundtrip.ShapeList, Covered: false,
+			Contradiction:       true,
+			ContradictionDetail: "credited via sibling clear: while also carrying disposition: backend-discards",
+		},
+	}
+
+	out := toContainerClearJSON(findings)
+	if len(out) != 1 {
+		t.Fatalf("toContainerClearJSON returned %d lines, want 1", len(out))
+	}
+	line := out[0]
+	if !line.Contradiction {
+		t.Errorf("Contradiction = false, want true")
+	}
+	if line.ContradictionDetail == "" {
+		t.Errorf("ContradictionDetail is empty, want the withdrawn route and disposition named")
+	}
+	if line.Covered {
+		t.Errorf("Covered = true, want false — a contradictory finding withdraws its credit")
+	}
+}
+
+// TestToClearCellCreditJSONCarriesContradictory is
+// TestToContainerClearJSONCarriesContradiction's cell-report counterpart:
+// ClearCellReport.Contradictory/ContradictionDetails must also survive the
+// JSON encoding used by roundtrip-verify's own `cells` report.
+func TestToClearCellCreditJSONCarriesContradictory(t *testing.T) {
+	reports := []roundtrip.ClearCellReport{
+		{
+			Key: roundtrip.CellKey{
+				Classification: roundtrip.ClassNA,
+				Shape:          roundtrip.ShapeList,
+				Direction:      roundtrip.DirectionClear,
+				Depth:          roundtrip.DepthTop,
+			},
+			Members:              []string{"tags"},
+			Contradictory:        []string{"tags"},
+			ContradictionDetails: map[string]string{"tags": "credited via sibling clear: while also carrying disposition: backend-discards"},
+		},
+	}
+
+	out := toClearCellCreditJSON(reports)
+	if len(out) != 1 {
+		t.Fatalf("toClearCellCreditJSON returned %d lines, want 1", len(out))
+	}
+	line := out[0]
+	if !reflect.DeepEqual(line.Contradictory, []string{"tags"}) {
+		t.Errorf("Contradictory = %v, want [tags]", line.Contradictory)
+	}
+	if line.ContradictionDetails["tags"] == "" {
+		t.Errorf("ContradictionDetails[%q] is empty, want the withdrawn route and disposition named", "tags")
 	}
 }

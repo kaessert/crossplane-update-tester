@@ -152,6 +152,42 @@ type UpdateTest struct {
 	// nothing to test. Populated by UnmarshalYAML; not itself part of the
 	// YAML schema (no yaml tag) and not settable by an author.
 	ValueExplicit bool `yaml:"-"`
+	// Disposition declares an evidence-tier disposition (see the
+	// Disposition type) directly on THIS entry, alongside whatever tested
+	// content (value:/expect:/clear:/withValues:) it already carries — the
+	// carrier for a field whose clear direction needs a disposition while
+	// its update path is itself genuinely tested, where SkipInfo's own
+	// nested disposition: key is unavailable because skip: cannot coexist
+	// with tested content (see ValidateFieldEntryMix). Only
+	// DispositionBackendDiscards may be declared here — see
+	// validateEntryDisposition for why the other four tiers require a
+	// skip: block instead. Empty means no top-level disposition: was
+	// authored; a field with no test at all still declares its
+	// disposition the established way, inside skip:.
+	Disposition Disposition `yaml:"disposition"`
+}
+
+// EffectiveDisposition returns the disposition t's own entry declares,
+// regardless of which of the two carriers authored it: the entry's
+// top-level disposition: key (t.Disposition) when present, else its nested
+// skip: disposition: key (t.Skip.Disposition) when t carries a skip: at
+// all. The top-level key wins when an entry somehow carries both —
+// validateEntryDisposition already refuses that combination at parse time,
+// so this is a defensive order rather than a real choice. Returns the
+// empty Disposition, never a guess, when neither carrier authored one.
+//
+// The single place every consumer of "what disposition did this entry
+// declare" reads from — roundtrip's container-clear cell coverage and
+// residual's fleet-wide burn-down report both call this rather than each
+// re-deriving the same two-carrier precedence.
+func (t UpdateTest) EffectiveDisposition() Disposition {
+	if t.Disposition != "" {
+		return t.Disposition
+	}
+	if t.Skip.Present() {
+		return t.Skip.Disposition
+	}
+	return ""
 }
 
 // UnmarshalYAML implements yaml.Unmarshaler for UpdateTest so
@@ -270,7 +306,7 @@ func validSkipReasonList() string {
 // tool can tell a claim that is re-checkable by machine from one that is
 // only a human's word.
 //
-// The four values are the evidence tiers a fleet-wide reading of every
+// The five values are the evidence tiers a fleet-wide reading of every
 // "skip:" waiver's own claim shape converged on. Deliberately closed, like
 // SkipReason: an open-ended free-text disposition could not be told apart
 // from a guess, which is exactly the failure this axis exists to end.
@@ -306,12 +342,24 @@ const (
 	// or that names nothing checkable at all. Recording it is a defect
 	// finding, not a legitimate skip.
 	DispositionDefect Disposition = "defect"
+	// DispositionBackendDiscards marks a leaf whose clear direction no route
+	// can ever evidence: the request carrying the empty container is
+	// well-formed, is issued, and is answered 200, and the collection is
+	// still there — unchanged — on the next read. Unlike the other four
+	// tiers, this one is authored on a field that MAY carry a tested entry
+	// of its own (value:/expect:/clear:/withValues:) — the field's own
+	// update path is real and tested; only its CLEAR direction specifically
+	// cannot be shown to converge. It is therefore never nested inside a
+	// skip: block, which exists for a field with no test at all: see
+	// UpdateTest.Disposition for the carrier this tier actually uses.
+	DispositionBackendDiscards Disposition = "backend-discards"
 )
 
 // dispositions is the closed set of valid Disposition values, in the order
 // they are listed in a parse-time "not a valid disposition" error.
 var dispositions = []Disposition{
 	DispositionStaticallyProvable, DispositionOneLivePatch, DispositionDeclaredExclusion, DispositionDefect,
+	DispositionBackendDiscards,
 }
 
 // validDispositionList renders dispositions as a comma-separated string for
@@ -508,6 +556,33 @@ func (s *SkipInfo) UnmarshalYAML(value *yaml.Node) error {
 	}
 }
 
+// validateDispositionValue enforces the closed disposition set and
+// declared-exclusion's own required companion keys, independent of which
+// carrier declared d — SkipInfo's own nested disposition: key, or
+// UpdateTest's top-level one (see validateDisposition and
+// validateEntryDisposition, its two callers).
+func validateDispositionValue(d Disposition, declaredBy, reconfirm string) error {
+	if d == "" {
+		return nil
+	}
+	valid := false
+	for _, known := range dispositions {
+		if d == known {
+			valid = true
+			break
+		}
+	}
+	if !valid {
+		return fmt.Errorf("disposition %q is not one of the valid dispositions (%s)", d, validDispositionList())
+	}
+	if d == DispositionDeclaredExclusion {
+		if declaredBy == "" || reconfirm == "" {
+			return fmt.Errorf("disposition %q requires both declared-by: and reconfirm: to be non-empty", d)
+		}
+	}
+	return nil
+}
+
 // validateDisposition enforces the closed disposition set and
 // declared-exclusion's own required companion keys. disposition: is
 // optional and orthogonal to reason:/legacy: — this runs for both the
@@ -515,23 +590,52 @@ func (s *SkipInfo) UnmarshalYAML(value *yaml.Node) error {
 // derives a disposition from s.Reason, s.LegacyText or s.Evidence: it is
 // authored, or it stays empty (see Disposition's own doc comment).
 func validateDisposition(s SkipInfo) error {
-	if s.Disposition == "" {
+	if err := validateDispositionValue(s.Disposition, s.DeclaredBy, s.Reconfirm); err != nil {
+		return fmt.Errorf("skip: %w", err)
+	}
+	return nil
+}
+
+// validateEntryDisposition enforces the closed disposition set for an
+// entry's own top-level "disposition:" key (UpdateTest.Disposition) — the
+// carrier for a field whose entry already carries a tested assertion,
+// where SkipInfo's nested disposition: key is unavailable because skip:
+// cannot coexist with tested content (see ValidateFieldEntryMix, which this
+// function leaves untouched: it never inspects, relaxes, or bypasses that
+// guard, it only validates a DIFFERENT key that guard has no opinion on).
+//
+// Only DispositionBackendDiscards may be declared here. The other four
+// tiers all answer "why does no test exist for this field" — an entry
+// authoring one of them at the top level, beside a tested value:/expect:/
+// clear:/withValues:, would be claiming both that the field is tested and
+// that it is not; that claim belongs inside a skip: block instead, where
+// ValidateFieldEntryMix already guarantees no tested content sits beside
+// it. backend-discards makes no such claim: it says the field's update path
+// IS tested, only its CLEAR direction specifically cannot be evidenced.
+//
+// Also rejects declaring disposition: at the top level on an entry whose
+// skip: is ALSO present — SkipInfo already has its own disposition: key,
+// and authoring both is an unresolvable ambiguity about which one governs,
+// never a merge.
+func validateEntryDisposition(t UpdateTest) error {
+	if t.Disposition == "" {
 		return nil
 	}
-	validDisposition := false
-	for _, d := range dispositions {
-		if s.Disposition == d {
-			validDisposition = true
-			break
-		}
+	if err := validateDispositionValue(t.Disposition, "", ""); err != nil {
+		return err
 	}
-	if !validDisposition {
-		return fmt.Errorf("skip: disposition %q is not one of the valid dispositions (%s)", s.Disposition, validDispositionList())
+	if t.Skip.Present() {
+		return fmt.Errorf(
+			"disposition: is declared at the entry's top level while the entry also carries skip: — " +
+				"a skip:'d field's disposition belongs inside the skip: block (skip: {reason: ..., " +
+				"disposition: ...}); the top-level disposition: key exists only for a field with no skip: at all")
 	}
-	if s.Disposition == DispositionDeclaredExclusion {
-		if s.DeclaredBy == "" || s.Reconfirm == "" {
-			return fmt.Errorf("skip: disposition %q requires both declared-by: and reconfirm: to be non-empty", s.Disposition)
-		}
+	if t.Disposition != DispositionBackendDiscards {
+		return fmt.Errorf(
+			"top-level disposition: %q is not valid outside a skip: block — only %q may be declared there; "+
+				"every other disposition in the closed set answers why no test exists for the field, which "+
+				"requires a skip: block to attach to",
+			t.Disposition, DispositionBackendDiscards)
 	}
 	return nil
 }
@@ -1011,6 +1115,9 @@ func ParseAnnotation(annotation string) ([]UpdateTest, string, []string, []strin
 			return nil, "", nil, nil, fmt.Errorf("entry %d (%s): %w", i, t.Field, err)
 		}
 		if err := ValidateIgnoreListElementKeys(t); err != nil {
+			return nil, "", nil, nil, fmt.Errorf("entry %d (%s): %w", i, t.Field, err)
+		}
+		if err := validateEntryDisposition(t); err != nil {
 			return nil, "", nil, nil, fmt.Errorf("entry %d (%s): %w", i, t.Field, err)
 		}
 		testedFields[t.Field] = true

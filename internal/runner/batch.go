@@ -38,7 +38,10 @@ type BatchResult struct {
 	// ClearViolations is the batch-mode equivalent of RunTests' own
 	// []ClearAssertion return — see that type's doc comment.
 	ClearViolations []ClearAssertion
-	Err             error
+	// UnprovenClear is the batch-mode equivalent of RunTests' own
+	// []UnprovenClearCredit return — see that type's doc comment.
+	UnprovenClear []UnprovenClearCredit
+	Err           error
 }
 
 // BatchOptions configures RunBatch.
@@ -164,13 +167,14 @@ func adaptiveThrottleHandler(limiter *AdaptiveLimiter) func(streak int) {
 // assertions, single-target error paths) without a worker pool around it.
 func runOneBatchTarget(t BatchTarget) BatchResult {
 	t.Runner.WithRoot(t.Root)
-	results, violations, clearViolations, err := t.Runner.RunTests(t.Manifest)
+	results, violations, clearViolations, unprovenClear, err := t.Runner.RunTests(t.Manifest)
 	return BatchResult{
 		Label:               t.Label,
 		Manifest:            t.Manifest,
 		Results:             results,
 		UnchangedViolations: violations,
 		ClearViolations:     clearViolations,
+		UnprovenClear:       unprovenClear,
 		Err:                 err,
 	}
 }

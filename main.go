@@ -316,7 +316,7 @@ func cmdRun(args []string) error {
 		m.Kind, m.Name, len(m.Tests), skipped)
 
 	root, _ := roundtrip.InferProviderRoot(opts.manifestPath)
-	results, unchangedViolations, clearViolations, err := runner.NewRunner(opts.manifestPath, opts.timeout).
+	results, unchangedViolations, clearViolations, unprovenClear, err := runner.NewRunner(opts.manifestPath, opts.timeout).
 		WithPollInterval(opts.pollInterval).
 		WithRoot(root).
 		RunTests(m)
@@ -327,10 +327,11 @@ func cmdRun(args []string) error {
 	passed, failed, noop, notEvidenced, untrusted := printResults(os.Stdout, results)
 	assertUnchangedFailed := printUnchangedAssertions(os.Stdout, m.AssertUnchanged, unchangedViolations)
 	clearCreditFailed := printClearAssertions(os.Stdout, clearViolations)
+	unprovenClearFailed := printUnprovenClearCredits(os.Stdout, unprovenClear)
 
 	total := passed + failed
 	fmt.Printf("%s: %d/%d tested, %d/%d skipped, %d no-op, %d not-evidenced, %d untrusted\n",
-		verdict(failed == 0 && !assertUnchangedFailed && !clearCreditFailed), passed, total, skipped, len(m.Tests), noop, notEvidenced, untrusted)
+		verdict(failed == 0 && !assertUnchangedFailed && !clearCreditFailed && !unprovenClearFailed), passed, total, skipped, len(m.Tests), noop, notEvidenced, untrusted)
 
 	var failureReasons []string
 	if failed > 0 {
@@ -341,6 +342,9 @@ func cmdRun(args []string) error {
 	}
 	if clearCreditFailed {
 		failureReasons = append(failureReasons, fmt.Sprintf("%d clear-credit assertion(s) failed", len(clearViolations)))
+	}
+	if unprovenClearFailed {
+		failureReasons = append(failureReasons, fmt.Sprintf("%d clear-credit assertion(s) never ran", len(unprovenClear)))
 	}
 	if len(failureReasons) > 0 {
 		return errors.New(strings.Join(failureReasons, ", and "))
@@ -402,6 +406,44 @@ func printClearAssertions(w io.Writer, violations []runner.ClearAssertion) (anyF
 		anyFailed = true
 		printfTo(w, "  \u2717 %s: NOT CLEARED after %q's patch (credited via %s, observed %q)\n",
 			v.Representative, v.TriggerField, v.Route, v.Observed)
+	}
+	printfTo(w, "\n")
+	return anyFailed
+}
+
+// printUnprovenClearCredits prints every covered container-clear credit
+// whose live check (see printClearAssertions above) never ran at all — a
+// pending proof that never fired is exactly as unproven as one that fired
+// and failed, and reusing that same GATING treatment here is deliberate:
+// see runner.UnprovenClearCredit's own doc comment. Each entry is printed
+// with its Reason spelled out rather than a single undifferentiated
+// "unproven" label, because the three reasons have three different
+// remedies — rewrite the skip:, change the test value that produced a
+// no-op, or fix whatever produced an unmatched trigger — and a reader who
+// cannot tell which one applies is sent to the wrong fix.
+//
+// Unlike printUnchangedAssertions and like printClearAssertions, nothing is
+// printed when credits is empty: this check has nothing declared to name
+// when it finds zero unproven credits, so a zero-line header would read as
+// a check that ran and found nothing when in fact nothing applied.
+func printUnprovenClearCredits(w io.Writer, credits []runner.UnprovenClearCredit) (anyFailed bool) {
+	if len(credits) == 0 {
+		return false
+	}
+	printfTo(w, "Unproven clear-credit assertions:\n")
+	for _, c := range credits {
+		anyFailed = true
+		switch c.Reason {
+		case runner.UnprovenLenderSkipped:
+			printfTo(w, "  \u2717 %s: credited via %s, but its lender %q is skip:'d — the live check never ran\n",
+				c.Representative, c.Route, c.TriggerField)
+		case runner.UnprovenLenderNoOp:
+			printfTo(w, "  \u2717 %s: credited via %s, but its lender %q no-op'd — its target already equalled the current value, so the live check never ran\n",
+				c.Representative, c.Route, c.TriggerField)
+		default:
+			printfTo(w, "  \u2717 %s: credited via %s, but no update-test entry could be matched as its lender — the live check has nothing to attach to\n",
+				c.Representative, c.Route)
+		}
 	}
 	printfTo(w, "\n")
 	return anyFailed
@@ -1149,12 +1191,13 @@ func cmdBatch(args []string) error {
 		}
 		assertUnchangedFailed := printUnchangedAssertions(&buf, assertUnchangedFields, res.UnchangedViolations)
 		clearCreditFailed := printClearAssertions(&buf, res.ClearViolations)
+		unprovenClearFailed := printUnprovenClearCredits(&buf, res.UnprovenClear)
 		printfTo(os.Stdout, "%s", buf.String())
 
 		total := passed + failed
 		fmt.Printf("%s: %d/%d tested, %d no-op, %d not-evidenced, %d untrusted\n",
-			verdict(failed == 0 && !assertUnchangedFailed && !clearCreditFailed), passed, total, noop, notEvidenced, untrusted)
-		if failed > 0 || assertUnchangedFailed || clearCreditFailed {
+			verdict(failed == 0 && !assertUnchangedFailed && !clearCreditFailed && !unprovenClearFailed), passed, total, noop, notEvidenced, untrusted)
+		if failed > 0 || assertUnchangedFailed || clearCreditFailed || unprovenClearFailed {
 			failedFixtures++
 		}
 	}

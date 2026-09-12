@@ -1997,7 +1997,7 @@ func TestRunTestsStuckFieldFailsAfterReachingThePatch(t *testing.T) {
 	m := &manifest.Manifest{Kind: testKindExample, Name: testNameExample}
 	m.Tests = append(m.Tests, manifest.UpdateTest{Field: testFieldNotifyDelay, Value: float64(1)})
 
-	results, _, _, err := r.RunTests(m)
+	results, _, _, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
@@ -2323,7 +2323,7 @@ func TestRunTestsResetsEventBurstBeforeCeiling(t *testing.T) {
 	r := newFakeRunner(f)
 
 	m := manifestWithSequentialFieldTests(numFields)
-	results, _, _, err := r.RunTests(m)
+	results, _, _, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
@@ -2385,7 +2385,7 @@ func TestRunTestsMidLoopResetAccountsForMultiEventAttempts(t *testing.T) {
 	r := newFakeRunner(f)
 
 	m := manifestWithSequentialFieldTests(numFields)
-	results, _, _, err := r.RunTests(m)
+	results, _, _, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
@@ -2446,7 +2446,7 @@ func TestRunTestsEarnsBurstBeforeFirstFieldWhenAlreadyAtCeiling(t *testing.T) {
 	r := newFakeRunner(f)
 
 	m := manifestWithSequentialFieldTests(1)
-	results, _, _, err := r.RunTests(m)
+	results, _, _, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
@@ -2485,7 +2485,7 @@ func TestRunTestsSkipsPreRunResetWhenBelowCeiling(t *testing.T) {
 	r := newFakeRunner(f)
 
 	m := manifestWithSequentialFieldTests(1)
-	results, _, _, err := r.RunTests(m)
+	results, _, _, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
@@ -2526,7 +2526,7 @@ func TestRunTestsRaisedCeilingPerformsZeroRestarts(t *testing.T) {
 	r.burstCeiling = raisedCeiling
 
 	m := manifestWithSequentialFieldTests(numFields)
-	results, _, _, err := r.RunTests(m)
+	results, _, _, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
@@ -2686,7 +2686,7 @@ func TestRunTestsWithoutRestartWiringStillDetectsGenuineNonEvidence(t *testing.T
 	r := newFakeRunner(f)
 
 	m := manifestWithSequentialFieldTests(numFields)
-	results, _, _, err := r.RunTests(m)
+	results, _, _, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
@@ -2733,7 +2733,7 @@ func TestRunTestsAssertUnchangedGatesOnSilentWipe(t *testing.T) {
 		AssertUnchanged: []string{"legacyRuleList"},
 	}
 
-	results, violations, _, err := r.RunTests(m)
+	results, violations, _, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
@@ -2784,7 +2784,7 @@ func TestRunTestsAssertUnchangedPassesWhenFieldHolds(t *testing.T) {
 		AssertUnchanged: []string{"legacyRuleList"},
 	}
 
-	_, violations, _, err := r.RunTests(m)
+	_, violations, _, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
@@ -2821,7 +2821,7 @@ func TestRunTestsAssertUnchangedReportsDriftOnceAcrossMultipleFieldTests(t *test
 		AssertUnchanged: []string{"legacyRuleList"},
 	}
 
-	_, violations, _, err := r.RunTests(m)
+	_, violations, _, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
@@ -2862,7 +2862,7 @@ func TestRunTestsRejectsUnresolvableAssertUnchangedPathBeforeAnyPatch(t *testing
 		AssertUnchanged: []string{"ruleChoice.legacyRuleList"},
 	}
 
-	_, _, _, err := r.RunTests(m)
+	_, _, _, _, err := r.RunTests(m)
 	if err == nil {
 		t.Fatal("expected an error for an assert-unchanged path that does not resolve on the object, got nil")
 	}
@@ -2890,7 +2890,7 @@ func TestRunTestsBelowCeilingNeverRestarts(t *testing.T) {
 	r := newFakeRunner(f)
 
 	m := manifestWithSequentialFieldTests(numFields)
-	if _, _, _, err := r.RunTests(m); err != nil {
+	if _, _, _, _, err := r.RunTests(m); err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
 
@@ -2926,7 +2926,7 @@ func TestRunTestsRestartFailureDoesNotAbortRun(t *testing.T) {
 	}
 
 	m := manifestWithSequentialFieldTests(numFields)
-	results, _, _, err := r.RunTests(m)
+	results, _, _, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
@@ -2991,7 +2991,7 @@ func TestRunTestsAmbiguousProviderDeploymentDegradesToUntrusted(t *testing.T) {
 	r.restartFunc = nil
 
 	m := manifestWithSequentialFieldTests(numFields)
-	results, _, _, err := r.RunTests(m)
+	results, _, _, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}

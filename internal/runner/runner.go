@@ -969,19 +969,25 @@ func (r *Runner) eventBurstCeiling() int {
 // once the field test claimed to have produced it actually ran. This is
 // computed only when WithRoot declared a provider root; see
 // clearCellReportsFor. Also a GATING failure — see checkClearAssertions.
-func (r *Runner) RunTests(m *manifest.Manifest) ([]TestResult, []UnchangedAssertion, []ClearAssertion, error) {
+//
+// The final return is every such credit whose live check never ran at all —
+// its lender was skipped, its lender no-op'd, or no lender could be matched
+// to it in the first place (see UnprovenClearCredit and its Reason values).
+// A credit RunTests never got to check is exactly as unproven as a credit it
+// checked and found false; both are GATING failures for the same reason.
+func (r *Runner) RunTests(m *manifest.Manifest) ([]TestResult, []UnchangedAssertion, []ClearAssertion, []UnprovenClearCredit, error) {
 	if err := r.ResolveResource(m); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 
 	snapshot, err := r.Snapshot()
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("initial snapshot: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("initial snapshot: %w", err)
 	}
 
 	baselines, err := readAssertUnchangedBaselines(snapshot, m.AssertUnchanged)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	// violatedFields tracks which assert-unchanged fields have already been
 	// reported, so a field that stays wiped for the rest of the run is
@@ -995,9 +1001,18 @@ func (r *Runner) RunTests(m *manifest.Manifest) ([]TestResult, []UnchangedAssert
 	// for why this is reused rather than re-derived. clearViolations
 	// accumulates exactly like violations above: attributed to whichever
 	// field test's patch was claimed to have produced the credit being
-	// checked.
-	pendingClear := unobservedClearCredits(clearCellReportsFor(r.root, m), m.Tests)
+	// checked. unprovenClear starts with path 3 (no resolvable trigger,
+	// never keyed into pendingClear at all) and gains paths 1 and 2 after
+	// the loop below, once it is known which pendingClear keys the loop
+	// never actually reached.
+	pendingClear, unprovenClear := unobservedClearCredits(clearCellReportsFor(r.root, m), m.Tests)
 	var clearViolations []ClearAssertion
+	// consumedClear records every pendingClear key whose live check was
+	// actually attempted below (see the loop's own gating condition,
+	// `!result.Skipped && !result.NoOp`) — the accounting checkClearAssertions
+	// itself has no way to report, since a map lookup that finds nothing
+	// looks identical whether the key was never checked or genuinely empty.
+	consumedClear := make(map[string]bool, len(pendingClear))
 
 	var results []TestResult
 	var attemptsSinceReset int
@@ -1161,10 +1176,34 @@ func (r *Runner) RunTests(m *manifest.Manifest) ([]TestResult, []UnchangedAssert
 				results[len(results)-1].Error = fmt.Errorf("checking clear-credit assertions: %w", ccerr)
 			}
 			clearViolations = append(clearViolations, newClearViolations...)
+			// The check above just ran for t.Field, regardless of what it
+			// found — a pendingClear[t.Field] key is now proven one way or
+			// the other, never left pending.
+			consumedClear[t.Field] = true
 		}
 	}
 
-	return results, violations, clearViolations, nil
+	// Paths 1 and 2: every pendingClear key the loop above never reached
+	// (its lender was skipped, or its lender no-op'd — see
+	// unprovenReasonForField) is exactly as unproven as path 3's entries
+	// already are, and gets folded into the same slice rather than a
+	// second, parallel one.
+	for field, items := range pendingClear {
+		if consumedClear[field] {
+			continue
+		}
+		reason := unprovenReasonForField(field, results)
+		for _, item := range items {
+			unprovenClear = append(unprovenClear, UnprovenClearCredit{
+				Representative: item.representative,
+				Route:          item.route,
+				TriggerField:   field,
+				Reason:         reason,
+			})
+		}
+	}
+
+	return results, violations, clearViolations, unprovenClear, nil
 }
 
 // providerDeploymentNamespace is where the Crossplane package manager

@@ -111,6 +111,18 @@ For each entry in the manifest's `crossplane.io/update-test` annotation, `run`:
    no annotation needed, and it runs only when `run` can locate the
    resource's CRD (the same lookup `validate`'s container-clear check
    uses; a manifest with no discoverable CRD is unaffected).
+10. **Asserts that every such credit was actually checked at all.** Point 9's
+    live check only runs when the entry it is attributed to reaches that
+    point in the loop — an entry can be attributed a credit and never reach
+    it, for three distinct reasons: the entry carries `skip:` alongside
+    `clear:`/`withValues:`, so it never runs; the entry's own target value
+    already equals the resource's current value, so it short-circuits to a
+    no-op before any patch is built; or no entry at all could be matched as
+    the credit's origin. Each is reported by name — which entry, which
+    credit mechanism, why the check never ran — and fails the whole
+    invocation exactly like a credit that *was* checked and found false. A
+    credit that is never checked proves nothing, and this exists so that
+    silence is never mistaken for a pass.
 
 Point 6 is the reason this tool exists rather than a `kubectl patch` followed by
 a value assertion. A value match alone cannot distinguish "the controller

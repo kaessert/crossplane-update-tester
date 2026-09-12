@@ -57,6 +57,56 @@ type pendingClearAssertion struct {
 	route          roundtrip.ClearRoute
 }
 
+// UnprovenClearReason names why a covered cell's offline credit was never
+// checked against its live post-state at all — as opposed to ClearAssertion,
+// which names a credit that WAS checked and found false. Each value has a
+// different remedy, which is why RunTests reports them distinctly rather
+// than folding them into one undifferentiated "unproven" label — see
+// checkClearAssertions' caller in RunTests for where each is produced.
+type UnprovenClearReason string
+
+const (
+	// UnprovenLenderSkipped means the update-test entry whose patch was
+	// claimed to produce this credit carries a skip: key, so RunTests
+	// never ran it and the live check that would have proven the credit
+	// never fired. Remedy: rewrite or remove the skip: on the lender.
+	UnprovenLenderSkipped UnprovenClearReason = "lender skipped"
+	// UnprovenLenderNoOp means the lender ran, but its target value
+	// already equalled the resource's current value, so it short-circuited
+	// to NO-OP before any patch reached the backend — the live check never
+	// had a post-patch snapshot to read. Remedy: change the lender's test
+	// value so it actually differs from the resource's current state.
+	UnprovenLenderNoOp UnprovenClearReason = "lender no-op"
+	// UnprovenNoTrigger means no update-test entry's Clear list or
+	// WithValues map could be matched to the credited representative at
+	// all — see triggerFieldFor. Remedy: an attribution bug in whichever
+	// entry was meant to carry this credit, or in the offline classifier
+	// itself.
+	UnprovenNoTrigger UnprovenClearReason = "no resolvable trigger"
+)
+
+// UnprovenClearCredit records one covered container-clear cell whose
+// offline credit (see ClearAssertion's own doc comment for the three
+// routes this applies to) was never checked against its live post-state,
+// for the reason named by Reason. Like ClearAssertion, this is a GATING
+// failure RunTests' caller must treat the same as a failed field test: an
+// assertion that never ran proves nothing, and printing the offline
+// "covered" verdict on the strength of it would report a check that did
+// not happen as though it had — see checkClearAssertions and RunTests.
+type UnprovenClearCredit struct {
+	// Representative is the credited leaf's own dotted path — the same
+	// value roundtrip.ClearCellReport.Representative carries.
+	Representative string
+	// Route names the credit mechanism offline validation assigned
+	// Representative.
+	Route roundtrip.ClearRoute
+	// TriggerField names the update-test entry whose patch was claimed to
+	// prove this credit. Empty when Reason is UnprovenNoTrigger, since no
+	// entry could be matched to Representative at all.
+	TriggerField string
+	Reason       UnprovenClearReason
+}
+
 // unassertedClearRoute reports whether route is one of the three credit
 // mechanisms whose credited leaf is never itself t.Field for any
 // update-test entry the runner executes — see ClearAssertion's own doc
@@ -103,19 +153,28 @@ func clearCellReportsFor(root string, m *manifest.Manifest) []roundtrip.ClearCel
 // itself renders, which field test's patch is claimed to have produced
 // each covered cell's unasserted credit (see unassertedClearRoute) — so
 // RunTests knows exactly when to check the representative's real
-// post-state. Keyed by TriggerField (see triggerFieldFor). A cell with no
-// resolvable trigger is silently skipped rather than asserted against the
-// wrong field — it should not happen, since every unasserted route is, by
-// construction, produced by SOME entry's Clear list or WithValues map, but
-// a check that cannot name its own trigger field is worse than no check.
-func unobservedClearCredits(reports []roundtrip.ClearCellReport, tests []manifest.UpdateTest) map[string][]pendingClearAssertion {
+// post-state. The map is keyed by TriggerField (see triggerFieldFor); a
+// cell with no resolvable trigger cannot be keyed at all, since there is no
+// field test to attribute the live check to — every unasserted route is, by
+// construction, produced by SOME entry's Clear list or WithValues map, so
+// this "should not happen", but an unfalsifiable claim is exactly what the
+// second return value exists to stop being: every such cell is returned as
+// an UnprovenClearCredit (Reason: UnprovenNoTrigger) rather than dropped,
+// so RunTests' caller reports it as a gating failure instead of silence.
+func unobservedClearCredits(reports []roundtrip.ClearCellReport, tests []manifest.UpdateTest) (map[string][]pendingClearAssertion, []UnprovenClearCredit) {
 	out := make(map[string][]pendingClearAssertion)
+	var unresolved []UnprovenClearCredit
 	for _, report := range reports {
 		if !report.Covered || !unassertedClearRoute(report.Route) {
 			continue
 		}
 		trigger, ok := triggerFieldFor(report.Representative, report.Route, tests)
 		if !ok {
+			unresolved = append(unresolved, UnprovenClearCredit{
+				Representative: report.Representative,
+				Route:          report.Route,
+				Reason:         UnprovenNoTrigger,
+			})
 			continue
 		}
 		out[trigger] = append(out[trigger], pendingClearAssertion{
@@ -123,7 +182,7 @@ func unobservedClearCredits(reports []roundtrip.ClearCellReport, tests []manifes
 			route:          report.Route,
 		})
 	}
-	return out
+	return out, unresolved
 }
 
 // triggerFieldFor finds the update-test entry whose Clear list or
@@ -224,4 +283,32 @@ func checkClearAssertions(snapshot []byte, pending map[string][]pendingClearAsse
 		}
 	}
 	return out, firstErr
+}
+
+// unprovenReasonForField reports why field's own update-test entry never
+// reached the clear-credit check inside RunTests' loop — called only for a
+// pendingClear key RunTests has already determined was never consumed (see
+// RunTests). field is drawn from pendingClear's own keys, which
+// unobservedClearCredits only ever populates from triggerFieldFor's return —
+// itself only ever a t.Field value out of the SAME m.Tests slice RunTests
+// loops over — so exactly one TestResult must carry Field == field, and its
+// Skipped/NoOp flags are the two states that stop the loop from reaching
+// checkClearAssertions for that field (see RunTests' own gating condition,
+// `!result.Skipped && !result.NoOp`). A field found neither skipped nor
+// no-op'd would already have been consumed and never reach this function at
+// all — a case this function does not attempt to represent as a fourth,
+// unreachable category, and instead reports as UnprovenLenderNoOp: still a
+// real member of that reason's family, since both share the same root cause
+// (the lender ran through the gated branch without any error stopping it).
+func unprovenReasonForField(field string, results []TestResult) UnprovenClearReason {
+	for _, res := range results {
+		if res.Field != field {
+			continue
+		}
+		if res.Skipped {
+			return UnprovenLenderSkipped
+		}
+		return UnprovenLenderNoOp
+	}
+	return UnprovenLenderNoOp
 }

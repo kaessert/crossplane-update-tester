@@ -117,18 +117,37 @@ func TestTriggerFieldFor(t *testing.T) {
 	})
 }
 
+// TestUnobservedClearCredits covers unobservedClearCredits directly,
+// including the "UnresolvableTriggerIsReportedUnresolved" subtest below —
+// the third silent path (UnprovenNoTrigger). That subtest is deliberately
+// exercised at THIS level rather than as a RunTests-level integration test
+// like the skipped-lender and no-op-lender paths get: coverageFor and
+// triggerFieldFor both walk the identical t.Clear/t.WithValues structures
+// built from the SAME m.Tests slice, with identical matching predicates
+// (exact path, or isAncestorOf's segment-exact prefix), so a credited
+// representative that coverageFor found NEVER fails to be found again by
+// triggerFieldFor through any CRD+manifest combination the classifier
+// itself can construct — the path is a defensive guard against a FUTURE
+// divergence between the two, not a currently reachable live scenario.
+// Constructing it here, with a synthetic ClearCellReport naming a
+// Representative no test entry mentions at all, is the correct level: it
+// exercises exactly the code this ticket's fix added, with no need to
+// first find (or fabricate) a CRD/manifest pair the shared classifier
+// would never itself produce.
 func TestUnobservedClearCredits(t *testing.T) {
 	tests := []manifest.UpdateTest{
 		{Field: "name", Value: "new-name", Clear: []string{"tags"}},
 	}
-
 	t.Run("CoveredUnassertedRouteIsPending", func(t *testing.T) {
 		reports := []roundtrip.ClearCellReport{
 			{Covered: true, Representative: "tags", Route: roundtrip.RouteSiblingClear},
 		}
-		got := unobservedClearCredits(reports, tests)
+		got, unresolved := unobservedClearCredits(reports, tests)
 		if len(got["name"]) != 1 || got["name"][0].representative != "tags" {
 			t.Errorf("unobservedClearCredits = %+v, want one pending assertion on trigger %q for \"tags\"", got, "name")
+		}
+		if len(unresolved) != 0 {
+			t.Errorf("unresolved = %+v, want none for a resolvable trigger", unresolved)
 		}
 	})
 
@@ -136,8 +155,12 @@ func TestUnobservedClearCredits(t *testing.T) {
 		reports := []roundtrip.ClearCellReport{
 			{Covered: false, Representative: "", Route: ""},
 		}
-		if got := unobservedClearCredits(reports, tests); len(got) != 0 {
+		got, unresolved := unobservedClearCredits(reports, tests)
+		if len(got) != 0 {
 			t.Errorf("unobservedClearCredits = %+v, want empty for an uncovered cell", got)
+		}
+		if len(unresolved) != 0 {
+			t.Errorf("unresolved = %+v, want none for an uncovered cell", unresolved)
 		}
 	})
 
@@ -145,17 +168,32 @@ func TestUnobservedClearCredits(t *testing.T) {
 		reports := []roundtrip.ClearCellReport{
 			{Covered: true, Representative: "tags", Route: roundtrip.RoutePerKeyNull},
 		}
-		if got := unobservedClearCredits(reports, tests); len(got) != 0 {
+		got, unresolved := unobservedClearCredits(reports, tests)
+		if len(got) != 0 {
 			t.Errorf("unobservedClearCredits = %+v, want empty for RoutePerKeyNull (directly asserted)", got)
+		}
+		if len(unresolved) != 0 {
+			t.Errorf("unresolved = %+v, want none for RoutePerKeyNull (directly asserted)", unresolved)
 		}
 	})
 
-	t.Run("UnresolvableTriggerIsSkipped", func(t *testing.T) {
+	t.Run("UnresolvableTriggerIsReportedUnresolved", func(t *testing.T) {
 		reports := []roundtrip.ClearCellReport{
 			{Covered: true, Representative: "nosuchleaf", Route: roundtrip.RouteSiblingClear},
 		}
-		if got := unobservedClearCredits(reports, tests); len(got) != 0 {
+		got, unresolved := unobservedClearCredits(reports, tests)
+		if len(got) != 0 {
 			t.Errorf("unobservedClearCredits = %+v, want empty when no entry names the representative", got)
+		}
+		if len(unresolved) != 1 {
+			t.Fatalf("unresolved = %+v, want exactly one entry when no entry names the representative", unresolved)
+		}
+		u := unresolved[0]
+		if u.Representative != "nosuchleaf" || u.Route != roundtrip.RouteSiblingClear || u.Reason != UnprovenNoTrigger {
+			t.Errorf("unresolved[0] = %+v, want Representative=nosuchleaf Route=%s Reason=%s", u, roundtrip.RouteSiblingClear, UnprovenNoTrigger)
+		}
+		if u.TriggerField != "" {
+			t.Errorf("unresolved[0].TriggerField = %q, want empty (no entry could be matched)", u.TriggerField)
 		}
 	})
 }
@@ -334,7 +372,7 @@ func TestRunTestsClearCreditSiblingClearPassesWhenRepresentativeGenuinelyEmpties
 		Tests: []manifest.UpdateTest{{Field: "name", Value: "new-name", Clear: []string{"tags"}}},
 	}
 
-	results, _, clearViolations, err := r.RunTests(m)
+	results, _, clearViolations, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
@@ -375,7 +413,7 @@ func TestRunTestsClearCreditGatesOnSilentDiscard(t *testing.T) {
 		}},
 	}
 
-	results, _, clearViolations, err := r.RunTests(m)
+	results, _, clearViolations, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
@@ -429,7 +467,7 @@ func TestRunTestsClearCreditAncestorTombstonePassesWhenNestedLeafGenuinelyEmptie
 		Tests: []manifest.UpdateTest{{Field: "name", Value: "new-name", Clear: []string{"network"}}},
 	}
 
-	_, _, clearViolations, err := r.RunTests(m)
+	_, _, clearViolations, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
@@ -469,7 +507,7 @@ func TestRunTestsClearCreditAncestorTombstoneGatesOnSurvivingNestedLeaf(t *testi
 		Tests: []manifest.UpdateTest{{Field: "name", Value: "new-name", Clear: []string{"network"}}},
 	}
 
-	_, _, clearViolations, err := r.RunTests(m)
+	_, _, clearViolations, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
@@ -514,11 +552,181 @@ func TestRunTestsClearCreditDisabledWithNoRoot(t *testing.T) {
 		Tests: []manifest.UpdateTest{{Field: "name", Value: "new-name", Clear: []string{"tags"}}},
 	}
 
-	_, _, clearViolations, err := r.RunTests(m)
+	_, _, clearViolations, unprovenClear, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
 	if len(clearViolations) != 0 {
 		t.Errorf("got %d clear-credit violations with no root declared, want 0 (the check must be disabled entirely): %+v", len(clearViolations), clearViolations)
+	}
+	if len(unprovenClear) != 0 {
+		t.Errorf("got %d unproven clear-credit entries with no root declared, want 0 (the check must be disabled entirely): %+v", len(unprovenClear), unprovenClear)
+	}
+}
+
+// ─── RunTests-level: an unconsumed pendingClear entry must gate ─────────
+
+// TestRunTestsClearCreditUnprovenWhenLenderSkipped is the shape of the
+// FIRST silent path: an entry carries BOTH skip: and clear: on the SAME
+// field. containerclear.go's offline credit builder walks every entry's
+// clear: list with no skip filter (see ContainerClearCoverage — skip: is
+// consulted only for Disposition, never for cell membership), so tags
+// still reads as "covered via sibling clear:" offline even though the
+// entry whose patch was supposed to prove it live never runs at all. Before
+// this ticket's fix, RunTests built pendingClear and simply never checked
+// whether every key in it was ever consumed — a skipped lender's key was
+// never looked up, and the run exited 0 reporting nothing.
+//
+// This exact combination — skip: alongside clear:/withValues: on ONE entry
+// — is already rejected at parse time by manifest.ValidateFieldEntryMix,
+// so no manifest that reaches RunTests through the real `run`/`batch` CLI
+// path (both go through manifest.Parse) can ever construct it; the
+// &manifest.Manifest{} literal below reaches the same state ONLY by
+// bypassing that parser, exactly as this file's other hand-built fixtures
+// already do. The test still earns its place: it proves the ACCOUNTING
+// fix (an unconsumed pendingClear entry gates) rather than the parser
+// guard, and it is the only defence left for a manifest built any other
+// way — a future caller that constructs a Manifest directly, or a parser
+// guard that is ever loosened.
+func TestRunTestsClearCreditUnprovenWhenLenderSkipped(t *testing.T) {
+	root := writeClearAssertFixtureCRD(t)
+	f := &fakeCluster{
+		forProvider:       map[string]interface{}{"name": "old-name", "tags": []interface{}{"a"}},
+		atProvider:        map[string]interface{}{"name": "old-name", "tags": []interface{}{"a"}},
+		generation:        1,
+		kind:              testKindExample,
+		name:              testNameExample,
+		recordUpdateEvent: true,
+	}
+	r := newFakeRunner(f).WithRoot(root)
+
+	m := &manifest.Manifest{
+		APIVersion: "widgets.crossplane.io/v1alpha1", Kind: testKindExample, Name: testNameExample,
+		Tests: []manifest.UpdateTest{{
+			Field: "name", Value: "new-name", Clear: []string{"tags"},
+			Skip: manifest.LegacySkip("name is not independently testable on this backend"),
+		}},
+	}
+
+	results, _, clearViolations, unprovenClear, err := r.RunTests(m)
+	if err != nil {
+		t.Fatalf("RunTests: unexpected error: %v", err)
+	}
+	if len(results) != 1 || !results[0].Skipped {
+		t.Fatalf("expected the name field test itself to be skipped, got %+v", results)
+	}
+	if len(clearViolations) != 0 {
+		t.Errorf("got %d clear-credit violations, want 0 (the live check for a skipped lender never ran at all): %+v", len(clearViolations), clearViolations)
+	}
+	if len(unprovenClear) != 1 {
+		t.Fatalf("got %d unproven clear-credit entries, want exactly 1 (tags' credit rides a skipped lender): %+v", len(unprovenClear), unprovenClear)
+	}
+	u := unprovenClear[0]
+	if u.Representative != "tags" {
+		t.Errorf("unproven Representative = %q, want %q", u.Representative, "tags")
+	}
+	if u.Route != roundtrip.RouteSiblingClear {
+		t.Errorf("unproven Route = %q, want %q", u.Route, roundtrip.RouteSiblingClear)
+	}
+	if u.TriggerField != "name" {
+		t.Errorf("unproven TriggerField = %q, want %q (the skipped entry whose clear: claimed the credit)", u.TriggerField, "name")
+	}
+	if u.Reason != UnprovenLenderSkipped {
+		t.Errorf("unproven Reason = %q, want %q", u.Reason, UnprovenLenderSkipped)
+	}
+}
+
+// TestRunTestsClearCreditUnprovenWhenLenderNoOps is the live shape of the
+// SECOND silent path: the lender's OWN field-test value already equals the
+// resource's current value, so runFieldTest's no-op detection short-circuits
+// BEFORE any patch reaches the backend (see runFieldTest's "No-op
+// detection" comment) — the live check for the credit it was supposed to
+// prove never gets a post-patch snapshot to read. NO-OP is a non-failing,
+// data-dependent outcome invisible to the offline classifier, so before
+// this ticket's fix nothing downstream of it ever noticed the credit stayed
+// unchecked.
+func TestRunTestsClearCreditUnprovenWhenLenderNoOps(t *testing.T) {
+	root := writeClearAssertFixtureCRD(t)
+	f := &fakeCluster{
+		forProvider:       map[string]interface{}{"name": "already-set", "tags": []interface{}{"a"}},
+		atProvider:        map[string]interface{}{"name": "already-set", "tags": []interface{}{"a"}},
+		generation:        1,
+		kind:              testKindExample,
+		name:              testNameExample,
+		recordUpdateEvent: true,
+	}
+	r := newFakeRunner(f).WithRoot(root)
+
+	m := &manifest.Manifest{
+		APIVersion: "widgets.crossplane.io/v1alpha1", Kind: testKindExample, Name: testNameExample,
+		// Value repeats forProvider's own current "name" — runFieldTest
+		// detects this as a no-op before any patch is built.
+		Tests: []manifest.UpdateTest{{Field: "name", Value: "already-set", Clear: []string{"tags"}}},
+	}
+
+	results, _, clearViolations, unprovenClear, err := r.RunTests(m)
+	if err != nil {
+		t.Fatalf("RunTests: unexpected error: %v", err)
+	}
+	if len(results) != 1 || !results[0].NoOp {
+		t.Fatalf("expected the name field test itself to no-op, got %+v", results)
+	}
+	if len(clearViolations) != 0 {
+		t.Errorf("got %d clear-credit violations, want 0 (the live check for a no-op lender never ran at all): %+v", len(clearViolations), clearViolations)
+	}
+	if len(unprovenClear) != 1 {
+		t.Fatalf("got %d unproven clear-credit entries, want exactly 1 (tags' credit rides a no-op lender): %+v", len(unprovenClear), unprovenClear)
+	}
+	u := unprovenClear[0]
+	if u.Representative != "tags" {
+		t.Errorf("unproven Representative = %q, want %q", u.Representative, "tags")
+	}
+	if u.Route != roundtrip.RouteSiblingClear {
+		t.Errorf("unproven Route = %q, want %q", u.Route, roundtrip.RouteSiblingClear)
+	}
+	if u.TriggerField != "name" {
+		t.Errorf("unproven TriggerField = %q, want %q (the no-op'd entry whose clear: claimed the credit)", u.TriggerField, "name")
+	}
+	if u.Reason != UnprovenLenderNoOp {
+		t.Errorf("unproven Reason = %q, want %q", u.Reason, UnprovenLenderNoOp)
+	}
+}
+
+// TestRunTestsClearCreditProvenWhenLenderRunsCleanly is the green-case
+// counterpart to the two tests above: a lender that is neither skipped nor
+// a no-op runs normally, its live check executes, and — matching every
+// other passing clear-credit test in this file — the run reports zero
+// unproven credits. A regression that reported every pendingClear entry as
+// unproven regardless of whether it was consumed would fail this test
+// immediately.
+func TestRunTestsClearCreditProvenWhenLenderRunsCleanly(t *testing.T) {
+	root := writeClearAssertFixtureCRD(t)
+	f := &fakeCluster{
+		forProvider:       map[string]interface{}{"name": "old-name", "tags": []interface{}{"a"}},
+		atProvider:        map[string]interface{}{"name": "old-name", "tags": []interface{}{"a"}},
+		generation:        1,
+		kind:              testKindExample,
+		name:              testNameExample,
+		recordUpdateEvent: true,
+	}
+	r := newFakeRunner(f).WithRoot(root)
+
+	m := &manifest.Manifest{
+		APIVersion: "widgets.crossplane.io/v1alpha1", Kind: testKindExample, Name: testNameExample,
+		Tests: []manifest.UpdateTest{{Field: "name", Value: "new-name", Clear: []string{"tags"}}},
+	}
+
+	results, _, clearViolations, unprovenClear, err := r.RunTests(m)
+	if err != nil {
+		t.Fatalf("RunTests: unexpected error: %v", err)
+	}
+	if len(results) != 1 || !results[0].Passed {
+		t.Fatalf("expected the name field test itself to pass, got %+v", results)
+	}
+	if len(clearViolations) != 0 {
+		t.Errorf("got %d clear-credit violations, want 0 (tags genuinely emptied): %+v", len(clearViolations), clearViolations)
+	}
+	if len(unprovenClear) != 0 {
+		t.Errorf("got %d unproven clear-credit entries, want 0 (the lender ran cleanly, so its credit was actually checked): %+v", len(unprovenClear), unprovenClear)
 	}
 }

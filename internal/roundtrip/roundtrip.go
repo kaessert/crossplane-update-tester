@@ -340,6 +340,37 @@ func FindCRD(root, apiVersion, kind string) (crd map[string]interface{}, plural 
 	return nil, ""
 }
 
+// InferProviderRoot walks upward from manifestPath's own absolute directory
+// looking for a "package/crds" directory, returning the first one found —
+// the provider repository root FindCRD itself expects.
+//
+// This exists because a caller's own working directory cannot be trusted:
+// `UPDATE_TESTER := go -C tools/update-tester tool ...` changes the TOOL
+// PROCESS'S OWN working directory to tools/update-tester before it ever
+// runs, so an os.Getwd() default silently resolves to the wrong directory
+// on every provider whose Makefile recipe invokes the tool that way.
+// manifestPath is unaffected by that: the invoking shell resolves it to an
+// absolute path BEFORE `go -C` ever changes anything, so walking up from
+// ITS OWN directory reaches the provider root reliably regardless of what
+// the tool process's own cwd became.
+func InferProviderRoot(manifestPath string) (string, bool) {
+	abs, err := filepath.Abs(manifestPath)
+	if err != nil {
+		return "", false
+	}
+	dir := filepath.Dir(abs)
+	for {
+		if info, err := os.Stat(filepath.Join(dir, "package", "crds")); err == nil && info.IsDir() {
+			return dir, true
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", false
+		}
+		dir = parent
+	}
+}
+
 // FormatReport renders a full human-readable report, headed by the
 // resource's kind/name — the shape the standalone roundtrip-diff subcommand
 // prints for each manifest it is given.

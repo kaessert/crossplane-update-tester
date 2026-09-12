@@ -873,6 +873,48 @@ func TestFindCRD(t *testing.T) {
 	})
 }
 
+// TestInferProviderRoot is InferProviderRoot's own table test: it must find
+// a package/crds directory an arbitrary number of levels above the
+// manifest, and report false rather than panicking when none exists
+// anywhere up to the filesystem root.
+func TestInferProviderRoot(t *testing.T) {
+	root := t.TempDir()
+	crdsDir := filepath.Join(root, "package", "crds")
+	if err := os.MkdirAll(crdsDir, 0o750); err != nil {
+		t.Fatalf("creating package/crds: %v", err)
+	}
+
+	t.Run("WalksUpMultipleLevels", func(t *testing.T) {
+		nested := filepath.Join(root, "examples", "widget")
+		if err := os.MkdirAll(nested, 0o750); err != nil {
+			t.Fatalf("creating nested examples dir: %v", err)
+		}
+		manifestPath := filepath.Join(nested, "widget.yaml")
+		if err := os.WriteFile(manifestPath, []byte("kind: Widget\n"), 0o600); err != nil {
+			t.Fatalf("writing manifest fixture: %v", err)
+		}
+
+		got, ok := InferProviderRoot(manifestPath)
+		if !ok {
+			t.Fatal("InferProviderRoot returned false, want the root found by walking up")
+		}
+		// Resolve both sides through filepath.Abs so a platform that
+		// returns t.TempDir() through a symlinked path (macOS
+		// /tmp -> /private/tmp) does not produce a false mismatch.
+		wantAbs, _ := filepath.Abs(root)
+		if got != wantAbs {
+			t.Errorf("InferProviderRoot = %q, want %q", got, wantAbs)
+		}
+	})
+
+	t.Run("NoPackageCrdsAnywhereReportsFalse", func(t *testing.T) {
+		isolated := t.TempDir()
+		if _, ok := InferProviderRoot(filepath.Join(isolated, "widget.yaml")); ok {
+			t.Error("InferProviderRoot found a root under a tree with no package/crds anywhere")
+		}
+	})
+}
+
 func TestFormatReportAndFindingsLines(t *testing.T) {
 	rows := []Row{
 		{Path: "allowAllResponseCodes", Classification: ClassPresentInSpecAbsentFromMirror, SpecValue: map[string]interface{}{}, SpecFound: true},

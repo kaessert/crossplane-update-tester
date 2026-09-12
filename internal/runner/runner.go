@@ -39,6 +39,16 @@ type Runner struct {
 	// defaultPollInterval.
 	pollInterval time.Duration
 
+	// root is the provider repository root holding package/crds, as
+	// declared by the caller (see WithRoot). RunTests uses it to locate
+	// the resource's CRD and compute the SAME container-clear cell report
+	// `validate` computes (roundtrip.ContainerClearCoverage +
+	// roundtrip.BuildClearCellReport) — see clearCellReportsFor. Empty
+	// means "no root to offer", in which case RunTests skips the
+	// clear-credit assertion entirely, exactly as validate's own
+	// printContainerClearCells silently skips when no CRD can be found.
+	root string
+
 	// execFunc is a test-only dispatch seam: no Runner method reads it
 	// directly. This package's client-go test fakes (see
 	// newFakeClientGoClientset, newFakeClientGoDynamicClient and
@@ -209,6 +219,19 @@ func NewRunner(manifestPath string, timeout int) *Runner {
 // A zero or negative value leaves defaultPollInterval in force.
 func (r *Runner) WithPollInterval(d time.Duration) *Runner {
 	r.pollInterval = d
+	return r
+}
+
+// WithRoot declares the provider repository root holding package/crds and
+// returns the Runner, so it can be chained onto NewRunner exactly like
+// WithPollInterval. RunTests uses it to compute the container-clear cell
+// report and check an unasserted credit's representative against the live
+// object — see clearCellReportsFor and unobservedClearCredits. An empty
+// root (the zero value every caller gets by default) disables that check
+// rather than erroring: a Runner built with no root to offer behaves
+// exactly as it did before this existed.
+func (r *Runner) WithRoot(root string) *Runner {
+	r.root = root
 	return r
 }
 
@@ -938,19 +961,27 @@ func (r *Runner) eventBurstCeiling() int {
 // at any point during the run — a GATING failure the caller must treat the
 // same as a failed field test. See UnchangedAssertion and
 // checkAssertUnchanged.
-func (r *Runner) RunTests(m *manifest.Manifest) ([]TestResult, []UnchangedAssertion, error) {
+//
+// It also returns every container-clear cell whose offline credit rides a
+// route this runner never directly asserts (a sibling clear:/withValues:
+// entry, or an ancestor's own clear: entry — see ClearAssertion) and whose
+// representative's real status.atProvider value disagreed with that credit
+// once the field test claimed to have produced it actually ran. This is
+// computed only when WithRoot declared a provider root; see
+// clearCellReportsFor. Also a GATING failure — see checkClearAssertions.
+func (r *Runner) RunTests(m *manifest.Manifest) ([]TestResult, []UnchangedAssertion, []ClearAssertion, error) {
 	if err := r.ResolveResource(m); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	snapshot, err := r.Snapshot()
 	if err != nil {
-		return nil, nil, fmt.Errorf("initial snapshot: %w", err)
+		return nil, nil, nil, fmt.Errorf("initial snapshot: %w", err)
 	}
 
 	baselines, err := readAssertUnchangedBaselines(snapshot, m.AssertUnchanged)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	// violatedFields tracks which assert-unchanged fields have already been
 	// reported, so a field that stays wiped for the rest of the run is
@@ -958,6 +989,15 @@ func (r *Runner) RunTests(m *manifest.Manifest) ([]TestResult, []UnchangedAssert
 	// it — rather than once per remaining field test.
 	violatedFields := make(map[string]bool, len(m.AssertUnchanged))
 	var violations []UnchangedAssertion
+
+	// pendingClear is computed ONCE, up front, from the same cell report
+	// `validate` itself builds — see clearCellReportsFor's own doc comment
+	// for why this is reused rather than re-derived. clearViolations
+	// accumulates exactly like violations above: attributed to whichever
+	// field test's patch was claimed to have produced the credit being
+	// checked.
+	pendingClear := unobservedClearCredits(clearCellReportsFor(r.root, m), m.Tests)
+	var clearViolations []ClearAssertion
 
 	var results []TestResult
 	var attemptsSinceReset int
@@ -1111,10 +1151,20 @@ func (r *Runner) RunTests(m *manifest.Manifest) ([]TestResult, []UnchangedAssert
 				results[len(results)-1].Error = fmt.Errorf("checking assert-unchanged fields: %w", cerr)
 			}
 			violations = append(violations, newViolations...)
+
+			// Clear-credit assertion: same shape, same snapshot, same
+			// attribution rule — a representative whose credited route
+			// was triggered by t.Field is checked against the SAME
+			// post-patch snapshot just captured above.
+			newClearViolations, ccerr := checkClearAssertions(snapshot, pendingClear, t.Field)
+			if ccerr != nil && results[len(results)-1].Error == nil {
+				results[len(results)-1].Error = fmt.Errorf("checking clear-credit assertions: %w", ccerr)
+			}
+			clearViolations = append(clearViolations, newClearViolations...)
 		}
 	}
 
-	return results, violations, nil
+	return results, violations, clearViolations, nil
 }
 
 // providerDeploymentNamespace is where the Crossplane package manager

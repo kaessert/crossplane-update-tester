@@ -16,6 +16,12 @@ type BatchTarget struct {
 	Label    string
 	Runner   *Runner
 	Manifest *manifest.Manifest
+	// Root is the provider repository root holding package/crds, applied
+	// to Runner via WithRoot before RunTests executes (see
+	// runOneBatchTarget) — the batch-mode equivalent of cmdRun's own root
+	// resolution. Empty disables the clear-credit assertion for this
+	// target exactly as an empty root does for a standalone `run`.
+	Root string
 }
 
 // BatchResult is one target's outcome. Exactly one of Err and a populated
@@ -29,7 +35,10 @@ type BatchResult struct {
 	Manifest            *manifest.Manifest
 	Results             []TestResult
 	UnchangedViolations []UnchangedAssertion
-	Err                 error
+	// ClearViolations is the batch-mode equivalent of RunTests' own
+	// []ClearAssertion return — see that type's doc comment.
+	ClearViolations []ClearAssertion
+	Err             error
 }
 
 // BatchOptions configures RunBatch.
@@ -154,12 +163,14 @@ func adaptiveThrottleHandler(limiter *AdaptiveLimiter) func(streak int) {
 // outcome. Split out from RunBatch so it is directly testable (call-count
 // assertions, single-target error paths) without a worker pool around it.
 func runOneBatchTarget(t BatchTarget) BatchResult {
-	results, violations, err := t.Runner.RunTests(t.Manifest)
+	t.Runner.WithRoot(t.Root)
+	results, violations, clearViolations, err := t.Runner.RunTests(t.Manifest)
 	return BatchResult{
 		Label:               t.Label,
 		Manifest:            t.Manifest,
 		Results:             results,
 		UnchangedViolations: violations,
+		ClearViolations:     clearViolations,
 		Err:                 err,
 	}
 }

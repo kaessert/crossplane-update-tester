@@ -1980,11 +1980,14 @@ func writeCRDFixture(t *testing.T, root, name, crdYAML string) {
 	}
 }
 
-// TestInferProviderRootFromManifestWalksUpToPackageCrds is
-// inferProviderRootFromManifest's own table test: it must find a
-// package/crds directory an arbitrary number of levels above the
-// manifest, and report false rather than panicking when none exists
-// anywhere up to the filesystem root.
+// TestInferProviderRootFromManifestWalksUpToPackageCrds pins
+// roundtrip.InferProviderRoot's behaviour as printContainerClearCells
+// itself relies on it: it must find a package/crds directory an arbitrary
+// number of levels above the manifest, and report false rather than
+// panicking when none exists anywhere up to the filesystem root. The
+// function itself lives in package roundtrip (its own table test there
+// covers it directly); this pin stays here because it is the fixture
+// TestPrintContainerClearCellsFallsBackWhenRootIsWrong below also uses.
 func TestInferProviderRootFromManifestWalksUpToPackageCrds(t *testing.T) {
 	root := t.TempDir()
 	writeCRDFixture(t, root, "widget.yaml", containerClearFixtureCRDForMain)
@@ -1998,22 +2001,22 @@ func TestInferProviderRootFromManifestWalksUpToPackageCrds(t *testing.T) {
 		t.Fatalf("writing manifest fixture: %v", err)
 	}
 
-	got, ok := inferProviderRootFromManifest(manifestPath)
+	got, ok := roundtrip.InferProviderRoot(manifestPath)
 	if !ok {
-		t.Fatal("inferProviderRootFromManifest returned false, want the root found by walking up")
+		t.Fatal("roundtrip.InferProviderRoot returned false, want the root found by walking up")
 	}
 	// Resolve both sides through filepath.EvalSymlinks-free Abs/Clean so a
 	// platform that returns t.TempDir() through a symlinked path (macOS
 	// /tmp -> /private/tmp) does not produce a false mismatch.
 	wantAbs, _ := filepath.Abs(root)
 	if got != wantAbs {
-		t.Errorf("inferProviderRootFromManifest = %q, want %q", got, wantAbs)
+		t.Errorf("roundtrip.InferProviderRoot = %q, want %q", got, wantAbs)
 	}
 
 	// No package/crds anywhere above an isolated temp dir.
 	isolated := t.TempDir()
-	if _, ok := inferProviderRootFromManifest(filepath.Join(isolated, "widget.yaml")); ok {
-		t.Error("inferProviderRootFromManifest found a root under a tree with no package/crds anywhere")
+	if _, ok := roundtrip.InferProviderRoot(filepath.Join(isolated, "widget.yaml")); ok {
+		t.Error("roundtrip.InferProviderRoot found a root under a tree with no package/crds anywhere")
 	}
 }
 
@@ -2054,7 +2057,7 @@ func TestPrintContainerClearCellsFallsBackWhenRootIsWrong(t *testing.T) {
 // file, never the CRD), so a provider mid-generation with no package/crds
 // directory anywhere must not start failing this check now that it gates.
 // No CRD fixture is written under root at all — roundtrip.FindCRD, and its
-// inferProviderRootFromManifest fallback, both find nothing.
+// roundtrip.InferProviderRoot fallback, both find nothing.
 func TestPrintContainerClearCellsReturnsZeroWhenCRDAbsent(t *testing.T) {
 	root := t.TempDir() // no package/crds directory anywhere under root
 	manifestPath := filepath.Join(root, "widget.yaml")

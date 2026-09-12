@@ -279,6 +279,20 @@ type fakeCluster struct {
 	silentWipeField string
 	silentWipeValue interface{}
 
+	// discardAtProviderPath, when non-empty, makes handlePatch accept the
+	// merge patch normally (bumping generation, recording an update event
+	// exactly as it does today) but leave status.atProvider's value at
+	// this dot-separated path completely UNCHANGED afterward — modelling
+	// a backend that returns 200 and silently discards a write to this
+	// specific field, independent of whatever else the same patch
+	// touched. This is the infobloxnios FixedAddress.options shape: a
+	// submitted empty list the backend accepts and discards, which a
+	// spec-side assertion would pass and a status.atProvider assertion
+	// correctly fails (see TestRunTestsClearCreditGatesOnSilentDiscard
+	// and TestRunTestsClearCreditAncestorTombstoneGatesOnSurvivingNestedLeaf).
+	// A path with no dots behaves exactly like a single top-level key.
+	discardAtProviderPath string
+
 	// driftField and driftValue, when driftField is non-empty, set an
 	// atProvider field to a new value starting from the driftAfterGetCalls'th
 	// read of the resource under test (1-based, counted the same way
@@ -634,6 +648,16 @@ func (f *fakeCluster) handlePatch(args []string) (string, error) {
 	specRaw, _ := patch["spec"].(map[string]interface{})
 	forProviderRaw, _ := specRaw["forProvider"].(map[string]interface{})
 
+	// discardAtProviderPath's pre-patch value is captured BEFORE any
+	// mutation below, so it can be restored afterward regardless of what
+	// the merge patch (or any other simulated side effect) did to it —
+	// see that field's own doc comment.
+	var preservedDiscardValue interface{}
+	var havePreservedDiscardValue bool
+	if f.discardAtProviderPath != "" {
+		preservedDiscardValue, havePreservedDiscardValue = getNestedField(f.atProvider, f.discardAtProviderPath)
+	}
+
 	mergeInto(f.forProvider, forProviderRaw)
 	// Simulate a controller that converges instantly, so pollField's first
 	// read already matches — these tests are about the no-op guard, not
@@ -662,6 +686,15 @@ func (f *fakeCluster) handlePatch(args []string) (string, error) {
 				}
 			}
 		}
+	}
+
+	// Simulate a backend that accepts and silently discards a write to one
+	// specific field, independent of what else the patch touched — see
+	// discardAtProviderPath's own doc comment. Restoring only when the
+	// path previously resolved leaves an absent path absent, matching a
+	// backend that never had anything to discard in the first place.
+	if f.discardAtProviderPath != "" && havePreservedDiscardValue {
+		setNestedField(f.atProvider, f.discardAtProviderPath, preservedDiscardValue)
 	}
 
 	f.generation++
@@ -704,6 +737,46 @@ func mergeInto(dst, patch map[string]interface{}) {
 			}
 		}
 		dst[k] = v
+	}
+}
+
+// getNestedField navigates obj through path's dot-separated segments,
+// reporting the value found there and whether the whole path resolved —
+// discardAtProviderPath's own read half. A path with no dots is an
+// ordinary single-key lookup.
+func getNestedField(obj map[string]interface{}, path string) (interface{}, bool) {
+	var cur interface{} = obj
+	for _, seg := range strings.Split(path, ".") {
+		m, ok := cur.(map[string]interface{})
+		if !ok {
+			return nil, false
+		}
+		v, ok := m[seg]
+		if !ok {
+			return nil, false
+		}
+		cur = v
+	}
+	return cur, true
+}
+
+// setNestedField navigates obj through path's dot-separated segments,
+// creating any missing intermediate map along the way, and sets the final
+// segment to value — discardAtProviderPath's own write half.
+func setNestedField(obj map[string]interface{}, path string, value interface{}) {
+	segs := strings.Split(path, ".")
+	cur := obj
+	for i, seg := range segs {
+		if i == len(segs)-1 {
+			cur[seg] = value
+			return
+		}
+		next, ok := cur[seg].(map[string]interface{})
+		if !ok {
+			next = map[string]interface{}{}
+			cur[seg] = next
+		}
+		cur = next
 	}
 }
 
@@ -1924,7 +1997,7 @@ func TestRunTestsStuckFieldFailsAfterReachingThePatch(t *testing.T) {
 	m := &manifest.Manifest{Kind: testKindExample, Name: testNameExample}
 	m.Tests = append(m.Tests, manifest.UpdateTest{Field: testFieldNotifyDelay, Value: float64(1)})
 
-	results, _, err := r.RunTests(m)
+	results, _, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
@@ -2250,7 +2323,7 @@ func TestRunTestsResetsEventBurstBeforeCeiling(t *testing.T) {
 	r := newFakeRunner(f)
 
 	m := manifestWithSequentialFieldTests(numFields)
-	results, _, err := r.RunTests(m)
+	results, _, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
@@ -2312,7 +2385,7 @@ func TestRunTestsMidLoopResetAccountsForMultiEventAttempts(t *testing.T) {
 	r := newFakeRunner(f)
 
 	m := manifestWithSequentialFieldTests(numFields)
-	results, _, err := r.RunTests(m)
+	results, _, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
@@ -2373,7 +2446,7 @@ func TestRunTestsEarnsBurstBeforeFirstFieldWhenAlreadyAtCeiling(t *testing.T) {
 	r := newFakeRunner(f)
 
 	m := manifestWithSequentialFieldTests(1)
-	results, _, err := r.RunTests(m)
+	results, _, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
@@ -2412,7 +2485,7 @@ func TestRunTestsSkipsPreRunResetWhenBelowCeiling(t *testing.T) {
 	r := newFakeRunner(f)
 
 	m := manifestWithSequentialFieldTests(1)
-	results, _, err := r.RunTests(m)
+	results, _, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
@@ -2453,7 +2526,7 @@ func TestRunTestsRaisedCeilingPerformsZeroRestarts(t *testing.T) {
 	r.burstCeiling = raisedCeiling
 
 	m := manifestWithSequentialFieldTests(numFields)
-	results, _, err := r.RunTests(m)
+	results, _, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
@@ -2613,7 +2686,7 @@ func TestRunTestsWithoutRestartWiringStillDetectsGenuineNonEvidence(t *testing.T
 	r := newFakeRunner(f)
 
 	m := manifestWithSequentialFieldTests(numFields)
-	results, _, err := r.RunTests(m)
+	results, _, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
@@ -2660,7 +2733,7 @@ func TestRunTestsAssertUnchangedGatesOnSilentWipe(t *testing.T) {
 		AssertUnchanged: []string{"legacyRuleList"},
 	}
 
-	results, violations, err := r.RunTests(m)
+	results, violations, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
@@ -2711,7 +2784,7 @@ func TestRunTestsAssertUnchangedPassesWhenFieldHolds(t *testing.T) {
 		AssertUnchanged: []string{"legacyRuleList"},
 	}
 
-	_, violations, err := r.RunTests(m)
+	_, violations, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
@@ -2748,7 +2821,7 @@ func TestRunTestsAssertUnchangedReportsDriftOnceAcrossMultipleFieldTests(t *test
 		AssertUnchanged: []string{"legacyRuleList"},
 	}
 
-	_, violations, err := r.RunTests(m)
+	_, violations, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
@@ -2789,7 +2862,7 @@ func TestRunTestsRejectsUnresolvableAssertUnchangedPathBeforeAnyPatch(t *testing
 		AssertUnchanged: []string{"ruleChoice.legacyRuleList"},
 	}
 
-	_, _, err := r.RunTests(m)
+	_, _, _, err := r.RunTests(m)
 	if err == nil {
 		t.Fatal("expected an error for an assert-unchanged path that does not resolve on the object, got nil")
 	}
@@ -2817,7 +2890,7 @@ func TestRunTestsBelowCeilingNeverRestarts(t *testing.T) {
 	r := newFakeRunner(f)
 
 	m := manifestWithSequentialFieldTests(numFields)
-	if _, _, err := r.RunTests(m); err != nil {
+	if _, _, _, err := r.RunTests(m); err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
 
@@ -2853,7 +2926,7 @@ func TestRunTestsRestartFailureDoesNotAbortRun(t *testing.T) {
 	}
 
 	m := manifestWithSequentialFieldTests(numFields)
-	results, _, err := r.RunTests(m)
+	results, _, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}
@@ -2918,7 +2991,7 @@ func TestRunTestsAmbiguousProviderDeploymentDegradesToUntrusted(t *testing.T) {
 	r.restartFunc = nil
 
 	m := manifestWithSequentialFieldTests(numFields)
-	results, _, err := r.RunTests(m)
+	results, _, _, err := r.RunTests(m)
 	if err != nil {
 		t.Fatalf("RunTests: unexpected error: %v", err)
 	}

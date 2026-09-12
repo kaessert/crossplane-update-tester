@@ -97,6 +97,20 @@ For each entry in the manifest's `crossplane.io/update-test` annotation, `run`:
    fails the whole `run` invocation the moment it drifts, wherever in the
    run that happens. See "`crossplane.io/update-test`" below for the
    annotation syntax and what this exists to catch.
+9. **Asserts a container-clear credit that patched a DIFFERENT field.**
+   `clear:` and `withValues:` fold a sibling (or, for `clear:`, an ancestor)
+   field's removal into the SAME merge patch as the entry's own field — see
+   "Whole-field tombstones without a sibling field" and "Backend-coupled
+   fields" below. Points 1–8 above only ever look at the field an entry
+   itself names, so a credited sibling was never actually checked against
+   the live object: a submission Kubernetes accepts but the backend
+   silently discards (200, no error, no effect) used to read as coverage
+   with nothing behind it. This automatically checks every such credited
+   field's real `status.atProvider` value once the entry that patched it
+   has run, and fails the whole invocation if it never actually emptied —
+   no annotation needed, and it runs only when `run` can locate the
+   resource's CRD (the same lookup `validate`'s container-clear check
+   uses; a manifest with no discoverable CRD is unaffected).
 
 Point 6 is the reason this tool exists rather than a `kubectl patch` followed by
 a value assertion. A value match alone cannot distinguish "the controller

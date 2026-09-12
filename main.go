@@ -315,8 +315,10 @@ func cmdRun(args []string) error {
 	fmt.Printf("Testing %s/%s (%d fields, %d skipped)\n",
 		m.Kind, m.Name, len(m.Tests), skipped)
 
-	results, unchangedViolations, err := runner.NewRunner(opts.manifestPath, opts.timeout).
+	root, _ := roundtrip.InferProviderRoot(opts.manifestPath)
+	results, unchangedViolations, clearViolations, err := runner.NewRunner(opts.manifestPath, opts.timeout).
 		WithPollInterval(opts.pollInterval).
+		WithRoot(root).
 		RunTests(m)
 	if err != nil {
 		return err
@@ -324,19 +326,24 @@ func cmdRun(args []string) error {
 
 	passed, failed, noop, notEvidenced, untrusted := printResults(os.Stdout, results)
 	assertUnchangedFailed := printUnchangedAssertions(os.Stdout, m.AssertUnchanged, unchangedViolations)
+	clearCreditFailed := printClearAssertions(os.Stdout, clearViolations)
 
 	total := passed + failed
 	fmt.Printf("%s: %d/%d tested, %d/%d skipped, %d no-op, %d not-evidenced, %d untrusted\n",
-		verdict(failed == 0 && !assertUnchangedFailed), passed, total, skipped, len(m.Tests), noop, notEvidenced, untrusted)
+		verdict(failed == 0 && !assertUnchangedFailed && !clearCreditFailed), passed, total, skipped, len(m.Tests), noop, notEvidenced, untrusted)
 
-	if failed > 0 && assertUnchangedFailed {
-		return fmt.Errorf("%d of %d field tests failed, and %d assert-unchanged field(s) drifted", failed, total, len(unchangedViolations))
-	}
+	var failureReasons []string
 	if failed > 0 {
-		return fmt.Errorf("%d of %d field tests failed", failed, total)
+		failureReasons = append(failureReasons, fmt.Sprintf("%d of %d field tests failed", failed, total))
 	}
 	if assertUnchangedFailed {
-		return fmt.Errorf("%d assert-unchanged field(s) drifted during the run", len(unchangedViolations))
+		failureReasons = append(failureReasons, fmt.Sprintf("%d assert-unchanged field(s) drifted", len(unchangedViolations)))
+	}
+	if clearCreditFailed {
+		failureReasons = append(failureReasons, fmt.Sprintf("%d clear-credit assertion(s) failed", len(clearViolations)))
+	}
+	if len(failureReasons) > 0 {
+		return errors.New(strings.Join(failureReasons, ", and "))
 	}
 	return nil
 }
@@ -368,6 +375,33 @@ func printUnchangedAssertions(w io.Writer, fields []string, violations []runner.
 			continue
 		}
 		printfTo(w, "  \u2713 %s: unchanged across run\n", f)
+	}
+	printfTo(w, "\n")
+	return anyFailed
+}
+
+// printClearAssertions prints every container-clear credit whose
+// representative failed the live check its offline classification claimed
+// it would pass (see runner.ClearAssertion) — GATING failures, exactly like
+// printUnchangedAssertions above, never merely diagnostic ones.
+//
+// Unlike printUnchangedAssertions, nothing is printed when violations is
+// empty. assert-unchanged fields are DECLARED by the manifest's own
+// annotation, so printing one line per declared field even when it held is
+// what proves the guard ran at all; a clear-credit assertion is derived
+// from the CRD's own schema instead, so a run against a manifest with no
+// CRD available, or with no cell riding an unasserted route, has nothing
+// to name — printing a header with zero lines under it would read as a
+// check that ran and found nothing, when in fact nothing was checked.
+func printClearAssertions(w io.Writer, violations []runner.ClearAssertion) (anyFailed bool) {
+	if len(violations) == 0 {
+		return false
+	}
+	printfTo(w, "Clear-credit assertions:\n")
+	for _, v := range violations {
+		anyFailed = true
+		printfTo(w, "  \u2717 %s: NOT CLEARED after %q's patch (credited via %s, observed %q)\n",
+			v.Representative, v.TriggerField, v.Route, v.Observed)
 	}
 	printfTo(w, "\n")
 	return anyFailed
@@ -620,13 +654,13 @@ func cmdValidate(args []string) error {
 // root to the wrong directory on every one of those six, and
 // roundtrip.FindCRD finds nothing. manifestPath is unaffected by that: the
 // shell builds "$$PWD/$$f" into an absolute path BEFORE go -C ever runs, so
-// inferProviderRootFromManifest walks up from ITS OWN directory instead,
+// roundtrip.InferProviderRoot walks up from ITS OWN directory instead,
 // which reaches the provider root reliably regardless of what the tool
 // process's own cwd became.
 func printContainerClearCells(root, manifestPath string, m *manifest.Manifest) int {
 	crd, _ := roundtrip.FindCRD(root, m.APIVersion, m.Kind)
 	if crd == nil {
-		if inferredRoot, ok := inferProviderRootFromManifest(manifestPath); ok {
+		if inferredRoot, ok := roundtrip.InferProviderRoot(manifestPath); ok {
 			crd, _ = roundtrip.FindCRD(inferredRoot, m.APIVersion, m.Kind)
 		}
 	}
@@ -641,30 +675,6 @@ func printContainerClearCells(root, manifestPath string, m *manifest.Manifest) i
 	return roundtrip.PrintClearCellReport(func(format string, args ...interface{}) {
 		printfTo(os.Stdout, format, args...)
 	}, roundtrip.BuildClearCellReport(findings))
-}
-
-// inferProviderRootFromManifest walks upward from manifestPath's own
-// absolute directory looking for a "package/crds" directory, returning the
-// first one found. See printContainerClearCells' own doc comment for why
-// this fallback exists — root's os.Getwd() default cannot be trusted under
-// `go -C tools/update-tester tool ...`, but manifestPath's own absolute
-// path was already resolved by the invoking shell before that happened.
-func inferProviderRootFromManifest(manifestPath string) (string, bool) {
-	abs, err := filepath.Abs(manifestPath)
-	if err != nil {
-		return "", false
-	}
-	dir := filepath.Dir(abs)
-	for {
-		if info, err := os.Stat(filepath.Join(dir, "package", "crds")); err == nil && info.IsDir() {
-			return dir, true
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return "", false
-		}
-		dir = parent
-	}
 }
 
 // ─── expect-skeleton ────────────────────────────────────────────────────────
@@ -1082,10 +1092,12 @@ func buildBatchTargets(opts batchOptions) ([]runner.BatchTarget, error) {
 		if len(m.Tests) == 0 {
 			return nil, fmt.Errorf("%s: no %s annotation found in manifest", p, manifest.AnnotationKey)
 		}
+		root, _ := roundtrip.InferProviderRoot(p)
 		targets = append(targets, runner.BatchTarget{
 			Label:    fmt.Sprintf("%s/%s", m.Kind, m.Name),
 			Runner:   runner.NewRunner(p, opts.timeout).WithPollInterval(opts.pollInterval),
 			Manifest: m,
+			Root:     root,
 		})
 	}
 	return targets, nil
@@ -1136,12 +1148,13 @@ func cmdBatch(args []string) error {
 			assertUnchangedFields = res.Manifest.AssertUnchanged
 		}
 		assertUnchangedFailed := printUnchangedAssertions(&buf, assertUnchangedFields, res.UnchangedViolations)
+		clearCreditFailed := printClearAssertions(&buf, res.ClearViolations)
 		printfTo(os.Stdout, "%s", buf.String())
 
 		total := passed + failed
 		fmt.Printf("%s: %d/%d tested, %d no-op, %d not-evidenced, %d untrusted\n",
-			verdict(failed == 0 && !assertUnchangedFailed), passed, total, noop, notEvidenced, untrusted)
-		if failed > 0 || assertUnchangedFailed {
+			verdict(failed == 0 && !assertUnchangedFailed && !clearCreditFailed), passed, total, noop, notEvidenced, untrusted)
+		if failed > 0 || assertUnchangedFailed || clearCreditFailed {
 			failedFixtures++
 		}
 	}

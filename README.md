@@ -849,9 +849,11 @@ decision:
       the backend. For a LIST leaf, `value: []` is itself an admissible
       wholesale-replacement clear under RFC-7386 (the same route "covered"
       below credits), so whether THAT route is closed — by the leaf's own
-      `minItems > 0`, or a second CEL rule requiring `<path>.size() > 0` —
-      is checked independently of the presence rule: it answers a separate
-      question (can the list ever be emptied at all) from whether it is
+      `minItems > 0`, or a CEL rule requiring `<path>.size() > 0` or
+      `size(<path>) > 0` declared at the CRD root, the spec node, the
+      forProvider node or any object node between forProvider and the
+      leaf — is checked independently of the presence rule: it answers a
+      separate question (can the list ever be emptied at all) from whether it is
       also required to be present, and closing it is enough on its own to
       make a LIST leaf ineligible, whether or not a presence rule also
       applies. The reported `reason` always names the actual blocker
@@ -861,7 +863,11 @@ decision:
       whole-field tombstone is not rejected by `minItems` or `size()` and
       still validates at admission, but the blocker is nonetheless a
       standing, schema-level statement that the list itself must never be
-      emptied;
+      emptied. A `size()` rule led by `!has(self.X)` / `self.X != 'V'`
+      guard disjuncts is conditional instead: it closes the route only on
+      a manifest whose `spec.forProvider` satisfies every guard, its
+      reason names that condition, and a manifest that does not satisfy
+      it keeps the leaf eligible;
     - the leaf carries no value anywhere on THIS manifest under test at
       all — not in its own `spec.forProvider`, and not introduced by any
       TESTED (non-`skip:`) update-test entry either, as that entry's own
@@ -869,9 +875,9 @@ decision:
       map. There is nothing on the object this fixture creates for a
       clear-direction test to remove, so no test anyone could write
       against THIS manifest would ever satisfy the obligation. Unlike the
-      three reasons above, this is NOT a statement about the Kind's
-      schema — it reads the manifest under test's own data, the same
-      artifact the coverage check below already reads, rather than the
+      three reasons above (bar a conditional `size()` rule), this is NOT
+      a statement about the Kind's schema — it reads the manifest under
+      test's own data, the same artifact the coverage check below already reads, rather than the
       schema alone. A leaf excluded here may still be eligible, and
       covered, on a sibling manifest of the same Kind that does populate
       it. It is also assigned only when the leaf is not already covered

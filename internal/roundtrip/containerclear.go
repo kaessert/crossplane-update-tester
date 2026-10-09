@@ -288,7 +288,7 @@ func ContainerClearCoverage(crd map[string]interface{}, m *manifest.Manifest) ([
 	// (see GroupClearCells' own doc comment). markerOnly is reconciled
 	// below, AFTER every leaf's own coverage AND cellCovered are known —
 	// see the loop immediately following.
-	structural, markerOnly, err := classifyIneligibility(crd, leaves)
+	structural, markerOnly, err := classifyIneligibility(crd, leaves, m.ForProvider)
 	if err != nil {
 		return nil, err
 	}

@@ -26,7 +26,9 @@ import (
 //   - a LIST leaf has a removal route a MAP leaf does not: `value: []` is
 //     RFC-7386 wholesale replacement (the same route selfTombstoned already
 //     credits). Whether that route itself is closed — by the leaf's own
-//     `minItems > 0` or a second CEL rule requiring `<path>.size() > 0` —
+//     `minItems > 0` or a second CEL rule requiring `<path>.size() > 0` /
+//     `size(<path>) > 0`, declared at the CRD root, the spec node, the
+//     forProvider node or any object node between forProvider and the leaf —
 //     is checked independently of any presence rule: it answers a separate
 //     question (can the list ever be emptied at all) from whether it is
 //     also required to be present, and it is sufficient ON ITS OWN to make
@@ -41,13 +43,19 @@ import (
 //     schema-level statement that the list itself must never be emptied. A
 //     LIST leaf whose empty-list route stays open is not ineligible at all,
 //     whether or not it is CEL-required: it is left out of the map
-//     entirely, exactly like any other eligible leaf.
+//     entirely, exactly like any other eligible leaf. A size() rule led by
+//     `!has(self.X)` / `self.X != 'V'` guard disjuncts is conditional: it
+//     closes the route only on a manifest whose forProvider satisfies every
+//     guard (listConditionallyEmptyReason names the condition), and a
+//     manifest that does not satisfy it keeps the leaf eligible.
 //
-// The first three reasons are derived purely from crd's own schema — the
-// same answer for every manifest of the Kind. ReasonAbsentFromManifest is
-// the odd one out, and deliberately so: it is the only reason that reads
-// the manifest under test's own data (m.ForProvider and m.Tests) rather
-// than the schema alone, because the question it answers — "does THIS
+// The first three reasons are derived from crd's own schema — the same
+// answer for every manifest of the Kind — with one exception: a list leaf
+// closed by a conditional size() rule is evaluated against the manifest's
+// own forProvider (see above). ReasonAbsentFromManifest is the odd one out,
+// and deliberately so: it is the only reason that reads the manifest under
+// test's own tests (m.Tests) and presence data rather than the schema
+// alone, because the question it answers — "does THIS
 // object ever carry a value here" — has no schema-only answer. That is
 // sound rather than a layering violation: ContainerClearCoverage's own
 // coverage half (coverageFor) already reads exactly the same manifest data
@@ -156,6 +164,19 @@ func listNeverEmptyReason(blocker string) IneligibilityReason {
 		blocker, blocker, blocker))
 }
 
+// listConditionallyEmptyReason builds the ineligibility reason for a LIST
+// leaf whose `value: []` route is closed by a GUARDED non-empty rule — one
+// that binds only while forProvider satisfies the rule's own condition, which
+// blocker names. It is a statement about THIS manifest, not about the Kind:
+// a manifest that does not set the condition is admitted with `value: []`
+// and keeps the leaf eligible. The rule's body is not read further, so
+// nothing is claimed about an explicit whole-field tombstone.
+func listConditionallyEmptyReason(blocker string) IneligibilityReason {
+	return IneligibilityReason(fmt.Sprintf(
+		"%s on this manifest, so admission rejects emptying this list to `value: []`; the rule is conditional and binds only because this manifest's forProvider satisfies that condition",
+		blocker))
+}
+
 // classifyIneligibility derives, for every leaf in leaves, whether its
 // removal direction can ever be exercised against crd's schema at all,
 // returning two maps. structural holds the HARD reasons — both of a LIST
@@ -176,8 +197,10 @@ func listNeverEmptyReason(blocker string) IneligibilityReason {
 // ineligibility, exactly as it already reconciles ReasonAbsentFromManifest
 // against cellCovered: coverage already earned is never withdrawn.
 //
-// Both maps are derived purely from the Kind's schema — the same answer
-// for every manifest of that Kind — and re-derived on EVERY call: nothing
+// Both maps are derived from the Kind's schema — the same answer for every
+// manifest of that Kind — except that a conditional size() rule is
+// evaluated against forProvider, the manifest's own spec.forProvider, and
+// binds only where its condition holds. They are re-derived on EVERY call: nothing
 // here is a hardcoded list, a per-provider config, or an annotation a
 // human must remember to update, so a CRD change that removes the shape or
 // the rule puts the leaf back in the denominator automatically on the very
@@ -192,7 +215,7 @@ func listNeverEmptyReason(blocker string) IneligibilityReason {
 // A leaf matching none of the reasons in IneligibilityReason's own doc
 // comment is left out of both returned maps entirely; it is not
 // ineligible.
-func classifyIneligibility(crd map[string]interface{}, leaves []ContainerLeaf) (structural, markerOnly map[string]IneligibilityReason, err error) {
+func classifyIneligibility(crd map[string]interface{}, leaves []ContainerLeaf, forProvider map[string]interface{}) (structural, markerOnly map[string]IneligibilityReason, err error) {
 	schema, err := servedSchema(crd)
 	if err != nil {
 		return nil, nil, err
@@ -246,7 +269,7 @@ func classifyIneligibility(crd map[string]interface{}, leaves []ContainerLeaf) (
 		// ITS OWN to make the leaf a markerOnly candidate. requiredByCEL
 		// only changes which map (and which reason text) the leaf lands
 		// in, never whether this leaf is checked at all.
-		blocker, blocked := listEmptyRouteBlocked(fpSchema, schema, leaf.Path)
+		blocker, conditional, blocked := listEmptyRouteBlocked(fpSchema, schema, leaf.Path, forProvider)
 		if !blocked {
 			continue
 		}
@@ -254,6 +277,10 @@ func classifyIneligibility(crd map[string]interface{}, leaves []ContainerLeaf) (
 			// Both routes closed: a hard, structural reason exactly like
 			// ReasonRequiredByCELMap above.
 			structural[leaf.Path] = listRequiredByCELReason(blocker)
+		} else if conditional {
+			// Only the `value: []` route is closed, and only while the
+			// rule's own condition holds on THIS manifest.
+			markerOnly[leaf.Path] = listConditionallyEmptyReason(blocker)
 		} else {
 			// Only the `value: []` route is closed; the caller reconciles
 			// this against actual coverage before treating it as final.
@@ -383,22 +410,29 @@ func setAtPath(tree map[string]interface{}, dotted string, value interface{}) {
 }
 
 // listEmptyRouteBlocked reports whether leafPath's OWN `value: []` clear
-// route is closed — by its schema declaring `minItems > 0`, or by a second
-// x-kubernetes-validations rule requiring `<path>.size() > 0` — and, when
-// closed, names the actual blocker for the reason string. Checked
+// route is closed on the manifest under test — by its schema declaring
+// `minItems > 0`, or by an x-kubernetes-validations rule requiring the list
+// to be non-empty via size() (see sizeNonEmptyGuard) — and, when closed,
+// names the actual blocker for the reason string. conditional is true when
+// the blocking rule is a guarded one (leading `!has(self.X)` /
+// `self.X != 'V'` disjuncts) that binds only because forProvider satisfies
+// its condition; the blocker then names that condition. Checked
 // independently of requiredByManagementPolicies: this is a SEPARATE
 // question (can the list be emptied at all) from whether it is required to
 // be present in the first place.
-func listEmptyRouteBlocked(fpSchema, schema map[string]interface{}, leafPath string) (string, bool) {
+func listEmptyRouteBlocked(fpSchema, schema map[string]interface{}, leafPath string, forProvider map[string]interface{}) (blocker string, conditional, blocked bool) {
 	if leafSchema, ok := schemaAtPath(fpSchema, leafPath); ok {
 		if n, hasMinItems := minItemsGuard(leafSchema); hasMinItems && n > 0 {
-			return fmt.Sprintf("minItems: %d", n), true
+			return fmt.Sprintf("minItems: %d", n), false, true
 		}
 	}
-	if rule, ok := sizeNonEmptyGuard(schema, leafPath); ok {
-		return fmt.Sprintf("a CEL rule requiring %s", rule), true
+	if hit, ok := sizeNonEmptyGuard(schema, fpSchema, leafPath, forProvider); ok {
+		if hit.condition != "" {
+			return fmt.Sprintf("a CEL rule requiring %s while %s", hit.clause, hit.condition), true, true
+		}
+		return fmt.Sprintf("a CEL rule requiring %s", hit.clause), false, true
 	}
-	return "", false
+	return "", false, false
 }
 
 // minItemsGuard reads m's own "minItems" — tolerating both the float64
@@ -418,51 +452,290 @@ func minItemsGuard(m map[string]interface{}) (int, bool) {
 	}
 }
 
-// sizeGuardPattern matches a CEL rule's OWN "<dotted path>.size() > 0" or
-// "<dotted path>.size() >= 1" clause — the two ordinary spellings of "this
-// list must not be empty" — anchored to wantPath so a size() guard on a
-// DIFFERENT field is never mistaken for one guarding this leaf.
+// sizeGuardPattern matches a CEL rule's OWN non-empty clause for wantPath —
+// the method form "<path>.size() > 0" / "<path>.size() >= 1" or the function
+// form "size(<path>) > 0" / "size(<path>) >= 1", the ordinary spellings of
+// "this list must not be empty" — anchored to wantPath so a size() guard on
+// a DIFFERENT field is never mistaken for one guarding this leaf.
 func sizeGuardPattern(wantPath string) *regexp.Regexp {
-	return regexp.MustCompile(regexp.QuoteMeta(wantPath) + `\.size\(\)\s*(?:>\s*0|>=\s*1)\b`)
+	q := regexp.QuoteMeta(wantPath)
+	const cmp = `\s*(?:>\s*0|>=\s*1)\b`
+	return regexp.MustCompile(q + `\.size\(\)` + cmp + `|\bsize\(\s*` + q + `\s*\)` + cmp)
 }
 
-// sizeNonEmptyGuard mirrors requiredByManagementPolicies's own anchor pair
-// (CRD root, and the "spec" node) to find a CEL rule requiring leafPath's
-// own list to be non-empty via size() — a SEPARATE rule from the one
-// requiredByManagementPolicies matches, which only ever checks has().
-func sizeNonEmptyGuard(schema map[string]interface{}, leafPath string) (string, bool) {
-	if rootValidations, ok := schema["x-kubernetes-validations"].([]interface{}); ok {
-		if rule, ok := sizeGuardRule(rootValidations, "self.spec.forProvider."+leafPath); ok {
-			return rule, true
-		}
-	}
-	specSchema, err := fieldSchema(schema, "spec")
-	if err == nil {
-		if specValidations, ok := specSchema["x-kubernetes-validations"].([]interface{}); ok {
-			if rule, ok := sizeGuardRule(specValidations, "self.forProvider."+leafPath); ok {
-				return rule, true
-			}
-		}
-	}
-	return "", false
+// sizeAnchor describes one schema node whose x-kubernetes-validations may
+// carry a non-empty rule for a leaf, and how `self` resolves there: celSelf
+// is the CEL path prefix of forProvider-relative paths (so a leaf's rule
+// text is celSelf + the leaf's path below the anchor), and fpPrefix is the
+// dotted forProvider-relative path of the anchor node itself ("" at
+// forProvider and above), prepended to a guard path to look it up in the
+// manifest's forProvider. A guard path not under celSelf cannot be
+// evaluated against forProvider at all.
+type sizeAnchor struct {
+	validations []interface{}
+	celSelf     string
+	fpPrefix    string
 }
 
-// sizeGuardRule scans validations for a rule whose text contains a
-// wantPath+".size() > 0" (or ">= 1") clause, returning that clause verbatim
-// for the reason string.
-func sizeGuardRule(validations []interface{}, wantPath string) (string, bool) {
+// sizeGuardHit is a matched non-empty clause, verbatim, plus the manifest
+// condition under which the rule binds ("" when the rule is unconditional).
+type sizeGuardHit struct {
+	clause    string
+	condition string
+}
+
+// sizeNonEmptyGuard scans every node on leafPath's route for an
+// x-kubernetes-validations rule requiring leafPath's own list to be
+// non-empty via size() — a SEPARATE rule from the one
+// requiredByManagementPolicies matches, which only ever checks has(). The
+// anchors are the CRD root (`self.spec.forProvider.<leaf>`), the spec node
+// (`self.forProvider.<leaf>`), the forProvider node (`self.<leaf>`) and
+// every object node between forProvider and the leaf (`self.<path below
+// that node>`), because a structural-schema rule may be declared wherever
+// `self` resolves the path it inspects.
+func sizeNonEmptyGuard(schema, fpSchema map[string]interface{}, leafPath string, forProvider map[string]interface{}) (sizeGuardHit, bool) {
+	var anchors []sizeAnchor
+	if v, ok := schema["x-kubernetes-validations"].([]interface{}); ok {
+		anchors = append(anchors, sizeAnchor{validations: v, celSelf: "self.spec.forProvider."})
+	}
+	if specSchema, err := fieldSchema(schema, "spec"); err == nil {
+		if v, ok := specSchema["x-kubernetes-validations"].([]interface{}); ok {
+			anchors = append(anchors, sizeAnchor{validations: v, celSelf: "self.forProvider."})
+		}
+	}
+	if v, ok := fpSchema["x-kubernetes-validations"].([]interface{}); ok {
+		anchors = append(anchors, sizeAnchor{validations: v, celSelf: "self."})
+	}
+	segments := strings.Split(leafPath, ".")
+	for i := 1; i < len(segments); i++ {
+		rel := strings.Join(segments[:i], ".")
+		node, ok := schemaAtPath(fpSchema, rel)
+		if !ok {
+			break
+		}
+		if v, ok := node["x-kubernetes-validations"].([]interface{}); ok {
+			anchors = append(anchors, sizeAnchor{validations: v, celSelf: "self.", fpPrefix: rel + "."})
+		}
+	}
+	for _, a := range anchors {
+		want := a.celSelf + strings.TrimPrefix(leafPath, a.fpPrefix)
+		if hit, ok := sizeGuardRule(a, want, forProvider); ok {
+			return hit, true
+		}
+	}
+	return sizeGuardHit{}, false
+}
+
+// sizeGuardRule scans a.validations for a rule carrying a non-empty clause
+// for wantPath (see sizeGuardPattern), returning that clause verbatim for
+// the reason string.
+//
+// A rule whose clause sits in its LAST top-level OR-disjunct is evaluated
+// against forProvider: every leading disjunct of the recognised guard
+// shapes — `!has(self.X)` and `self.X != 'V'` — is reduced to true or
+// false on this manifest, and the rule binds only when ALL of them are
+// false (the clause is then all that stands between the object and
+// admission). A leading disjunct that evaluates true means the rule does
+// not bind here and the leaf is left alone; the condition under which it
+// does bind is returned in the hit. A rule without leading disjuncts, with
+// a leading disjunct of any other shape, or with the clause anywhere but
+// last is treated as unconditional.
+func sizeGuardRule(a sizeAnchor, wantPath string, forProvider map[string]interface{}) (sizeGuardHit, bool) {
 	pattern := sizeGuardPattern(wantPath)
-	for _, v := range validations {
+	for _, v := range a.validations {
 		vm, ok := v.(map[string]interface{})
 		if !ok {
 			continue
 		}
 		rule, _ := vm["rule"].(string)
-		if m := pattern.FindString(rule); m != "" {
-			return m, true
+		clause := pattern.FindString(rule)
+		if clause == "" {
+			continue
+		}
+		disjuncts := splitTopLevelOr(rule)
+		last := len(disjuncts) - 1
+		if last < 1 || !pattern.MatchString(disjuncts[last]) {
+			return sizeGuardHit{clause: clause}, true
+		}
+		var conds []string
+		binds, evaluable := true, true
+		for _, d := range disjuncts[:last] {
+			holds, cond, known := evalGuardDisjunct(d, a, forProvider)
+			if !known {
+				evaluable = false
+				break
+			}
+			if holds {
+				binds = false
+				break
+			}
+			conds = append(conds, cond)
+		}
+		switch {
+		case !evaluable:
+			return sizeGuardHit{clause: clause}, true
+		case binds:
+			return sizeGuardHit{clause: clause, condition: joinConditions(conds)}, true
 		}
 	}
-	return "", false
+	return sizeGuardHit{}, false
+}
+
+var (
+	reNotHasDisjunct = regexp.MustCompile(`^!\s*has\(\s*(self(?:\.[A-Za-z0-9_]+)+)\s*\)$`)
+	reNotEqDisjunct  = regexp.MustCompile(`^(self(?:\.[A-Za-z0-9_]+)+)\s*!=\s*(?:'([^']*)'|"([^"]*)")$`)
+)
+
+// evalGuardDisjunct reduces one leading OR-disjunct of a guarded rule to its
+// value on forProvider. holds is the disjunct's value, cond the plain-words
+// condition that makes it FALSE (the rule binding), and known is false when
+// the disjunct is not one of the two recognised shapes, names a path outside
+// forProvider, or compares a non-string value.
+//
+//   - `!has(self.X)` is false exactly when X is present;
+//   - `self.X != 'V'` is false exactly when X is present and equals V; with X
+//     absent it is treated as true (the object cannot satisfy the condition).
+func evalGuardDisjunct(d string, a sizeAnchor, forProvider map[string]interface{}) (holds bool, cond string, known bool) {
+	d = stripOuterParens(strings.TrimSpace(d))
+	if m := reNotHasDisjunct.FindStringSubmatch(d); m != nil {
+		fpPath, ok := guardFPPath(m[1], a)
+		if !ok {
+			return false, "", false
+		}
+		_, present := valueAtPath(forProvider, fpPath)
+		return !present, "forProvider." + fpPath + " is set", true
+	}
+	if m := reNotEqDisjunct.FindStringSubmatch(d); m != nil {
+		fpPath, ok := guardFPPath(m[1], a)
+		if !ok {
+			return false, "", false
+		}
+		want := m[2]
+		if m[3] != "" {
+			want = m[3]
+		}
+		cond = "forProvider." + fpPath + " == '" + want + "'"
+		v, present := valueAtPath(forProvider, fpPath)
+		if !present {
+			return true, cond, true
+		}
+		s, isString := v.(string)
+		if !isString {
+			return false, "", false
+		}
+		return s != want, cond, true
+	}
+	return false, "", false
+}
+
+// guardFPPath maps a CEL path rooted at `self` in a rule declared on anchor a
+// to its dotted path inside forProvider, reporting false when the path does
+// not resolve under forProvider.
+func guardFPPath(celPath string, a sizeAnchor) (string, bool) {
+	rest := celPath + "."
+	if !strings.HasPrefix(rest, a.celSelf) {
+		return "", false
+	}
+	rest = strings.TrimSuffix(strings.TrimPrefix(rest, a.celSelf), ".")
+	if rest == "" {
+		return "", false
+	}
+	return a.fpPrefix + rest, true
+}
+
+// joinConditions renders a rule's binding conditions in plain words,
+// dropping a "<path> is set" that an equality on the same path already
+// implies.
+func joinConditions(conds []string) string {
+	var out []string
+	for _, c := range conds {
+		if path, ok := strings.CutSuffix(c, " is set"); ok {
+			implied := false
+			for _, other := range conds {
+				if strings.HasPrefix(other, path+" == ") {
+					implied = true
+					break
+				}
+			}
+			if implied {
+				continue
+			}
+		}
+		out = append(out, c)
+	}
+	return strings.Join(out, " and ")
+}
+
+// splitTopLevelOr splits rule on `||` operators outside parentheses and
+// quoted string literals, returning the trimmed disjuncts in order.
+func splitTopLevelOr(rule string) []string {
+	var out []string
+	depth, start := 0, 0
+	var quote byte
+	for i := 0; i < len(rule); i++ {
+		c := rule[i]
+		switch {
+		case quote != 0:
+			if c == quote {
+				quote = 0
+			}
+		case c == '\'' || c == '"':
+			quote = c
+		case c == '(' || c == '[':
+			depth++
+		case c == ')' || c == ']':
+			depth--
+		case c == '|' && depth == 0 && i+1 < len(rule) && rule[i+1] == '|':
+			out = append(out, strings.TrimSpace(rule[start:i]))
+			i++
+			start = i + 1
+		}
+	}
+	return append(out, strings.TrimSpace(rule[start:]))
+}
+
+// stripOuterParens removes parentheses that enclose all of s.
+func stripOuterParens(s string) string {
+	for len(s) >= 2 && s[0] == '(' && s[len(s)-1] == ')' {
+		depth := 0
+		enclosing := true
+		for i := 0; i < len(s)-1; i++ {
+			switch s[i] {
+			case '(':
+				depth++
+			case ')':
+				depth--
+				if depth == 0 {
+					enclosing = false
+				}
+			}
+			if !enclosing {
+				break
+			}
+		}
+		if !enclosing {
+			return s
+		}
+		s = strings.TrimSpace(s[1 : len(s)-1])
+	}
+	return s
+}
+
+// valueAtPath returns the value root carries at dotted, navigating nested
+// maps exactly as presentAtPath does.
+func valueAtPath(root map[string]interface{}, dotted string) (interface{}, bool) {
+	var cur interface{} = root
+	for _, seg := range strings.Split(dotted, ".") {
+		m, ok := cur.(map[string]interface{})
+		if !ok {
+			return nil, false
+		}
+		cur, ok = m[seg]
+		if !ok {
+			return nil, false
+		}
+	}
+	return cur, true
 }
 
 // referenceResolutionShape reports whether leaf is, by its SCHEMA SHAPE

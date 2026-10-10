@@ -379,13 +379,39 @@ func testEntryDataTree(m *manifest.Manifest) map[string]interface{} {
 			continue
 		}
 		if t.Field != "" {
-			setAtPath(tree, t.Field, t.Value)
+			setAtPath(tree, t.Field, copyTreeValue(t.Value))
 		}
 		for sibling, v := range t.WithValues {
-			setAtPath(tree, sibling, v)
+			setAtPath(tree, sibling, copyTreeValue(v))
 		}
 	}
 	return tree
+}
+
+// copyTreeValue returns a deep copy of v's nested map[string]interface{} and
+// []interface{} structure, so a value placed into the presence tree never
+// shares storage with the manifest.UpdateTest it came from. setAtPath walks
+// INTO any existing map it finds, so a later dotted entry under the same
+// top-level key (configuration.serviceNow.url after a withValues:
+// configuration map) would otherwise write its Value into the earlier
+// entry's own live literal map — which buildMergePatch later sends.
+func copyTreeValue(v interface{}) interface{} {
+	switch x := v.(type) {
+	case map[string]interface{}:
+		out := make(map[string]interface{}, len(x))
+		for k, e := range x {
+			out[k] = copyTreeValue(e)
+		}
+		return out
+	case []interface{}:
+		out := make([]interface{}, len(x))
+		for i, e := range x {
+			out[i] = copyTreeValue(e)
+		}
+		return out
+	default:
+		return v
+	}
 }
 
 // setAtPath writes value into tree at dotted, creating intermediate

@@ -774,3 +774,54 @@ func TestRunTestsClearCreditProvenWhenLenderRunsCleanly(t *testing.T) {
 		t.Errorf("got %d unproven clear-credit entries, want 0 (the lender ran cleanly, so its credit was actually checked): %+v", len(unprovenClear), unprovenClear)
 	}
 }
+
+// TestBuildMergePatchAfterClearCellReportsKeepsEntryLiterals pins the
+// runner-visible half of the presence-tree aliasing defect: a provider root
+// makes RunTests call clearCellReportsFor up front, which assembles a
+// synthetic presence tree from the tested entries. A withValues: map (or a
+// map value:) followed by a dotted entry under the same top-level key must
+// still reach buildMergePatch with its OWN literals, not the later entry's.
+func TestBuildMergePatchAfterClearCellReportsKeepsEntryLiterals(t *testing.T) {
+	cases := map[string]struct {
+		tests []manifest.UpdateTest
+		// patched indexes the entry whose patch is built after the call.
+		patched int
+		want    string
+	}{
+		"WithValuesMapFollowedByDottedEntries": {
+			tests: []manifest.UpdateTest{
+				{Field: "name", Value: "switched", WithValues: map[string]interface{}{
+					"network": map[string]interface{}{"subnets": map[string]interface{}{"a": "first"}},
+				}},
+				{Field: "network.subnets.a", Value: "later"},
+			},
+			patched: 0,
+			want:    `{"spec":{"forProvider":{"name":"switched","network":{"subnets":{"a":"first"}}}}}`,
+		},
+		"MapValueFollowedByDottedEntry": {
+			tests: []manifest.UpdateTest{
+				{Field: "network", Value: map[string]interface{}{"subnets": map[string]interface{}{"a": "first"}}},
+				{Field: "network.subnets.a", Value: "later"},
+			},
+			patched: 0,
+			want:    `{"spec":{"forProvider":{"network":{"subnets":{"a":"first"}}}}}`,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			root := writeClearAssertFixtureCRD(t)
+			m := &manifest.Manifest{APIVersion: "widgets.crossplane.io/v1alpha1", Kind: "ExampleResource", Tests: tc.tests}
+			if reports := clearCellReportsFor(root, m); reports == nil {
+				t.Fatal("clearCellReportsFor returned nil — the fixture CRD was not matched, so the aliasing path never ran")
+			}
+			e := m.Tests[tc.patched]
+			got, err := buildMergePatch(e.Field, e.Value, e.Clear, e.WithValues)
+			if err != nil {
+				t.Fatalf("buildMergePatch: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("patch after clearCellReportsFor = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}

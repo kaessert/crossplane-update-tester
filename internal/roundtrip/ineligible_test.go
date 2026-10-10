@@ -1,6 +1,7 @@
 package roundtrip
 
 import (
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -1441,5 +1442,107 @@ func TestTestEntryDataTree(t *testing.T) {
 	}
 	if !presentAtPath(tree, "sibling") {
 		t.Error(`"sibling" not present in the synthetic tree, want it introduced by "other"'s own withValues: map`)
+	}
+}
+
+// TestTestEntryDataTreeNeverAliasesManifestLiterals pins that the synthetic
+// presence tree shares no storage with the manifest's own update-test
+// entries: setAtPath walks INTO an existing map, so a dotted entry listed
+// after a withValues: (or map value:) literal under the same top-level key
+// must write into the tree's own copy, never into the entry's live literal
+// that the runner later sends as a merge patch. Each case is built fresh
+// per run, and the same manifest shape is also driven through
+// ContainerClearCoverage, the production caller of testEntryDataTree.
+func TestTestEntryDataTreeNeverAliasesManifestLiterals(t *testing.T) {
+	build := map[string]func() *manifest.Manifest{
+		"WithValuesMapFollowedByDottedEntriesUnderSameKey": func() *manifest.Manifest {
+			return &manifest.Manifest{Tests: []manifest.UpdateTest{
+				{Field: "tags", Value: []interface{}{"a"}, WithValues: map[string]interface{}{
+					"network": map[string]interface{}{
+						"cidr":    "10.0.0.0/8",
+						"subnets": map[string]interface{}{"a": "b"},
+					},
+				}},
+				{Field: "network.cidr", Value: "192.168.0.0/16"},
+				{Field: "network.subnets.a", Value: "z"},
+				{Field: "network.extra.deep", Value: "new"},
+			}}
+		},
+		"MapValueFollowedByDottedEntryUnderIt": func() *manifest.Manifest {
+			return &manifest.Manifest{Tests: []manifest.UpdateTest{
+				{Field: "network", Value: map[string]interface{}{
+					"cidr":    "10.0.0.0/8",
+					"subnets": map[string]interface{}{"a": "b"},
+				}},
+				{Field: "network.cidr", Value: "192.168.0.0/16"},
+				{Field: "network.subnets.a", Value: "z"},
+			}}
+		},
+		"ListValueWithNestedMapsFollowedByDottedEntry": func() *manifest.Manifest {
+			return &manifest.Manifest{Tests: []manifest.UpdateTest{
+				{Field: "network", Value: []interface{}{map[string]interface{}{"cidr": "x"}}},
+				{Field: "network.cidr", Value: "y"},
+			}}
+		},
+		"WithValuesMapSharedBySecondEntryWithValues": func() *manifest.Manifest {
+			return &manifest.Manifest{Tests: []manifest.UpdateTest{
+				{Field: "name", Value: "n", WithValues: map[string]interface{}{"network": map[string]interface{}{"cidr": "a"}}},
+				{Field: "tags", Value: []interface{}{"t"}, WithValues: map[string]interface{}{"network.cidr": "b"}},
+			}}
+		},
+	}
+
+	for name, mk := range build {
+		t.Run(name+"/testEntryDataTree", func(t *testing.T) {
+			m, want := mk(), mk()
+			tree := testEntryDataTree(m)
+			if !reflect.DeepEqual(m.Tests, want.Tests) {
+				t.Errorf("testEntryDataTree mutated the manifest's tests:\n got  %#v\n want %#v", m.Tests, want.Tests)
+			}
+			// The tree itself must still hold the later dotted writes.
+			if !presentAtPath(tree, "network") {
+				t.Errorf("network missing from the presence tree: %#v", tree)
+			}
+		})
+		t.Run(name+"/ContainerClearCoverage", func(t *testing.T) {
+			m, want := mk(), mk()
+			if _, err := ContainerClearCoverage(decodeCRD(t, containerClearFixtureCRD), m); err != nil {
+				t.Fatalf("ContainerClearCoverage: %v", err)
+			}
+			if !reflect.DeepEqual(m.Tests, want.Tests) {
+				t.Errorf("ContainerClearCoverage mutated the manifest's tests:\n got  %#v\n want %#v", m.Tests, want.Tests)
+			}
+		})
+	}
+}
+
+// TestCopyTreeValue pins the deep-copy helper itself: nested maps and lists
+// are copied, scalars and nil pass through.
+func TestCopyTreeValue(t *testing.T) {
+	cases := map[string]interface{}{
+		"Nil":       nil,
+		"String":    "x",
+		"Int":       3,
+		"Bool":      true,
+		"EmptyMap":  map[string]interface{}{},
+		"EmptyList": []interface{}{},
+		"Nested": map[string]interface{}{
+			"a": []interface{}{map[string]interface{}{"b": nil}, "c"},
+			"d": map[string]interface{}{"e": 1},
+		},
+	}
+	for name, in := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := copyTreeValue(in)
+			if !reflect.DeepEqual(got, in) {
+				t.Fatalf("copyTreeValue(%#v) = %#v, want an equal value", in, got)
+			}
+			if m, ok := in.(map[string]interface{}); ok {
+				got.(map[string]interface{})["__probe"] = true
+				if _, leaked := m["__probe"]; leaked {
+					t.Error("copy of a map shares storage with its source")
+				}
+			}
+		})
 	}
 }

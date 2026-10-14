@@ -3485,6 +3485,54 @@ func TestSelectResourceName(t *testing.T) {
 			name:   testNameExample,
 			want:   "exampleresources.example.crossplane.io/" + testNameExample,
 		},
+		"KindEndingInYWithSameNamedCompanion": {
+			reason: "kubectl prints the -ies plural for a Kind ending in y, so the managed resource must still be told apart from a same-named companion of another kind",
+			out: "projectrepositories.projectrepository.example.crossplane.io/" + testNameExample + "\n" +
+				"localrepositories.localrepository.example.crossplane.io/" + testNameExample + "\n",
+			kind: "ProjectRepository",
+			name: testNameExample,
+			want: "projectrepositories.projectrepository.example.crossplane.io/" + testNameExample,
+		},
+		"KindEndingInYCompanionListedFirst": {
+			reason: "the -ies match must not depend on line order",
+			out: "localrepositories.localrepository.example.crossplane.io/" + testNameExample + "\n" +
+				"projectrepositories.projectrepository.example.crossplane.io/" + testNameExample + "\n",
+			kind: "ProjectRepository",
+			name: testNameExample,
+			want: "projectrepositories.projectrepository.example.crossplane.io/" + testNameExample,
+		},
+		"KindEndingInYSingularSegment": {
+			reason: "the singular type segment of a Kind ending in y keeps matching",
+			out: "projectrepository.projectrepository.example.crossplane.io/" + testNameExample + "\n" +
+				"secret/" + testNameExample + "\n",
+			kind: "ProjectRepository",
+			name: testNameExample,
+			want: "projectrepository.projectrepository.example.crossplane.io/" + testNameExample,
+		},
+		"KindEndingInYBothIesPluralsAmbiguous": {
+			reason: "two same-named -ies objects of the same kind in different groups still cannot be told apart — error, never a guess",
+			out: "projectrepositories.a.example.crossplane.io/" + testNameExample + "\n" +
+				"projectrepositories.b.example.crossplane.io/" + testNameExample + "\n",
+			kind:    "ProjectRepository",
+			name:    testNameExample,
+			wantErr: true,
+		},
+		"IrregularPluralCannotDisambiguate": {
+			reason: "a plural that is none of the known forms (Mouse -> mice) matches nothing, so two same-named objects must error rather than be guessed",
+			out: "mice.rodent.example.crossplane.io/" + testNameExample + "\n" +
+				"secret/" + testNameExample + "\n",
+			kind:    "Mouse",
+			name:    testNameExample,
+			wantErr: true,
+		},
+		"YOnlyKindDoesNotMatchBareIes": {
+			reason: "a Kind that is just \"Y\" has no stem, so it must not match the bare \"ies\" segment",
+			out: "ies.example.crossplane.io/" + testNameExample + "\n" +
+				"secret/" + testNameExample + "\n",
+			kind:    "Y",
+			name:    testNameExample,
+			wantErr: true,
+		},
 		"NoLineMatchesTheName": {
 			reason:  "an output holding only unrelated objects is a resolution failure, not a name to pass on",
 			out:     secretLine + "\n",

@@ -332,7 +332,10 @@ func resourceTypeOf(resourceName string) string {
 // <resource> is the lowercased singular or plural of the Kind depending on
 // the type and the kubectl version — so the leading token is compared
 // case-insensitively against the Kind and its common plural forms rather
-// than for exact equality.
+// than for exact equality. A Kind ending in "y" is pluralised "-ies" by
+// kubectl ("ProjectRepository" prints as "projectrepositories"), so that
+// form is accepted too. A genuinely irregular plural is not guessed at: it
+// matches nothing, and selectResourceName then reports the ambiguity.
 func resourceTypeMatchesKind(resourceType, kind string) bool {
 	if kind == "" || resourceType == "" {
 		return false
@@ -343,7 +346,13 @@ func resourceTypeMatchesKind(resourceType, kind string) bool {
 	}
 	head = strings.ToLower(head)
 	k := strings.ToLower(kind)
-	return head == k || head == k+"s" || head == k+"es"
+	if head == k || head == k+"s" || head == k+"es" {
+		return true
+	}
+	if stem, ok := strings.CutSuffix(k, "y"); ok && stem != "" {
+		return head == stem+"ies"
+	}
+	return false
 }
 
 // Snapshot reads the current status.atProvider as JSON bytes, for the
